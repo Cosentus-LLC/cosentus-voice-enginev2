@@ -61,6 +61,7 @@ quote-style = "double"
 
 [tool.pytest.ini_options]
 testpaths = ["backend/voice-agent/tests"]
+pythonpath = ["backend/voice-agent"]
 asyncio_mode = "auto"
 filterwarnings = [
     "error",
