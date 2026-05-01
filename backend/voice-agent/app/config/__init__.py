@@ -1,4 +1,4 @@
-"""Agent runtime config layer — Pydantic contract and Lambda loader."""
+"""Engine config layer — Pydantic contracts, settings, and the runtime-config loader."""
 
 from app.config.agent_config import (
     AgentConfig,
@@ -13,6 +13,7 @@ from app.config.agent_config import (
     TTSSettings,
     load_agent_config,
 )
+from app.config.settings import Settings
 
 __all__ = [
     "AgentConfig",
@@ -22,6 +23,7 @@ __all__ = [
     "PostCallConfig",
     "PostCallField",
     "STTConfig",
+    "Settings",
     "ToolConfig",
     "TTSConfig",
     "TTSSettings",

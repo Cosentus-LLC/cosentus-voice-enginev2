@@ -22,6 +22,7 @@ dependencies = [
     "pipecat-ai[daily,silero,elevenlabs,aws,webrtc,runner,assemblyai]>=1.1.0,<2.0.0",
     "boto3",
     "pydantic>=2",
+    "pydantic-settings>=2.0",
     "fastapi",
     "uvicorn",
     "structlog",

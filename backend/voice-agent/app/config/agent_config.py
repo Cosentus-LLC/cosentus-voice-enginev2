@@ -44,6 +44,8 @@ from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from app.config.settings import Settings
+
 logger = structlog.get_logger(__name__)
 
 
@@ -280,18 +282,28 @@ def _invoke_lambda_sync(function_name: str, payload: bytes) -> dict[str, Any]:
     )
 
 
-async def load_agent_config(agent_id_or_name: str) -> AgentConfig:
+async def load_agent_config(
+    agent_id_or_name: str,
+    settings: Settings | None = None,
+) -> AgentConfig:
     """Fetch one agent's runtime config from the voice-api Lambda.
 
     Args:
         agent_id_or_name: Agent UUID or name. Passed verbatim into
             the URL path the lambda routes on.
+        settings: Optional :class:`~app.config.settings.Settings`.
+            When provided, the lambda function name comes from
+            ``settings.voice_api_lambda_name``. When ``None``, falls
+            back to ``os.environ["VOICE_API_LAMBDA_NAME"]``. Layer 9
+            (runtime) constructs Settings once at startup and passes
+            it to every caller; the env-var fallback exits then. See
+            docs/v2-tech-debt-log.md entry 3.
 
     Returns:
         Parsed :class:`AgentConfig`.
 
     Raises:
-        AgentConfigLoadError: For any failure — missing env, lambda
+        AgentConfigLoadError: For any failure — missing config, lambda
             invoke error, ``FunctionError``, non-200 response status,
             malformed JSON in either envelope, or Pydantic
             validation failure. v2 does not fall back to a stub
@@ -299,7 +311,11 @@ async def load_agent_config(agent_id_or_name: str) -> AgentConfig:
     """
     started = time.perf_counter()
 
-    function_name = os.environ.get(_LAMBDA_NAME_ENV, "")
+    if settings is not None:
+        function_name = settings.voice_api_lambda_name
+    else:
+        function_name = os.environ.get(_LAMBDA_NAME_ENV, "")
+
     if not function_name:
         logger.error(
             "agent_config_load_failed",

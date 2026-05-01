@@ -69,25 +69,42 @@ field name.
 **Layer / file.** Layer 1 — `backend/voice-agent/app/config/agent_config.py`
 (`AgentConfigMeta`).
 
-## Entry 3: Layer 1 reads env vars directly; Layer 2 will own settings
+## Entry 3: Layer 1 falls back to `os.environ` when no Settings is passed
 
-**Context.** `app/config/agent_config.py` reads
-`VOICE_API_LAMBDA_NAME` and `AWS_REGION` directly from `os.environ`.
-v2 plans a dedicated settings layer (Layer 2) that owns all
-env-and-SSM bootstrap; the loader should consume from it rather
-than reach into `os.environ` itself.
+**Context.** `app/config/agent_config.py` historically reached into
+`os.environ` for two values: `VOICE_API_LAMBDA_NAME` and
+`AWS_REGION`. With Layer 2 (`Settings`) shipped, the loader now
+accepts an optional `Settings` parameter — when provided,
+`voice_api_lambda_name` comes from settings; when `None`, the
+loader falls back to `os.environ` for backwards compatibility.
 
-**Why we accepted this.** Layer 2 doesn't exist yet. Adding inline
-`os.environ.get(...)` calls is a two-line workaround; abstracting
-prematurely would violate the "no premature abstraction" principle.
+The module-level `_LAMBDA_CLIENT` still reads `AWS_REGION` from
+`os.environ` because the client is constructed at module import,
+*before* any caller could construct or pass a `Settings` instance.
 
-**Cost.** Minimal. Two `os.environ.get` calls become a `Settings`
-field read when Layer 2 lands.
+**Updated 2026-05-01 (Layer 2 ships).** `Settings` now exists.
+`load_agent_config(agent_id_or_name, settings=...)` is the
+recommended path. The env-var fallback remains so existing tests
+and any pre-Layer-9 caller still work.
 
-**Exit condition.** When Layer 2 (`app/config/settings.py`) lands,
-refactor `load_agent_config` to take a `Settings` instance (or
-read from a module-level resolved settings object) instead of
-calling `os.environ.get` itself. The module-level
-`_LAMBDA_CLIENT`'s region also moves to settings.
+**Why the fallback remains.** Layer 9 (runtime) is the layer that
+will construct `Settings` once at process startup and pass it
+through every Layer-1 call site. Removing the fallback now would
+require each caller to plumb Settings through manually before
+Layer 9 lands.
+
+**Cost.** Two `os.environ.get` calls in the loader and one in the
+module-level `_LAMBDA_CLIENT` constructor.
+
+**Exit condition.** When Layer 9 (`app/runtime/`) lands and the
+runtime layer:
+
+1. Constructs `Settings()` once at process startup; and
+2. Passes `settings` to every `load_agent_config` call site.
+
+At that point we drop the `settings is None` branch from
+`load_agent_config` and require a `Settings` argument, and we
+refactor the module-level `_LAMBDA_CLIENT` to be lazily constructed
+on first use using `settings.aws_region`.
 
 **Layer / file.** Layer 1 — `backend/voice-agent/app/config/agent_config.py`.

@@ -12,6 +12,7 @@ from app.config.agent_config import (
     AgentConfigLoadError,
     load_agent_config,
 )
+from app.config.settings import Settings
 from botocore.exceptions import ClientError, ReadTimeoutError
 from pydantic import ValidationError
 
@@ -403,3 +404,31 @@ class TestLoadAgentConfig:
         with pytest.raises(AgentConfigLoadError, match="Lambda invoke failed") as exc_info:
             await load_agent_config("chris-claim-status")
         assert exc_info.value.__cause__ is timeout
+
+    async def test_settings_object_overrides_env_for_lambda_name(
+        self,
+        mocker,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        # Verifies the Layer 2 integration: when a Settings instance is
+        # passed, voice_api_lambda_name comes from settings, not env.
+        # Strongest form: build Settings, then change env, prove the
+        # captured Settings value (not the changed env value) is used.
+        monkeypatch.setenv("VOICE_API_LAMBDA_NAME", "from-settings")
+        monkeypatch.setenv(
+            "API_KEY_SECRET_ARN",
+            "arn:aws:secretsmanager:us-east-1:123:secret:test",
+        )
+        settings = Settings(_env_file=None)
+
+        # Flip env after Settings is constructed. If the loader read
+        # env directly we'd see "from-env" below.
+        monkeypatch.setenv("VOICE_API_LAMBDA_NAME", "from-env-shouldnt-be-used")
+
+        mock_invoke = mocker.patch("app.config.agent_config._invoke_lambda_sync")
+        mock_invoke.return_value = _mock_invoke_response(200, _runtime_config_json())
+
+        await load_agent_config("chris-claim-status", settings=settings)
+
+        function_name, _payload = mock_invoke.call_args.args
+        assert function_name == "from-settings"
