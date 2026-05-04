@@ -50,14 +50,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 # Layer 1, 2, 3
 from app.config import Settings, load_agent_config  # noqa: E402
-from app.services import build_llm, build_stt, build_tts  # noqa: E402
+from app.services import build_stt, build_tts  # noqa: E402
+from app.services.factory import resolve_bedrock_model_id  # noqa: E402
 
 # Pipecat 1.1.0
 from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import LLMRunFrame
+from pipecat.frames.frames import LLMRunFrame, TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -66,6 +67,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
+from pipecat.services.aws.llm import AWSBedrockLLMService
 from pipecat.transports.daily.transport import DailyParams, DailyTransport
 from pipecat.transports.daily.utils import (
     DailyRESTHelper,
@@ -153,24 +155,43 @@ async def main() -> None:
             tools=[t.type for t in agent.tools],
         )
 
-        # ── 5. Build the three vendor services via Layer 3 ─────────────────
+        # ── 5. Build STT / TTS via Layer 3; build LLM directly here ────────
+        # build_llm doesn't currently accept system_instruction, but
+        # Pipecat 1.1.0's Bedrock service requires the system prompt
+        # to come via Settings.system_instruction — putting it as a
+        # role="system" message in the LLMContext gets silently
+        # converted to role="user" and Claude responds to it as user
+        # input (skeleton run #1 reproduced this exactly).
+        #
+        # When this lands in Layer 3 properly, build_llm will accept
+        # system_instruction and the spike-only override goes away.
         stt = build_stt(agent)
         tts = build_tts(agent)
-        llm = build_llm(agent, settings=settings)
+        llm = AWSBedrockLLMService(
+            aws_region=settings.aws_region,
+            settings=AWSBedrockLLMService.Settings(
+                model=resolve_bedrock_model_id(agent.llm.model),
+                max_tokens=agent.llm.max_tokens,
+                temperature=agent.llm.temperature,
+                system_instruction=agent.system_prompt,
+                enable_prompt_caching=True,
+            ),
+        )
         logger.info(
             "services_built",
             stt=type(stt).__name__,
             tts=type(tts).__name__,
             llm=type(llm).__name__,
+            system_instruction_chars=len(agent.system_prompt),
         )
 
-        # ── 6. Seed the LLM context with the system prompt ─────────────────
-        # Just the system prompt — push LLMRunFrame on connect and
-        # let Claude figure out the opener from the prompt's
-        # instructions. Whether that matches agent.first_message
-        # exactly is one of the questions this skeleton tests.
+        # ── 6. Seed the LLM context with the bot's first_message ───────────
+        # The system prompt now lives on the service (system_instruction);
+        # the messages list seeds the conversation with the bot's
+        # opener so when the user responds, Claude has context that
+        # the call already started.
         messages: list[dict] = [
-            {"role": "system", "content": agent.system_prompt},
+            {"role": "assistant", "content": agent.first_message},
         ]
         context = LLMContext(messages)
 
@@ -205,13 +226,21 @@ async def main() -> None:
         )
 
         # ── 8. Daily transport with the room we just created ───────────────
+        # audio_in_sample_rate=8000 forces Daily to deliver 8 kHz audio,
+        # matching the Layer 3 AssemblyAI factory's locked-in 8 kHz
+        # config (Cosentus's PSTN target). Without this, Daily browser
+        # delivers 16 kHz; AssemblyAI interprets the bytes at 8 kHz
+        # speed and produces nonsense transcripts (skeleton run #1
+        # reproduced this — "hello" got transcribed as "I know").
         transport = DailyTransport(
             room.url,
             token,
             "v2 walking skeleton",
             DailyParams(
                 audio_in_enabled=True,
+                audio_in_sample_rate=8000,
                 audio_out_enabled=True,
+                audio_out_sample_rate=24000,
                 vad_analyzer=vad,
             ),
         )
@@ -243,11 +272,15 @@ async def main() -> None:
         @transport.event_handler("on_client_connected")
         async def on_client_connected(transport_, client):
             logger.info("client_connected", client=client)
-            # Push LLMRunFrame so Claude generates the opener from
-            # the system prompt. Per the brief — even though the
-            # agent has a first_message field, this skeleton exercises
-            # the raw LLM-driven opener path.
-            await task.queue_frames([LLMRunFrame()])
+            # Speak first_message via TTS directly. We do NOT push
+            # LLMRunFrame here because the messages list now starts
+            # with first_message as a seeded assistant turn — calling
+            # the LLM with no user message would either fail (Bedrock
+            # rejects empty user turn) or have Claude improvise the
+            # opener again, defeating the point of having
+            # first_message at all.
+            _ = LLMRunFrame  # silence unused-import
+            await task.queue_frames([TTSSpeakFrame(agent.first_message)])
 
         @transport.event_handler("on_client_disconnected")
         async def on_client_disconnected(transport_, client):

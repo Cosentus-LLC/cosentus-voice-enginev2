@@ -56,6 +56,7 @@ def settings_fixture(monkeypatch: pytest.MonkeyPatch) -> Settings:
 def _agent(
     *,
     name: str = "test-agent",
+    system_prompt: str = "You are a test agent.",
     llm_model: str = "claude-haiku-4-5",
     llm_max_tokens: int | None = None,
     llm_temperature: float | None = None,
@@ -68,6 +69,7 @@ def _agent(
     """Construct a minimal AgentConfig for tests."""
     return AgentConfig(
         name=name,
+        system_prompt=system_prompt,
         llm=LLMConfig(
             model=llm_model,
             max_tokens=llm_max_tokens if llm_max_tokens is not None else 200,
@@ -369,3 +371,52 @@ class TestBuildLlm:
         build_llm(_agent(llm_model=""), settings_fixture)
 
         assert mock_cls.call_args.kwargs["model"] == _BEDROCK_DEFAULT_MODEL
+
+    def test_system_instruction_passed_from_agent(self, mocker, settings_fixture: Settings):
+        # Surfaced by walking-skeleton run #1: putting the system
+        # prompt as a role="system" message in LLMContext got silently
+        # rendered as user input by Bedrock. Pipecat's documented
+        # pattern is Settings.system_instruction, which is what
+        # build_llm now uses.
+        mock_cls = mocker.patch("app.services.factory.AWSBedrockLLMService")
+
+        prompt = "You are Chris, a billing specialist."
+        build_llm(_agent(system_prompt=prompt), settings_fixture)
+
+        settings_kwargs = mock_cls.Settings.call_args.kwargs
+        assert settings_kwargs["system_instruction"] == prompt
+
+    def test_system_instruction_always_passed_unconditionally(
+        self, mocker, settings_fixture: Settings
+    ):
+        # Even an empty system_prompt is forwarded — the field is
+        # always set on Settings, never elided. This keeps the
+        # behavior predictable: nothing in build_llm decides whether
+        # the system prompt "deserves" to be passed.
+        mock_cls = mocker.patch("app.services.factory.AWSBedrockLLMService")
+
+        build_llm(_agent(system_prompt=""), settings_fixture)
+
+        settings_kwargs = mock_cls.Settings.call_args.kwargs
+        assert "system_instruction" in settings_kwargs
+        assert settings_kwargs["system_instruction"] == ""
+
+    def test_multiline_system_prompt_passed_unchanged(self, mocker, settings_fixture: Settings):
+        # Cosentus's prompts are multi-KB, multi-section markdown
+        # with headers, lists, and template variables. Verify the
+        # full string passes through intact — no truncation, no
+        # stripping, no transformation.
+        mock_cls = mocker.patch("app.services.factory.AWSBedrockLLMService")
+
+        prompt = (
+            "# Identity\n"
+            "You are Chris.\n\n"
+            "# Rules\n"
+            "1. One question at a time.\n"
+            "2. {{template_variable}} stays literal.\n"
+        )
+        build_llm(_agent(system_prompt=prompt), settings_fixture)
+
+        settings_kwargs = mock_cls.Settings.call_args.kwargs
+        assert settings_kwargs["system_instruction"] == prompt
+        assert "{{template_variable}}" in settings_kwargs["system_instruction"]

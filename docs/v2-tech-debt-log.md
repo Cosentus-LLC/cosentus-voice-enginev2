@@ -261,3 +261,33 @@ be unreachable) or both harmonized to the same value.
 **Layer / file.** Layer 1 — `app/config/agent_config.py`
 (`TTSConfig.model` default); Layer 3 — `app/services/factory.py`
 (`_ELEVENLABS_DEFAULT_MODEL`).
+
+## Entry 9: `DailyParams` must explicitly set `audio_in_sample_rate=8000`
+
+**What.** Daily browser-based audio is 16 kHz by default. v2's
+AssemblyAI STT is hardcoded to 8 kHz (PSTN-correct via Layer 3
+locked-in choice). Without explicit `audio_in_sample_rate=8000`
+on `DailyParams`, browser audio mismatches the STT sample rate
+and produces garbage transcripts ("hello" → "I know", "could you
+hear me?" → "could you go away?" — both reproduced in the walking
+skeleton's run #1).
+
+**Why we shipped it.** Discovery during walking-skeleton testing.
+Layer 8 (pipeline builder) hasn't been written yet, so the fix
+lands when `DailyParams` is constructed there. Production PSTN
+calls deliver 8 kHz audio natively, so prod isn't actually broken
+today — but any browser-based testing, dev calls, or hybrid
+scenarios will hit this without the explicit setting.
+
+**Cost.** Easy to forget. If Layer 8's brief doesn't explicitly
+call this out, walking-skeleton-style failures repeat on the
+first dev test. Entry exists primarily to make sure Layer 8
+doesn't repeat the discovery.
+
+**Exit condition.** Layer 8 ships with
+`DailyParams(audio_in_sample_rate=8000, ...)` and the explicit
+setting is covered by a pipeline test. At that point this entry
+can be marked closed.
+
+**Layer / file.** Layer 8 — pipeline builder, `DailyTransport` /
+`DailyParams` construction.

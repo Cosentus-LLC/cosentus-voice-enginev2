@@ -282,7 +282,8 @@ def build_llm(agent: AgentConfig, settings: Settings) -> AWSBedrockLLMService:
     """Construct the AWS Bedrock Claude LLM service.
 
     Per-agent: ``llm.model`` (resolved to a full Bedrock inference
-    profile ID), ``llm.max_tokens``, ``llm.temperature``.
+    profile ID), ``llm.max_tokens``, ``llm.temperature``,
+    ``system_prompt`` (passed via ``Settings.system_instruction``).
 
     Hardcoded: ``enable_prompt_caching=True``. v1 had a per-agent
     flag that was logged but never wired into the constructor — the
@@ -291,6 +292,17 @@ def build_llm(agent: AgentConfig, settings: Settings) -> AWSBedrockLLMService:
     full input cost on the first request and cached cost
     thereafter.
 
+    The system prompt is passed via ``Settings.system_instruction``
+    rather than as a ``role="system"`` entry in the
+    :class:`LLMContext` messages list. Pipecat's context-management
+    docs warn that a system message in the context can be lost
+    during context summarization or full replacement; the Bedrock
+    service in particular does not surface it as a system prompt at
+    all — it is silently rendered as user input. Walking-skeleton
+    run #1 reproduced this exactly (Claude responded to the 35 KB
+    identity prompt as if it were a user message). The
+    ``system_instruction`` path is the documented Pipecat pattern.
+
     Region comes from Layer 2 ``Settings.aws_region``. Credentials
     use boto3's default chain (Fargate task IAM role) — no explicit
     keys passed.
@@ -298,6 +310,11 @@ def build_llm(agent: AgentConfig, settings: Settings) -> AWSBedrockLLMService:
     model_id = resolve_bedrock_model_id(agent.llm.model)
 
     llm_settings_kwargs: dict[str, object] = {
+        # The system prompt always lives on the service via
+        # system_instruction — not in LLMContext.messages — so it
+        # survives context summarization and Bedrock honors it as
+        # an actual system prompt.
+        "system_instruction": agent.system_prompt,
         # Hardcoded ON. v1 had a per-agent flag that was always
         # logged but never wired — so caching was effectively off
         # platform-wide. Closing that gap here.
