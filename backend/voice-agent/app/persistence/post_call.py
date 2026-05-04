@@ -49,7 +49,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from typing import Any
 
 import boto3
@@ -64,26 +63,22 @@ from app.services.factory import resolve_bedrock_model_id
 logger = structlog.get_logger(__name__)
 
 
-# Region read at module import via the same pattern Layer 1 uses for
-# the lambda client. Aurora-loaded ``settings.aws_region`` reads from
-# the identical ``AWS_REGION`` env var, so the two values agree at
-# steady state. See agent_config.py for the AWS-doc rationale on
-# module-level boto3 clients (avoids SSL interpreter races in
-# concurrent contexts; sync clients are thread-safe).
-_REGION_ENV = "AWS_REGION"
-_DEFAULT_REGION = "us-east-1"
-_BEDROCK_CLIENT = boto3.session.Session().client(
-    "bedrock-runtime",
-    region_name=os.environ.get(_REGION_ENV, _DEFAULT_REGION),
-    config=BotoConfig(
-        # Connect quickly — Bedrock's regional endpoint is fast when
-        # healthy. Read takes longer; structured extraction with
-        # transcript context can run 2-8 s on Haiku.
-        connect_timeout=5.0,
-        read_timeout=30.0,
-        retries={"max_attempts": 2, "mode": "adaptive"},
-    ),
-)
+# Lazy-initialized Bedrock client. ``None`` until :func:`_get_bedrock_client`
+# runs the first time, at which point we construct the client using
+# ``settings.aws_region`` and cache it for every subsequent call.
+#
+# This pattern closes the Entry 11 anti-pattern (region captured at
+# import time from ``os.environ`` regardless of what ``Settings`` says).
+# Now the function signature's promise — "the settings parameter
+# configures the client" — is actually true.
+#
+# Module-level cache is the AWS-documented multithreading pattern (one
+# shared thread-safe client across worker threads), see
+# https://boto3.amazonaws.com/v1/documentation/api/latest/guide/clients.html.
+# The race-condition window during the first concurrent ``_get_*``
+# calls creates at most one duplicate client which is GC'd; the global
+# slot ends up with a single shared instance.
+_BEDROCK_CLIENT: Any = None
 
 # Default model when the agent's ``post_call_analyses.model`` is
 # empty. Haiku is the right default — fast, cheap, and structured
@@ -126,10 +121,9 @@ async def run_post_call_analyses(
         transcript: Output of
             :meth:`~app.persistence.transcript.TranscriptAccumulator.to_list`
             — the full conversation including tool turns.
-        settings: Layer 2 settings. Currently unused at the boto3
-            level (region is captured at module import) but accepted
-            so the signature is stable for when the boto3 client
-            life-cycle is reworked.
+        settings: Layer 2 settings. Drives the lazy-initialized
+            Bedrock client's region binding (see
+            :func:`_get_bedrock_client`).
 
     Returns:
         ``{field_name: value, ...}`` matching ``agent.post_call_analyses.fields``.
@@ -158,7 +152,7 @@ async def run_post_call_analyses(
     last_error: str | None = None
     for attempt in range(_MAX_PARSE_RETRIES + 1):
         try:
-            raw = await _invoke_bedrock(bedrock_id, prompt)
+            raw = await _invoke_bedrock(bedrock_id, prompt, settings)
         except (BotoCoreError, ClientError) as exc:
             api_code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
             logger.error(
@@ -271,7 +265,34 @@ def _build_extraction_prompt(
     return "\n".join(lines)
 
 
-async def _invoke_bedrock(model_id: str, prompt: str) -> str:
+def _get_bedrock_client(settings: Settings) -> Any:
+    """Return the module-shared ``bedrock-runtime`` client, constructing it
+    lazily on first call using ``settings.aws_region``.
+
+    Idempotent — every call after the first returns the cached client.
+    The first call pays the construction cost (~1 ms on a warm
+    interpreter). The boto3 sync client is thread-safe so the same
+    instance is shared across the worker threads
+    :func:`asyncio.to_thread` dispatches to.
+    """
+    global _BEDROCK_CLIENT
+    if _BEDROCK_CLIENT is None:
+        _BEDROCK_CLIENT = boto3.session.Session().client(
+            "bedrock-runtime",
+            region_name=settings.aws_region,
+            config=BotoConfig(
+                # Connect quickly — Bedrock's regional endpoint is fast
+                # when healthy. Read takes longer; structured extraction
+                # with transcript context can run 2-8 s on Haiku.
+                connect_timeout=5.0,
+                read_timeout=30.0,
+                retries={"max_attempts": 2, "mode": "adaptive"},
+            ),
+        )
+    return _BEDROCK_CLIENT
+
+
+async def _invoke_bedrock(model_id: str, prompt: str, settings: Settings) -> str:
     """Call Bedrock Converse with a single user message; return text.
 
     Synchronous boto3 wrapped in :func:`asyncio.to_thread` so it
@@ -279,8 +300,9 @@ async def _invoke_bedrock(model_id: str, prompt: str) -> str:
     first text block from the response, ``""`` if no text was
     returned (rare; usually means the model hit a content filter).
     """
+    client = _get_bedrock_client(settings)
     response = await asyncio.to_thread(
-        _BEDROCK_CLIENT.converse,
+        client.converse,
         modelId=model_id,
         messages=[{"role": "user", "content": [{"text": prompt}]}],
         inferenceConfig={

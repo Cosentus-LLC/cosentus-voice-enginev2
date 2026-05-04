@@ -13,6 +13,7 @@ from app.config.agent_config import (
     PostCallField,
 )
 from app.config.settings import Settings
+from app.persistence import post_call as post_call_module
 from app.persistence.post_call import (
     _build_extraction_prompt,
     _parse_and_validate,
@@ -382,3 +383,51 @@ def test_prompt_handles_empty_case_data():
     )
     prompt = _build_extraction_prompt(pca, {}, _transcript())
     assert "(none)" in prompt
+
+
+# ── Lazy-init Bedrock client binding ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_bedrock_client_binds_region_from_settings_on_first_call():
+    """The lazy-init pattern must build the client from ``settings.aws_region``,
+    not from the env-var-at-import. Closes Entry 11."""
+    # Reset the module-level cache so the next ``_get_bedrock_client``
+    # call constructs a fresh client.
+    post_call_module._BEDROCK_CLIENT = None
+
+    agent = _agent(fields=[PostCallField(name="summary", type="text")])
+    settings = Settings(
+        voice_api_lambda_name="test-api",
+        api_key_secret_arn="arn:aws:secretsmanager:us-east-1:0:secret:test",
+        aws_region="us-west-2",
+    )
+
+    captured = {}
+
+    def fake_client(service: str, region_name: str, config):
+        captured["service"] = service
+        captured["region"] = region_name
+        mock = MagicMock()
+        mock.converse.return_value = {
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [{"text": json.dumps({"summary": "ok"})}],
+                }
+            }
+        }
+        return mock
+
+    fake_session = MagicMock()
+    fake_session.client = MagicMock(side_effect=fake_client)
+    with patch(
+        "app.persistence.post_call.boto3.session.Session",
+        return_value=fake_session,
+    ):
+        await run_post_call_analyses(agent, {}, _transcript(), settings)
+
+    assert captured["service"] == "bedrock-runtime"
+    assert captured["region"] == "us-west-2"
+    # Reset for subsequent tests so no module-level state leaks.
+    post_call_module._BEDROCK_CLIENT = None

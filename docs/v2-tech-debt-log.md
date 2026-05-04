@@ -362,7 +362,21 @@ deleted entirely. Until then, Layer 8 just inherits the pattern.
 `backend/voice-agent/scripts/walking_skeleton.py` (research artifact
 only).
 
-## Entry 11: `_BEDROCK_CLIENT` region captured at import time
+## Entry 11: ~~`_BEDROCK_CLIENT` region captured at import time~~
+
+**Closed:** 2026-05-04 in a Layer 6 follow-up commit.
+``app/persistence/post_call.py`` now uses a ``_get_bedrock_client(settings)``
+lazy-init helper: the boto3 ``bedrock-runtime`` client is constructed
+on first call using ``settings.aws_region``, then cached at module
+level for subsequent calls. The function signature's promise — "the
+settings parameter configures the client" — is now actually true.
+Layer 1's ``_LAMBDA_CLIENT`` (Entry 4) gets the same treatment in a
+parallel follow-up.
+
+---
+
+<details>
+<summary>Original entry (kept for history)</summary>
 
 **What.** `app/persistence/post_call.py` constructs the boto3
 ``bedrock-runtime`` client at module import using
@@ -433,3 +447,5 @@ the natural place to apply both.
 **Layer / file.** Layer 6 —
 ``backend/voice-agent/app/persistence/post_call.py`` module-level
 ``_BEDROCK_CLIENT``. Cross-references Entry 4.
+
+</details>
