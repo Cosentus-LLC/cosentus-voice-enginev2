@@ -467,3 +467,53 @@ the natural place to apply both.
 ``_BEDROCK_CLIENT``. Cross-references Entry 4.
 
 </details>
+
+## Entry 12: ~~`PipelineRunner` signal handlers conflict under concurrent calls~~
+
+**Closed:** 2026-05-04 in Layer 8 (commit forthcoming).
+``app/bot/bot.py::run_bot`` constructs ``PipelineRunner(handle_sigint=False,
+handle_sigterm=False)`` so concurrent calls don't clobber each other's
+signal handlers. Layer 9 (when it lands) will install a single
+process-level handler that iterates active sessions and cancels each
+task. v2 ships fixed; v1 / AWS sample ship the bug.
+
+---
+
+<details>
+<summary>Original entry (kept for history)</summary>
+
+**What.** Default ``PipelineRunner(handle_sigint=True)`` registers a
+process-wide SIGINT handler via ``loop.add_signal_handler``, which
+**replaces** (not appends) any prior handler. With N concurrent
+calls in one Fargate process (``MAX_CONCURRENT_CALLS=4`` in
+production), only the most-recently-constructed runner's tasks
+receive SIGINT — earlier calls are leaked.
+
+Verified empirically by reading
+``.venv/lib/python3.12/site-packages/pipecat/pipeline/runner.py``
+lines 33–62 (constructor) and 110–117 (signal-handler setup).
+``add_signal_handler`` semantics confirmed via Python docs.
+
+**Why we ship fixed.** The fix is straightforward: pass
+``handle_sigint=False`` and ``handle_sigterm=False`` at runner
+construction. Layer 9 (runtime) installs a single process-level
+SIGTERM handler that iterates ``pipeline_manager.active_sessions``
+and cancels each ``asyncio.Task``. Cost is one extra discipline
+rule documented at the runner-construction site in ``run_bot``.
+
+**Original bug source.** AWS sample-voice-agent
+(``aws-solutions-library-samples/sample-voice-agent``) constructs
+``PipelineRunner()`` with defaults at every call. v1 inherited the
+pattern from the fork. v2 deviates explicitly and documents the
+deviation inline.
+
+**Empirical verification.** Done as part of Layer 8 verification
+brief (see commits ``aecbd6d`` and ``78af92a`` lazy-init follow-ups
+for context on similar concurrent-state issues we'd already
+caught + fixed).
+
+**Layer / file.** Layer 8 — ``backend/voice-agent/app/bot/bot.py``
+``PipelineRunner`` construction site. Layer 9 (future) — process-
+level signal handler.
+
+</details>
