@@ -377,8 +377,13 @@ async def test_run_bot_constructs_pipeline_runner_with_signal_handlers_off():
 
 
 @pytest.mark.asyncio
-async def test_run_bot_attaches_observers_to_pipeline_task():
-    """PipelineTask.observers must include both Layer 7 observers."""
+async def test_run_bot_attaches_error_observer_to_pipeline_task():
+    """After the May 2026 transcript-observer rewrite, only the
+    ErrorObserver remains on PipelineTask.observers. Transcript
+    capture is wired via aggregator event handlers
+    (``on_user_turn_stopped`` / ``on_assistant_turn_stopped``) and
+    isn't an observer in the BaseObserver sense.
+    """
     agent, mocks = _patch_run_bot_dependencies()
     transport = _make_transport_mock()
     patches = _start_run_bot_patches(agent, mocks, transport)
@@ -391,11 +396,11 @@ async def test_run_bot_attaches_observers_to_pipeline_task():
             p.stop()
 
     observers = mocks["pipeline_task_kwargs"]["observers"]
-    # Layer 7 contributes exactly two — TranscriptObserver + ErrorObserver.
-    assert len(observers) == 2
+    # Only the ErrorObserver is left in the observers list.
+    assert len(observers) == 1
     class_names = {type(o).__name__ for o in observers}
-    assert "TranscriptObserver" in class_names
     assert "ErrorObserver" in class_names
+    assert "TranscriptObserver" not in class_names
 
 
 @pytest.mark.asyncio

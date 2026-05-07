@@ -181,12 +181,20 @@ async def test_concurrent_appends_preserve_unique_turn_numbers():
 
 @pytest.mark.asyncio
 async def test_to_list_returns_serializable_dicts():
-    """to_list yields plain dicts with iso timestamps."""
+    """to_list yields plain dicts with iso timestamps + interrupted flag."""
     accum = TranscriptAccumulator()
     await accum.append_user_turn("hello")
     turn = accum.to_list()[0]
     assert isinstance(turn, dict)
-    assert set(turn.keys()) == {"turn_number", "speaker", "content", "timestamp"}
+    assert set(turn.keys()) == {
+        "turn_number",
+        "speaker",
+        "content",
+        "timestamp",
+        "interrupted",
+    }
+    # User turns never carry interrupted=True regardless of what was passed.
+    assert turn["interrupted"] is False
     # ISO-8601 round-trips.
     datetime.fromisoformat(turn["timestamp"])
 
@@ -206,7 +214,7 @@ async def test_to_list_returns_fresh_list_on_each_call():
 
 
 def test_transcript_turn_to_dict():
-    """Direct dataclass-to-dict round-trip."""
+    """Direct dataclass-to-dict round-trip; ``interrupted`` defaults to ``False``."""
     turn = TranscriptTurn(
         turn_number=3,
         speaker="user",
@@ -218,7 +226,20 @@ def test_transcript_turn_to_dict():
         "speaker": "user",
         "content": "hello",
         "timestamp": "2026-05-04T12:00:00+00:00",
+        "interrupted": False,
     }
+
+
+def test_transcript_turn_to_dict_with_interrupted():
+    """``interrupted=True`` lands in the JSONB serialization."""
+    turn = TranscriptTurn(
+        turn_number=2,
+        speaker="assistant",
+        content="I was about to say",
+        timestamp=datetime(2026, 5, 7, 19, 38, 46, tzinfo=UTC),
+        interrupted=True,
+    )
+    assert turn.to_dict()["interrupted"] is True
 
 
 def test_transcript_turn_is_frozen():
@@ -242,3 +263,63 @@ async def test_invalid_speaker_raises_value_error():
     accum = TranscriptAccumulator()
     with pytest.raises(ValueError, match="Invalid speaker"):
         await accum._append(speaker="bot", content="x", timestamp=None)
+
+
+# ── ``interrupted`` flag ───────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_assistant_turn_interrupted_flag_persists():
+    """``append_assistant_turn(interrupted=True)`` lands in the JSONB."""
+    accum = TranscriptAccumulator()
+    await accum.append_assistant_turn(
+        "I was about to say something",
+        interrupted=True,
+    )
+    turn = accum.to_list()[0]
+    assert turn["speaker"] == "assistant"
+    assert turn["interrupted"] is True
+
+
+@pytest.mark.asyncio
+async def test_assistant_turn_interrupted_defaults_to_false():
+    """The default for ``append_assistant_turn`` is ``interrupted=False`` —
+    the static-opener path doesn't pass the kwarg and shouldn't be
+    flagged as interrupted.
+    """
+    accum = TranscriptAccumulator()
+    await accum.append_assistant_turn("Hi, this is the Cosentus voice assistant.")
+    turn = accum.to_list()[0]
+    assert turn["interrupted"] is False
+
+
+@pytest.mark.asyncio
+async def test_user_turn_never_carries_interrupted_true():
+    """Only assistant turns can be ``interrupted=True``. Defensive
+    guard inside ``_append`` strips the flag for user/tool turns
+    even if a producer somehow passes it.
+    """
+    accum = TranscriptAccumulator()
+    await accum._append(
+        speaker="user",
+        content="hi",
+        timestamp=None,
+        interrupted=True,  # producer bug — ignored
+    )
+    turn = accum.to_list()[0]
+    assert turn["speaker"] == "user"
+    assert turn["interrupted"] is False
+
+
+@pytest.mark.asyncio
+async def test_tool_turn_never_carries_interrupted_true():
+    accum = TranscriptAccumulator()
+    await accum._append(
+        speaker="tool",
+        content="press_digit(digits='1') → success",
+        timestamp=None,
+        interrupted=True,  # producer bug — ignored
+    )
+    turn = accum.to_list()[0]
+    assert turn["speaker"] == "tool"
+    assert turn["interrupted"] is False

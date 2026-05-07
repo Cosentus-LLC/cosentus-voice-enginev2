@@ -98,7 +98,7 @@ from app.config.settings import Settings
 from app.hydration.hydrator import hydrate_prompt
 from app.observers.error_observer import ErrorObserver
 from app.observers.error_state import ErrorState
-from app.observers.transcript_observer import TranscriptObserver
+from app.observers.transcript_observer import wire_transcript_handlers
 from app.persistence.transcript import TranscriptAccumulator
 from app.services.factory import build_llm, build_stt, build_tts
 from app.tools.executor import ToolExecutor
@@ -225,10 +225,16 @@ async def run_bot(
     registry = build_registry_for_call(agent, settings)
     executor = ToolExecutor(registry)
 
-    # ── Layers 6 + 7: accumulators + observers ─────────────────────────
+    # ── Layers 6 + 7: accumulators + error observer ────────────────────
+    # User/assistant transcript turns now flow via Pipecat's canonical
+    # aggregator events (see Layer 7 ``wire_transcript_handlers``);
+    # the wire-up itself happens after the aggregator pair is built
+    # below. Tool turns are still appended directly by Layer 4's tool
+    # handler closure. The error observer remains a BaseObserver
+    # subclass attached to PipelineTask — Pipecat doesn't ship an
+    # error-state-recording primitive.
     accumulator = TranscriptAccumulator()
     error_state = ErrorState()
-    transcript_observer = TranscriptObserver(accumulator)
     error_observer = ErrorObserver(error_state)
 
     # ── Per-call mutable closure state ────────────────────────────────
@@ -287,6 +293,13 @@ async def run_bot(
         ),
     )
 
+    # Wire Layer 7's transcript capture to the aggregator's canonical
+    # ``on_user_turn_stopped`` / ``on_assistant_turn_stopped`` events.
+    # Captures Pipecat's ``AssistantTurnStoppedMessage.interrupted``
+    # flag — propagates to ``TranscriptTurn.interrupted`` so analysts
+    # can see which assistant turns were cut off by user barge-in.
+    wire_transcript_handlers(aggregator_pair, accumulator)
+
     # ── Pipeline assembly ─────────────────────────────────────────────
     pipeline = Pipeline(
         [
@@ -303,7 +316,9 @@ async def run_bot(
     # ── PipelineTask ──────────────────────────────────────────────────
     # Built-in TurnTrackingObserver + UserBotLatencyObserver auto-
     # attach when enable_metrics=True (Pipecat 1.1.0 internals).
-    # Layer 7's two observers ride alongside.
+    # Layer 7's ErrorObserver rides alongside; transcript capture is
+    # wired via aggregator event handlers above and isn't attached
+    # to PipelineTask.observers.
     idle_timeout = (
         getattr(runner_args, "pipeline_idle_timeout_secs", None) or _DEFAULT_IDLE_TIMEOUT_SECS
     )
@@ -314,7 +329,7 @@ async def run_bot(
             enable_metrics=True,
             enable_usage_metrics=True,
         ),
-        observers=[transcript_observer, error_observer],
+        observers=[error_observer],
         idle_timeout_secs=idle_timeout,
     )
 

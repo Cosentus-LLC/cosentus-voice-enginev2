@@ -49,20 +49,39 @@ class TranscriptTurn:
             formatted ``tool_name(args) → status`` line — see
             :meth:`TranscriptAccumulator.append_tool_turn`.
         timestamp: When the turn was finalized. UTC.
+        interrupted: ``True`` when an assistant turn was cut off mid-
+            speech (user barge-in or pipeline cancel). Defaults to
+            ``False`` and stays ``False`` for ``user`` and ``tool``
+            turns regardless. Sourced from Pipecat's
+            :class:`AssistantTurnStoppedMessage.interrupted` flag —
+            available since Pipecat 1.1.0; previous v2 transcript
+            implementation reconstructed turns from frame streams
+            and had no equivalent signal.
     """
 
     turn_number: int
     speaker: str
     content: str
     timestamp: datetime
+    interrupted: bool = False
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialize to the ``voice_calls.transcript`` JSONB shape."""
+        """Serialize to the ``voice_calls.transcript`` JSONB shape.
+
+        ``interrupted`` is always written so the consuming lambda /
+        frontend can rely on the field existing without a
+        ``KeyError`` guard. ``False`` is the safe default for
+        non-assistant turns and for assistant turns that finished
+        cleanly. Backward-compatible: existing transcript rows
+        written before this field landed simply lack the key in
+        their stored JSONB; readers should default-to-False.
+        """
         return {
             "turn_number": self.turn_number,
             "speaker": self.speaker,
             "content": self.content,
             "timestamp": self.timestamp.isoformat(),
+            "interrupted": self.interrupted,
         }
 
 
@@ -103,15 +122,37 @@ class TranscriptAccumulator:
         self,
         content: str,
         timestamp: datetime | None = None,
+        *,
+        interrupted: bool = False,
     ) -> None:
         """Append a finalized bot response as a turn.
 
-        ``content`` is the assistant's full text for the turn; Layer 7
-        accumulates ``TextFrame`` chunks between
+        ``content`` is the assistant's full text for the turn — Layer
+        7's wirer reads it from
+        :class:`pipecat.processors.aggregators.llm_response_universal.AssistantTurnStoppedMessage.content`,
+        which is Pipecat's own aggregated text for the turn (the
+        framework already concatenates ``TextFrame`` chunks between
         ``LLMFullResponseStartFrame`` and ``LLMFullResponseEndFrame``
-        and calls here once with the joined string.
+        and applies inter-frame whitespace handling).
+
+        Args:
+            content: Joined assistant utterance text.
+            timestamp: When the turn started; defaults to ``now`` if
+                unspecified. Layer 7 forwards
+                :attr:`AssistantTurnStoppedMessage.timestamp` here.
+            interrupted: ``True`` when Pipecat detected the assistant
+                turn was cut off (user barge-in / pipeline cancel).
+                Forwarded from
+                :attr:`AssistantTurnStoppedMessage.interrupted`. The
+                static-opener path (Layer 8 calls this directly with
+                a deterministic greeting) leaves it ``False``.
         """
-        await self._append(speaker="assistant", content=content, timestamp=timestamp)
+        await self._append(
+            speaker="assistant",
+            content=content,
+            timestamp=timestamp,
+            interrupted=interrupted,
+        )
 
     async def append_tool_turn(
         self,
@@ -158,6 +199,7 @@ class TranscriptAccumulator:
         speaker: str,
         content: str,
         timestamp: datetime | None,
+        interrupted: bool = False,
     ) -> None:
         if speaker not in _VALID_SPEAKERS:
             # Producer bug — fail loudly. Unknown speakers would
@@ -166,6 +208,10 @@ class TranscriptAccumulator:
                 f"Invalid speaker {speaker!r}; must be one of {sorted(_VALID_SPEAKERS)}"
             )
         ts = timestamp if timestamp is not None else datetime.now(UTC)
+        # Only assistant turns can carry interrupted=True. Defensive
+        # guard so a stray user/tool call with the kwarg doesn't
+        # confuse downstream consumers.
+        effective_interrupted = interrupted if speaker == "assistant" else False
         async with self._lock:
             self._turns.append(
                 TranscriptTurn(
@@ -173,6 +219,7 @@ class TranscriptAccumulator:
                     speaker=speaker,
                     content=content,
                     timestamp=ts,
+                    interrupted=effective_interrupted,
                 )
             )
 
