@@ -102,6 +102,50 @@ class TestTransferCallExecutor:
         # transport exception.
         assert "transfer" in (result.error or "").lower()
 
+    async def test_handler_does_not_push_pipeline_control_frames(self):
+        """REGRESSION GUARD against the Bug A anti-pattern.
+
+        The May 2026 Bug A audit established: tool handlers must
+        not push ``InterruptionTaskFrame`` / ``InterruptionFrame``
+        / ``CancelTaskFrame`` / any pipeline-control frame, because
+        doing so disrupts the function-call lifecycle and makes
+        tool_use / tool_result blocks vanish from the LLM context.
+        transfer_call already follows the standard pattern (calls
+        ``transport.sip_call_transfer`` directly, no frame pushes);
+        this test fails the build if anyone re-introduces the
+        anti-pattern.
+        """
+        from pipecat.frames.frames import (
+            CancelTaskFrame,
+            InterruptionFrame,
+            InterruptionTaskFrame,
+        )
+
+        queue_frame_mock = AsyncMock()
+        transport = MagicMock()
+        transport.sip_call_transfer = AsyncMock(return_value=None)
+        ctx = ToolContext(
+            call_id="call-1",
+            session_id="call-1",
+            sip_session_id="sip-leg-1",
+            transport=transport,
+            queue_frame=queue_frame_mock,
+            tool_settings={"targets": {"billing": "+15551234567"}},
+        )
+
+        await transfer_call_executor({"target": "billing"}, ctx)
+
+        forbidden_types = (
+            InterruptionTaskFrame,
+            InterruptionFrame,
+            CancelTaskFrame,
+        )
+        for call in queue_frame_mock.await_args_list:
+            frame = call.args[0]
+            assert not isinstance(frame, forbidden_types), (
+                f"transfer_call must not push {type(frame).__name__}"
+            )
+
 
 class TestTransferCallDefinition:
     def test_name_matches_aurora_valid_tool_types(self):

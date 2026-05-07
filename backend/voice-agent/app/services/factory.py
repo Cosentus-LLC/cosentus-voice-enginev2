@@ -52,6 +52,7 @@ in v1's phase-8 branch:
 from __future__ import annotations
 
 import os
+import re
 
 import structlog
 from pipecat.services.assemblyai.stt import AssemblyAISTTService
@@ -170,6 +171,20 @@ _SHORT_TO_BEDROCK: dict[str, str] = {
 # ── Public functions ───────────────────────────────────────────────────────
 
 
+# Aurora occasionally stores dated short forms ("claude-haiku-4-5-
+# 20251001"). The lambda's POST /api/agents/:name/clone path inherits
+# whatever ``post_call_analyses.model`` value was on the source agent;
+# v2-tools-test ships with the dated form, so any agent cloned from
+# it carries it forward. Stripping a trailing -YYYYMMDD before map
+# lookup means a single map entry per Claude version covers both
+# forms — and any future date-suffix variants land here automatically.
+# Caught empirically in the v2 inbound PSTN test (call_id
+# c18a181a-...): post_call_analyses.model was "claude-haiku-4-5-
+# 20251001" → not in map → passed through to Bedrock → rejected
+# with ValidationException.
+_DATE_SUFFIX_RE = re.compile(r"-\d{8}$")
+
+
 def resolve_bedrock_model_id(short_or_full: str) -> str:
     """Resolve an agent's ``llm.model`` value into a Bedrock inference profile ID.
 
@@ -178,7 +193,10 @@ def resolve_bedrock_model_id(short_or_full: str) -> str:
     1. Empty / falsy → :data:`_BEDROCK_DEFAULT_MODEL`.
     2. Already a full Bedrock ID (contains a dot) → pass through.
     3. Known short form → mapped via :data:`_SHORT_TO_BEDROCK`.
-    4. Unknown short form → log warning, pass through (Bedrock will
+    4. Short form with a trailing ``-YYYYMMDD`` suffix → strip the
+       suffix and look up the un-dated form (e.g.
+       ``claude-haiku-4-5-20251001`` → ``claude-haiku-4-5``).
+    5. Unknown short form → log warning, pass through (Bedrock will
        reject with a clearer error than we can produce).
 
     See the module-level comment on :data:`_SHORT_TO_BEDROCK` for
@@ -191,6 +209,12 @@ def resolve_bedrock_model_id(short_or_full: str) -> str:
     mapped = _SHORT_TO_BEDROCK.get(short_or_full)
     if mapped:
         return mapped
+    # Try stripping a trailing -YYYYMMDD suffix.
+    stripped = _DATE_SUFFIX_RE.sub("", short_or_full)
+    if stripped != short_or_full:
+        mapped = _SHORT_TO_BEDROCK.get(stripped)
+        if mapped:
+            return mapped
     logger.warning(
         "bedrock_model_id_unknown_short_form",
         input=short_or_full,

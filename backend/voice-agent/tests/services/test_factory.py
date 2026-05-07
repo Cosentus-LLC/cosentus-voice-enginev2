@@ -137,6 +137,38 @@ class TestResolveBedrockModelId:
         for short in _SHORT_TO_BEDROCK:
             assert "." not in short, f"short key {short!r} contains a dot"
 
+    def test_dated_short_form_strips_yyyymmdd_suffix_and_resolves(self):
+        """Bug B: Aurora's ``post_call_analyses.model`` sometimes stores
+        a dated short form (``claude-haiku-4-5-20251001``). The
+        resolver strips a trailing ``-YYYYMMDD`` and looks up the
+        un-dated form. Caught empirically in the v2 inbound PSTN
+        test (call_id c18a181a-...): without this normalization the
+        post_call_analyses Bedrock invoke fails with
+        ``ValidationException``.
+        """
+        dated = "claude-haiku-4-5-20251001"
+        undated = "claude-haiku-4-5"
+        # Both forms must resolve to the same Bedrock inference profile ID.
+        assert resolve_bedrock_model_id(dated) == resolve_bedrock_model_id(undated)
+        assert resolve_bedrock_model_id(dated) == "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+
+    def test_dated_short_form_for_sonnet_4_5_resolves(self):
+        """Generalize: any model in the map that matches the dated
+        pattern should resolve. Sanity-check against sonnet-4-5.
+        """
+        assert (
+            resolve_bedrock_model_id("claude-sonnet-4-5-20250929")
+            == _SHORT_TO_BEDROCK["claude-sonnet-4-5"]
+        )
+
+    def test_dated_unknown_short_form_still_falls_through(self):
+        """Date suffix on an UNKNOWN base name should still pass
+        through (warn + return as-is). The strip-and-lookup path
+        only succeeds when the un-dated base IS in the map.
+        """
+        result = resolve_bedrock_model_id("claude-mystery-9-9-20991231")
+        assert result == "claude-mystery-9-9-20991231"
+
 
 # ── build_stt ───────────────────────────────────────────────────────────────
 

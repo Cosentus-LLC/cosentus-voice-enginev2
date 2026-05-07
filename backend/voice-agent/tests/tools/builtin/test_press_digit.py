@@ -1,9 +1,24 @@
-"""Tests for app.tools.builtin.press_digit."""
+"""Tests for app.tools.builtin.press_digit.
+
+After the Bug A rewrite (May 2026), press_digit follows the standard
+Pipecat tool pattern:
+
+* No ``InterruptionTaskFrame`` from inside the handler.
+* No per-digit ``OutputDTMFUrgentFrame`` queueing.
+* Single ``transport.send_dtmf({...})`` call — Daily paces internally.
+* ``cancel_on_interruption`` and ``run_llm`` use Pipecat defaults
+  (both ``True``).
+
+The regression test ``test_handler_does_not_push_pipeline_control_frames``
+is the empirical guard against the bug recurring: if anyone re-adds
+an ``InterruptionTaskFrame`` (or any pipeline-control frame) to the
+handler, the test fails before the broken behavior reaches a real
+PSTN call.
+"""
 
 from __future__ import annotations
 
-import asyncio
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from app.tools.builtin.press_digit import (
@@ -12,9 +27,11 @@ from app.tools.builtin.press_digit import (
 )
 from app.tools.context import ToolContext
 from app.tools.result import ToolStatus
-from pipecat.audio.dtmf.types import KeypadEntry
 from pipecat.frames.frames import (
+    CancelTaskFrame,
+    InterruptionFrame,
     InterruptionTaskFrame,
+    OutputDTMFFrame,
     OutputDTMFUrgentFrame,
 )
 
@@ -22,117 +39,173 @@ from pipecat.frames.frames import (
 def _ctx(
     *,
     sip_session_id: str | None = "sip-leg-1",
+    transport: MagicMock | None = None,
     queue_frame: AsyncMock | None = None,
-) -> tuple[ToolContext, AsyncMock]:
+) -> tuple[ToolContext, MagicMock, AsyncMock]:
+    if transport is None:
+        transport = MagicMock()
+        transport.send_dtmf = AsyncMock(return_value=None)
     qf = queue_frame or AsyncMock(return_value=None)
     return (
         ToolContext(
             call_id="call-1",
             session_id="call-1",
             sip_session_id=sip_session_id,
+            transport=transport,
             queue_frame=qf,
         ),
+        transport,
         qf,
     )
 
 
 class TestPressDigitExecutor:
     async def test_empty_digits_returns_error(self):
-        ctx, _ = _ctx()
+        ctx, transport, _ = _ctx()
         result = await press_digit_executor({"digits": ""}, ctx)
         assert result.status is ToolStatus.ERROR
+        transport.send_dtmf.assert_not_awaited()
 
     async def test_invalid_chars_return_error(self):
-        ctx, _ = _ctx()
+        ctx, transport, _ = _ctx()
         result = await press_digit_executor({"digits": "12abc"}, ctx)
         assert result.status is ToolStatus.ERROR
         assert "invalid" in (result.error or "").lower()
+        transport.send_dtmf.assert_not_awaited()
 
     async def test_no_sip_session_returns_error(self):
-        ctx, _ = _ctx(sip_session_id=None)
+        ctx, transport, _ = _ctx(sip_session_id=None)
         result = await press_digit_executor({"digits": "123"}, ctx)
         assert result.status is ToolStatus.ERROR
         assert "sip" in (result.error or "").lower()
+        transport.send_dtmf.assert_not_awaited()
 
-    async def test_no_queue_frame_returns_error(self):
-        ctx = ToolContext(call_id="call-1", sip_session_id="sip-1", queue_frame=None)
+    async def test_no_transport_returns_error(self):
+        ctx = ToolContext(
+            call_id="call-1",
+            sip_session_id="sip-1",
+            transport=None,
+            queue_frame=AsyncMock(),
+        )
         result = await press_digit_executor({"digits": "123"}, ctx)
         assert result.status is ToolStatus.ERROR
+        assert "transport" in (result.error or "").lower()
 
-    async def test_queues_interruption_first_then_dtmf_in_order(self):
-        ctx, qf = _ctx()
-
-        result = await press_digit_executor({"digits": "12"}, ctx)
-
+    async def test_calls_send_dtmf_with_correct_payload(self):
+        ctx, transport, _ = _ctx()
+        result = await press_digit_executor({"digits": "123"}, ctx)
         assert result.status is ToolStatus.SUCCESS
-        # First call must be the interruption.
-        first_frame = qf.call_args_list[0].args[0]
-        assert isinstance(first_frame, InterruptionTaskFrame)
+        transport.send_dtmf.assert_awaited_once()
+        settings = transport.send_dtmf.await_args.args[0]
+        assert settings["tones"] == "123"
+        assert settings["sessionId"] == "sip-leg-1"
+        assert settings["digitDurationMs"] == 120
 
-        # Subsequent calls are the DTMF frames in order.
-        dtmf_frames = [
-            call.args[0]
-            for call in qf.call_args_list[1:]
-            if isinstance(call.args[0], OutputDTMFUrgentFrame)
-        ]
-        assert len(dtmf_frames) == 2
-        assert dtmf_frames[0].button == KeypadEntry("1")
-        assert dtmf_frames[1].button == KeypadEntry("2")
-
-    async def test_dtmf_frames_carry_sip_session_id(self):
-        ctx, qf = _ctx()
-        await press_digit_executor({"digits": "1"}, ctx)
-        dtmf_frames = [
-            call.args[0]
-            for call in qf.call_args_list
-            if isinstance(call.args[0], OutputDTMFUrgentFrame)
-        ]
-        assert dtmf_frames[0].transport_destination == "sip-leg-1"
+    async def test_passes_full_digit_string_in_one_call(self):
+        """v2 fix: previously queued one OutputDTMFUrgentFrame per
+        digit. New behavior: single send_dtmf with the whole string —
+        Daily paces internally.
+        """
+        ctx, transport, _ = _ctx()
+        await press_digit_executor({"digits": "*1#23"}, ctx)
+        assert transport.send_dtmf.await_count == 1
+        assert transport.send_dtmf.await_args.args[0]["tones"] == "*1#23"
 
     async def test_uses_pacing_ms_from_env(self, monkeypatch: pytest.MonkeyPatch):
-        # Set an absurdly small pacing so the test stays fast and
-        # we can still observe the inter-digit sleep.
-        monkeypatch.setenv("PRESS_DIGIT_PACING_MS", "5")
-        ctx, _ = _ctx()
-        # Just verify it doesn't crash and returns success — exact
-        # timing observation is fragile.
-        result = await press_digit_executor({"digits": "12"}, ctx)
-        assert result.status is ToolStatus.SUCCESS
+        monkeypatch.setenv("PRESS_DIGIT_PACING_MS", "75")
+        ctx, transport, _ = _ctx()
+        await press_digit_executor({"digits": "1"}, ctx)
+        assert transport.send_dtmf.await_args.args[0]["digitDurationMs"] == 75
 
     async def test_default_pacing_when_env_unset(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.delenv("PRESS_DIGIT_PACING_MS", raising=False)
-        ctx, qf = _ctx()
-        # Single digit — no pacing sleep involved, just confirms
-        # the env-unset path doesn't fail.
-        result = await press_digit_executor({"digits": "1"}, ctx)
-        assert result.status is ToolStatus.SUCCESS
-
-    async def test_invalid_pacing_env_falls_back_loudly(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setenv("PRESS_DIGIT_PACING_MS", "garbage")
-        ctx, _ = _ctx()
-        result = await press_digit_executor({"digits": "1"}, ctx)
-        assert result.status is ToolStatus.SUCCESS
-
-    async def test_run_llm_false_on_success(self):
-        ctx, _ = _ctx()
-        result = await press_digit_executor({"digits": "1"}, ctx)
-        assert result.status is ToolStatus.SUCCESS
-        # Stay silent — the IVR's response becomes the next user turn.
-        assert result.run_llm is False
-
-    async def test_no_pacing_sleep_after_last_digit(self, monkeypatch: pytest.MonkeyPatch):
-        # Pacing 200ms; if we slept after the last digit, total
-        # elapsed for one digit would be > 200ms. Single-digit case
-        # should be fast (no inter-digit sleeps).
-        monkeypatch.setenv("PRESS_DIGIT_PACING_MS", "200")
-        ctx, _ = _ctx()
-        loop = asyncio.get_running_loop()
-        start = loop.time()
+        ctx, transport, _ = _ctx()
         await press_digit_executor({"digits": "1"}, ctx)
-        elapsed = loop.time() - start
-        # 60ms interruption settle + a few ms of overhead, no 200ms
-        # post-last-digit sleep.
-        assert elapsed < 0.15, f"elapsed={elapsed}"
+        assert transport.send_dtmf.await_args.args[0]["digitDurationMs"] == 120
+
+    async def test_invalid_pacing_env_falls_back_to_default(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("PRESS_DIGIT_PACING_MS", "garbage")
+        ctx, transport, _ = _ctx()
+        result = await press_digit_executor({"digits": "1"}, ctx)
+        assert result.status is ToolStatus.SUCCESS
+        assert transport.send_dtmf.await_args.args[0]["digitDurationMs"] == 120
+
+    async def test_out_of_range_pacing_falls_back_to_default(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("PRESS_DIGIT_PACING_MS", "9999")
+        ctx, transport, _ = _ctx()
+        result = await press_digit_executor({"digits": "1"}, ctx)
+        assert result.status is ToolStatus.SUCCESS
+        assert transport.send_dtmf.await_args.args[0]["digitDurationMs"] == 120
+
+    async def test_run_llm_default_true_so_claude_can_confirm(self):
+        """v2 fix: previously ``run_llm=False``. With the new pattern
+        the LLM is re-invoked after the tool result lands, so Claude
+        can confirm the press in conversation. This is what gives
+        Claude conversational memory of having pressed digits.
+        """
+        ctx, _, _ = _ctx()
+        result = await press_digit_executor({"digits": "1"}, ctx)
+        assert result.status is ToolStatus.SUCCESS
+        assert result.run_llm is True
+
+    async def test_success_data_includes_digits_pressed(self):
+        ctx, _, _ = _ctx()
+        result = await press_digit_executor({"digits": "456"}, ctx)
+        assert result.status is ToolStatus.SUCCESS
+        assert result.data is not None
+        assert result.data["digits_pressed"] == "456"
+        assert result.data["digit_count"] == 3
+
+    async def test_send_dtmf_exception_returns_error(self):
+        transport = MagicMock()
+        transport.send_dtmf = AsyncMock(side_effect=RuntimeError("daily down"))
+        ctx, _, _ = _ctx(transport=transport)
+        result = await press_digit_executor({"digits": "1"}, ctx)
+        assert result.status is ToolStatus.ERROR
+        assert "DTMF" in (result.error or "")
+
+    async def test_send_dtmf_returning_error_string_is_propagated(self):
+        """Daily SDK returns a non-empty error description on
+        SIP-level failure (e.g., session ID stale). Surface it.
+        """
+        transport = MagicMock()
+        transport.send_dtmf = AsyncMock(return_value="invalid-session-id")
+        ctx, _, _ = _ctx(transport=transport)
+        result = await press_digit_executor({"digits": "1"}, ctx)
+        assert result.status is ToolStatus.ERROR
+        assert "invalid-session-id" in (result.error or "")
+
+    async def test_handler_does_not_push_pipeline_control_frames(self):
+        """REGRESSION GUARD for Bug A.
+
+        Earlier v2 revisions pushed ``InterruptionTaskFrame`` from
+        inside the handler to clear pending TTS before sending
+        tones. That broke the function-call lifecycle: tool_use /
+        tool_result blocks vanished from LLM context. The standard
+        Pipecat tool pattern is: handlers do NOT push pipeline-
+        control frames. If this test fails, someone re-introduced
+        the anti-pattern.
+        """
+        ctx, _, qf = _ctx()
+        await press_digit_executor({"digits": "123"}, ctx)
+
+        # The handler may legitimately not call queue_frame at all
+        # under the new design (it goes through transport.send_dtmf).
+        # If queue_frame WAS called, none of the calls may carry
+        # any pipeline-control frame.
+        forbidden_types = (
+            InterruptionTaskFrame,
+            InterruptionFrame,
+            CancelTaskFrame,
+            OutputDTMFFrame,
+            OutputDTMFUrgentFrame,
+        )
+        for call in qf.await_args_list:
+            frame = call.args[0]
+            assert not isinstance(frame, forbidden_types), (
+                f"press_digit handler must not push {type(frame).__name__} — "
+                "see module docstring for the bug history."
+            )
 
 
 class TestPressDigitDefinition:
@@ -145,5 +218,9 @@ class TestPressDigitDefinition:
         assert digits.type == "string"
         assert digits.pattern == r"^[0-9*#]+$"
 
-    def test_does_not_cancel_on_interruption(self):
-        assert PRESS_DIGIT.cancel_on_interruption is False
+    def test_uses_default_cancel_on_interruption_true(self):
+        """v2 fix: previously ``cancel_on_interruption=False`` to
+        support the homegrown TTS-clearing pattern. With that hack
+        gone, the documented Pipecat default ``True`` is correct.
+        """
+        assert PRESS_DIGIT.cancel_on_interruption is True
