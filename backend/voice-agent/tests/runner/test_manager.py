@@ -41,6 +41,7 @@ def _daily_mock(
     inbound_room: DailyRoom | None = None,
     outbound_room: DailyRoom | None = None,
     browser_room: DailyRoom | None = None,
+    caller_id_uuid: str | None = "stub-uuid-for-tests",
 ) -> MagicMock:
     inbound_room = inbound_room or DailyRoom(
         url="https://x.daily.co/in", name="in", sip_uri="sip:in@x"
@@ -52,6 +53,10 @@ def _daily_mock(
     daily.create_outbound_room = AsyncMock(return_value=outbound_room)
     daily.create_browser_room = AsyncMock(return_value=browser_room)
     daily.mint_token = AsyncMock(return_value="bot.token.jwt")
+    # Default: every from_number resolves to a stub UUID so existing
+    # outbound tests don't hit the unresolved-fallback path. Tests
+    # that exercise the fallback override this explicitly.
+    daily.get_phone_number_uuid = AsyncMock(return_value=caller_id_uuid)
     daily.close = AsyncMock()
     return daily
 
@@ -141,8 +146,16 @@ async def test_start_outbound_creates_room_and_spawns():
 
 
 @pytest.mark.asyncio
-async def test_start_outbound_passes_dialout_settings():
-    daily = _daily_mock()
+async def test_start_outbound_resolves_caller_id_e164_to_uuid():
+    """Empirically verified 2026-05-07: Daily's ``dialOut/start``
+    rejects ``callerId`` in E.164 form (``+15559999999``) with
+    ``"Incorrect callerID! No phone number maps to: ..."`` and
+    accepts the matching purchased-phone-number UUID. The manager
+    resolves E.164 → UUID and passes the UUID to
+    ``dialout_settings.callerId``; ``body.from_number`` keeps the
+    E.164 for Aurora storage and human-readable logs.
+    """
+    daily = _daily_mock(caller_id_uuid="resolved-daily-uuid-abc")
     m = PipelineManager(_settings(), daily, _protection_mock())
 
     captured_args = []
@@ -162,8 +175,45 @@ async def test_start_outbound_passes_dialout_settings():
     assert len(captured_args) == 1
     body = captured_args[0].body
     assert body["direction"] == "outbound"
+    # E.164 — kept for Aurora storage + transcripts.
+    assert body["from_number"] == "+15559999999"
+    # UUID — what Daily expects in its dialOut/start callerId field.
     assert body["dialout_settings"]["phoneNumber"] == "+15551234567"
-    assert body["dialout_settings"]["callerId"] == "+15559999999"
+    assert body["dialout_settings"]["callerId"] == "resolved-daily-uuid-abc"
+    # The resolver was actually consulted.
+    daily.get_phone_number_uuid.assert_awaited_once_with("+15559999999")
+
+
+@pytest.mark.asyncio
+async def test_start_outbound_falls_back_to_e164_on_unresolved_caller_id():
+    """If the resolver returns ``None`` (E.164 not in Daily's
+    purchased-numbers list), the manager passes the E.164 through
+    unchanged. Daily then returns ``"Incorrect callerID..."`` and
+    Phase 2's ``dialout_failed_sync`` handler cancels the bot
+    cleanly. Don't fail-fast in the manager — keep the existing
+    termination + CallRecord path.
+    """
+    daily = _daily_mock(caller_id_uuid=None)
+    m = PipelineManager(_settings(), daily, _protection_mock())
+
+    captured_args = []
+
+    async def fake_bot(runner_args):
+        captured_args.append(runner_args)
+
+    with patch("app.runner.manager.bot", fake_bot):
+        await m.start_outbound(
+            agent_id="a",
+            target_number="+15551234567",
+            from_number="+19998887777",
+            case_data={},
+        )
+        await asyncio.sleep(0.05)
+
+    assert len(captured_args) == 1
+    body = captured_args[0].body
+    # callerId falls back to the E.164 form when no UUID resolves.
+    assert body["dialout_settings"]["callerId"] == "+19998887777"
 
 
 # ── start_browser ────────────────────────────────────────────────────────

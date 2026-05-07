@@ -107,6 +107,13 @@ class DailyRoomClient:
         self._recording_region = recording_region
         self._api_url = api_url
         self._session: aiohttp.ClientSession | None = None
+        # E.164 → Daily phone-number-record UUID. Daily's
+        # ``dialOut/start`` ``callerId`` field expects the UUID of a
+        # purchased-phone-number row, NOT the E.164 string. Filled
+        # lazily on first lookup, refreshed on cache miss. See
+        # :meth:`get_phone_number_uuid` for rationale and the docs
+        # references that established the requirement.
+        self._caller_id_cache: dict[str, str] = {}
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         """Lazy-init the shared HTTP session with the bearer header."""
@@ -271,6 +278,88 @@ class DailyRoomClient:
             raise DailyAPIError(f"Token mint network error: {exc}") from exc
 
         return data["token"]
+
+    async def get_phone_number_uuid(self, e164: str) -> str | None:
+        """Resolve an E.164 phone number to its Daily purchased-number UUID.
+
+        Daily's ``dialOut/start`` REST endpoint expects the
+        ``callerId`` field to carry the UUID of a record in
+        ``GET /v1/purchased-phone-numbers``, **not** the E.164
+        string. Empirically verified 2026-05-07 — passing the E.164
+        form (e.g. ``"+12098210846"``) returns
+        ``"Incorrect callerID! No phone number maps to: +12098210846"``;
+        passing the matching UUID (e.g.
+        ``"c3f81341-7c92-499f-ab37-ecda466e2ab9"``) succeeds. Both
+        the Pipecat
+        `Daily dial-out guide <https://docs.pipecat.ai/deployment/pipecat-cloud/guides/telephony/daily-dial-out>`_
+        and Daily's
+        `startDialOut reference <https://docs.daily.co/reference/daily-js/instance-methods/start-dial-out>`_
+        document this explicitly: "To specify the caller ID, use
+        the phone number's id as the callerId."
+
+        Cache: hit → return immediately. Miss → fetch the full
+        ``/v1/purchased-phone-numbers`` page, populate the cache,
+        return. Cosentus has 3 purchased numbers today; even if
+        Daily's pagination grows the list, ``GET`` is cheap and the
+        list rarely changes. ``None`` return signals "no record
+        matches this E.164" so the caller can decide whether to
+        proceed (Daily will reject the dialout) or fail-fast.
+
+        Args:
+            e164: E.164-formatted phone number (e.g. ``+12098210846``).
+
+        Returns:
+            The Daily UUID for the matching purchased-number record,
+            or ``None`` if no match is found after a fresh fetch.
+        """
+        cached = self._caller_id_cache.get(e164)
+        if cached:
+            return cached
+
+        await self._refresh_phone_number_cache()
+        return self._caller_id_cache.get(e164)
+
+    async def _refresh_phone_number_cache(self) -> None:
+        """Fetch ``/v1/purchased-phone-numbers`` and rebuild the cache.
+
+        Errors are logged but never raised — a refresh failure leaves
+        the existing cache intact (graceful degradation). The caller
+        of :meth:`get_phone_number_uuid` will see ``None`` for any
+        E.164 that wasn't cached and Daily will return the same
+        ``Incorrect callerID`` error as before; from the caller's
+        perspective the experience is the unchanged E.164-passthrough
+        baseline, not a regression.
+        """
+        session = await self._ensure_session()
+        try:
+            async with session.get(
+                f"{self._api_url}/purchased-phone-numbers",
+                params={"limit": 100},
+            ) as resp:
+                body = await resp.text()
+                if resp.status >= 400:
+                    logger.error(
+                        "phone_number_cache_refresh_failed",
+                        status=resp.status,
+                        body=body[:200],
+                    )
+                    return
+                data = await self._parse_json(body)
+        except aiohttp.ClientError as exc:
+            logger.error("phone_number_cache_refresh_network_error", error=str(exc))
+            return
+
+        new_cache: dict[str, str] = {}
+        for entry in data.get("data", []) or []:
+            number = entry.get("number")
+            uuid_value = entry.get("id")
+            if isinstance(number, str) and isinstance(uuid_value, str) and number and uuid_value:
+                new_cache[number] = uuid_value
+        self._caller_id_cache = new_cache
+        logger.info(
+            "phone_number_cache_refreshed",
+            entry_count=len(new_cache),
+        )
 
     @staticmethod
     async def _parse_json(body: str) -> dict:

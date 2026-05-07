@@ -475,6 +475,11 @@ async def run_bot(
         # start_dialout creates a SIP leg from the bot's connection;
         # REST API can't initiate this from outside.
         if direction == "outbound" and dialout_settings:
+            # ``callerId`` here is the Daily phone-number-record
+            # UUID (set by Layer 9 manager.start_outbound). Logging
+            # alongside ``from_number`` (E.164) makes "why is the
+            # callee seeing this number?" debuggable in production.
+            caller_id_uuid = (dialout_settings or {}).get("callerId")
             try:
                 dialout_session_id, error = await transport_.start_dialout(
                     dialout_settings,
@@ -482,17 +487,17 @@ async def run_bot(
                 if error:
                     # Sync-return error — the dialout request was
                     # refused before any ringing happened (e.g.
-                    # caller-id not authorized in Daily, malformed
-                    # phoneNumber). There's no SIP leg to drain.
-                    # Cancel immediately so the bot doesn't strand
-                    # in an empty room until idle_timeout. Yesterday's
-                    # outbound PSTN test caught this.
+                    # caller-id UUID not authorized in Daily,
+                    # malformed phoneNumber). There's no SIP leg to
+                    # drain. Cancel immediately so the bot doesn't
+                    # strand in an empty room until idle_timeout.
                     logger.error(
                         "dialout_failed_sync",
                         call_id=call_id,
                         error=str(error),
                         target_number=target_number,
                         from_number=from_number,
+                        caller_id_uuid=caller_id_uuid,
                     )
                     await safe_cancel("dialout_failed_sync")
                     return
@@ -500,6 +505,9 @@ async def run_bot(
                     "dialout_initiated",
                     call_id=call_id,
                     dialout_session_id=dialout_session_id,
+                    target_number=target_number,
+                    from_number=from_number,
+                    caller_id_uuid=caller_id_uuid,
                 )
             except Exception as exc:  # noqa: BLE001
                 # Unexpected exception (network blip, SDK bug, etc.).
@@ -511,6 +519,7 @@ async def run_bot(
                     error=str(exc),
                     target_number=target_number,
                     from_number=from_number,
+                    caller_id_uuid=caller_id_uuid,
                 )
                 await safe_cancel("dialout_unexpected_error")
 

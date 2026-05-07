@@ -167,11 +167,47 @@ class PipelineManager:
         """Outbound PSTN call. Creates a dialout-enabled Daily room,
         mints a bot token, spawns the bot, and returns the spawn
         result. The bot itself dials out from ``on_joined``.
+
+        ``from_number`` arrives as an E.164 string (the public
+        contract for ``/start``). For Aurora storage and logs we
+        keep it E.164 — Aurora's ``voice_calls.from_number`` column
+        is ``VARCHAR(30)`` and humans reading transcripts want to
+        see the actual phone number, not a UUID. But Daily's
+        ``dialOut/start`` ``callerId`` field expects the UUID of a
+        purchased-phone-number record. Empirically verified
+        2026-05-07: passing the E.164 form returns
+        ``Incorrect callerID! No phone number maps to: <num>``;
+        passing the UUID succeeds. So we resolve E.164 → UUID here
+        and only inject the UUID into ``dialout_settings.callerId``;
+        everything else (``body.from_number``, ``CallRecord``,
+        observers) keeps the E.164.
+
+        On unresolved E.164 (no matching purchased number in Daily),
+        we fall back to passing the E.164 through and let Daily
+        return its canonical "Incorrect callerID" error. Layer 8's
+        ``dialout_failed_sync`` handler then cancels the bot
+        cleanly. Don't fail-fast in the manager — the engine's
+        existing termination path already handles this with the
+        right CallRecord shape.
         """
         self._reject_if_unavailable()
 
         room = await self._daily.create_outbound_room()
         token = await self._daily.mint_token(room.name)
+
+        caller_id_uuid = await self._daily.get_phone_number_uuid(from_number)
+        caller_id_for_dailout: str = caller_id_uuid or from_number
+        if caller_id_uuid is None:
+            logger.warning(
+                "outbound_caller_id_uuid_unresolved",
+                from_number=from_number,
+                hint=(
+                    "from_number didn't match any purchased-phone-number "
+                    "record in Daily; passing E.164 through, Daily will "
+                    "reject with 'Incorrect callerID' and Phase 2's "
+                    "dialout_failed_sync handler will cancel the bot."
+                ),
+            )
 
         call_id = str(uuid.uuid4())
         runner_args = DailyRunnerArguments(
@@ -181,18 +217,33 @@ class PipelineManager:
                 "agent_id": agent_id,
                 "direction": "outbound",
                 "target_number": target_number,
+                # E.164 — kept for Aurora storage (VARCHAR(30)) and
+                # human-readable logs / transcripts.
                 "from_number": from_number,
                 "case_data": case_data or {},
                 "batch_id": batch_id,
                 "batch_row_index": batch_row_index,
                 # Daily SDK key naming: camelCase. Layer 8's
                 # ``on_joined`` handler passes this verbatim to
-                # ``transport.start_dialout``.
+                # ``transport.start_dialout``. ``callerId`` MUST be
+                # the Daily phone-number-record UUID, not the E.164
+                # — see method docstring. Only Daily-recognized
+                # keys go in this dict; the E.164 stays available
+                # for logging via ``body.from_number``.
                 "dialout_settings": {
                     "phoneNumber": target_number,
-                    "callerId": from_number,
+                    "callerId": caller_id_for_dailout,
                 },
             },
+        )
+
+        logger.info(
+            "outbound_call_dispatching",
+            call_id=call_id,
+            from_number=from_number,
+            target_number=target_number,
+            caller_id_uuid_resolved=caller_id_uuid is not None,
+            caller_id_uuid=caller_id_uuid,
         )
 
         await self._spawn(call_id, runner_args)
