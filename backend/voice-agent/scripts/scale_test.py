@@ -682,54 +682,60 @@ async def run_soak(
     deadline = started_at + duration_secs
     cycle_index = 0
 
-    async with (
-        aiohttp.ClientSession() as session,
-        metrics_sampler(
-            pid=pid,
-            samples_path=samples_path,
-            started_at=started_at,
-            stop_event=stop_metrics,
-        ) as _samples,
-        open(soak_path, "w") as soak_log,
-    ):
-        while time.time() < deadline:
-            cycle_index += 1
-            cycle_started = time.time()
-            tasks = [
-                asyncio.create_task(fire_start(session, call_index=i)) for i in range(concurrency)
-            ]
-            results = await asyncio.gather(*tasks)
-            await wait_for_active_sessions(session, target=0, op="==", timeout=60.0)
-            cycle_finished = time.time()
+    # Plain ``with`` for the JSONL file — ``open()`` returns a sync
+    # context manager and can't be combined with ``async with``.
+    soak_log = open(soak_path, "w")
+    try:
+        async with (
+            aiohttp.ClientSession() as session,
+            metrics_sampler(
+                pid=pid,
+                samples_path=samples_path,
+                started_at=started_at,
+                stop_event=stop_metrics,
+            ) as _samples,
+        ):
+            while time.time() < deadline:
+                cycle_index += 1
+                cycle_started = time.time()
+                tasks = [
+                    asyncio.create_task(fire_start(session, call_index=i))
+                    for i in range(concurrency)
+                ]
+                results = await asyncio.gather(*tasks)
+                await wait_for_active_sessions(session, target=0, op="==", timeout=60.0)
+                cycle_finished = time.time()
 
-            cycle_record = {
-                "cycle_index": cycle_index,
-                "elapsed_hours": round((cycle_started - started_at) / 3600, 2),
-                "cycle_secs": round(cycle_finished - cycle_started, 2),
-                "accepted": sum(1 for r in results if r.http_status == 202),
-                "rejected": sum(1 for r in results if r.http_status == 503),
-                "rss_mb": round(_sample_rss_mb(pid), 1),
-                "fd_count": _sample_fd_count(pid),
-                "engine_running": engine.is_running,
-            }
-            soak_log.write(json.dumps(cycle_record) + "\n")
-            soak_log.flush()
-            print(f"[soak] {json.dumps(cycle_record)}")
+                cycle_record = {
+                    "cycle_index": cycle_index,
+                    "elapsed_hours": round((cycle_started - started_at) / 3600, 2),
+                    "cycle_secs": round(cycle_finished - cycle_started, 2),
+                    "accepted": sum(1 for r in results if r.http_status == 202),
+                    "rejected": sum(1 for r in results if r.http_status == 503),
+                    "rss_mb": round(_sample_rss_mb(pid), 1),
+                    "fd_count": _sample_fd_count(pid),
+                    "engine_running": engine.is_running,
+                }
+                soak_log.write(json.dumps(cycle_record) + "\n")
+                soak_log.flush()
+                print(f"[soak] {json.dumps(cycle_record)}")
 
-            if not engine.is_running:
-                soak_log.write(
-                    json.dumps(
-                        {
-                            "event": "engine_died",
-                            "cycle_index": cycle_index,
-                            "elapsed_hours": round((time.time() - started_at) / 3600, 2),
-                        }
+                if not engine.is_running:
+                    soak_log.write(
+                        json.dumps(
+                            {
+                                "event": "engine_died",
+                                "cycle_index": cycle_index,
+                                "elapsed_hours": round((time.time() - started_at) / 3600, 2),
+                            }
+                        )
+                        + "\n"
                     )
-                    + "\n"
-                )
-                break
+                    break
 
-            await asyncio.sleep(cycle_pause_secs)
+                await asyncio.sleep(cycle_pause_secs)
+    finally:
+        soak_log.close()
 
     final_rss = _sample_rss_mb(pid) if engine.is_running else 0
     final_fds = _sample_fd_count(pid) if engine.is_running else 0
