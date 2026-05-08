@@ -115,6 +115,106 @@ async def test_reject_if_at_capacity():
     assert exc_info.value.reason == "at_capacity"
 
 
+# ── Concurrent capacity-gate (Bug D regression guard) ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_concurrent_starts_cannot_overshoot_max_concurrent():
+    """Bug D regression guard. Empirically caught by Layer 9.5
+    scenario d: prior implementation checked ``at_capacity`` at the
+    top of ``start_*`` BEFORE awaits to Daily REST + UUID resolver,
+    which let N=10 concurrent /start requests all pass the check
+    and reach _spawn, overshooting ``max_concurrent=6`` to 10 active
+    sessions. Fix: ``_reserve_slot`` performs check + dict insert
+    atomically (no awaits between them) so concurrent reservations
+    are serialized by asyncio's single-threaded scheduling.
+
+    This test fires N=10 concurrent ``start_outbound`` against a
+    manager with ``max_concurrent=6``. Exactly 6 should accept and
+    4 should raise ``CapacityRejected("at_capacity")``.
+    """
+    daily = _daily_mock()
+    protection = _protection_mock()
+    m = PipelineManager(_settings(max_concurrent=6), daily, protection)
+
+    bot_event = asyncio.Event()
+
+    async def slow_bot(runner_args):
+        await bot_event.wait()
+
+    results = []
+    with patch("app.runner.manager.bot", slow_bot):
+        spawn_tasks = [
+            asyncio.create_task(
+                m.start_outbound(
+                    agent_id="a",
+                    target_number="+15551234567",
+                    from_number="+15559999999",
+                    case_data={},
+                ),
+                name=f"spawn-{i}",
+            )
+            for i in range(10)
+        ]
+        outcomes = await asyncio.gather(*spawn_tasks, return_exceptions=True)
+
+        accepted = sum(1 for o in outcomes if isinstance(o, CallSpawnResult))
+        rejected_at_capacity = sum(
+            1 for o in outcomes if isinstance(o, CapacityRejected) and o.reason == "at_capacity"
+        )
+
+        assert accepted == 6, f"expected 6 accepted, got {accepted}; outcomes={outcomes}"
+        assert rejected_at_capacity == 4, (
+            f"expected 4 rejected_at_capacity, got {rejected_at_capacity}; outcomes={outcomes}"
+        )
+        # active_sessions must equal max_concurrent at peak — never overshoot.
+        assert m.active_session_count == 6
+
+        # Cleanup: release the bots.
+        bot_event.set()
+        await asyncio.sleep(0.05)
+
+    results.append(outcomes)
+
+
+@pytest.mark.asyncio
+async def test_reservation_released_when_post_reservation_step_raises():
+    """If Daily REST fails AFTER the slot is reserved (e.g.,
+    create_outbound_room throws), the reservation must be released
+    so capacity isn't leaked. Otherwise repeated transient failures
+    would consume capacity until the engine restarts.
+    """
+    daily = _daily_mock()
+    daily.create_outbound_room = AsyncMock(side_effect=RuntimeError("daily down"))
+    m = PipelineManager(_settings(max_concurrent=6), daily, _protection_mock())
+
+    with pytest.raises(RuntimeError, match="daily down"):
+        await m.start_outbound(
+            agent_id="a",
+            target_number="+1",
+            from_number="+15559999999",
+        )
+
+    # Slot was released.
+    assert m.active_session_count == 0
+
+
+@pytest.mark.asyncio
+async def test_release_slot_is_no_op_for_real_task_entry():
+    """``_release_slot`` must NOT remove a slot that's been replaced
+    by a real task — that would orphan the running coroutine. Only
+    placeholders (``None`` value) are removable via ``_release_slot``.
+    """
+    m = PipelineManager(_settings(), _daily_mock(), _protection_mock())
+    fake_task = MagicMock()
+    m._active_sessions["real-call"] = fake_task
+
+    m._release_slot("real-call")
+
+    assert "real-call" in m._active_sessions
+    assert m._active_sessions["real-call"] is fake_task
+
+
 # ── start_outbound ────────────────────────────────────────────────────────
 
 

@@ -189,64 +189,78 @@ class PipelineManager:
         cleanly. Don't fail-fast in the manager — the engine's
         existing termination path already handles this with the
         right CallRecord shape.
+
+        Capacity gate: the slot is reserved synchronously via
+        :meth:`_reserve_slot` BEFORE any awaits, so concurrent
+        ``/start`` requests can't all pass the gate while the dict
+        is still empty (the bug Layer 9.5 scenario d caught). On
+        any post-reservation failure (Daily REST exception, etc.)
+        we release the reservation so capacity doesn't leak.
         """
-        self._reject_if_unavailable()
+        call_id = str(uuid.uuid4())
+        was_empty = self._reserve_slot(call_id)
+        try:
+            room = await self._daily.create_outbound_room()
+            token = await self._daily.mint_token(room.name)
 
-        room = await self._daily.create_outbound_room()
-        token = await self._daily.mint_token(room.name)
+            caller_id_uuid = await self._daily.get_phone_number_uuid(from_number)
+            caller_id_for_dailout: str = caller_id_uuid or from_number
+            if caller_id_uuid is None:
+                logger.warning(
+                    "outbound_caller_id_uuid_unresolved",
+                    from_number=from_number,
+                    hint=(
+                        "from_number didn't match any purchased-phone-number "
+                        "record in Daily; passing E.164 through, Daily will "
+                        "reject with 'Incorrect callerID' and Phase 2's "
+                        "dialout_failed_sync handler will cancel the bot."
+                    ),
+                )
 
-        caller_id_uuid = await self._daily.get_phone_number_uuid(from_number)
-        caller_id_for_dailout: str = caller_id_uuid or from_number
-        if caller_id_uuid is None:
-            logger.warning(
-                "outbound_caller_id_uuid_unresolved",
-                from_number=from_number,
-                hint=(
-                    "from_number didn't match any purchased-phone-number "
-                    "record in Daily; passing E.164 through, Daily will "
-                    "reject with 'Incorrect callerID' and Phase 2's "
-                    "dialout_failed_sync handler will cancel the bot."
-                ),
+            runner_args = DailyRunnerArguments(
+                room_url=room.url,
+                token=token,
+                body={
+                    "agent_id": agent_id,
+                    "direction": "outbound",
+                    "target_number": target_number,
+                    # E.164 — kept for Aurora storage (VARCHAR(30)) and
+                    # human-readable logs / transcripts.
+                    "from_number": from_number,
+                    "case_data": case_data or {},
+                    "batch_id": batch_id,
+                    "batch_row_index": batch_row_index,
+                    # Daily SDK key naming: camelCase. Layer 8's
+                    # ``on_joined`` handler passes this verbatim to
+                    # ``transport.start_dialout``. ``callerId`` MUST
+                    # be the Daily phone-number-record UUID, not the
+                    # E.164 — see method docstring. Only Daily-
+                    # recognized keys go in this dict; the E.164
+                    # stays available for logging via
+                    # ``body.from_number``.
+                    "dialout_settings": {
+                        "phoneNumber": target_number,
+                        "callerId": caller_id_for_dailout,
+                    },
+                },
             )
 
-        call_id = str(uuid.uuid4())
-        runner_args = DailyRunnerArguments(
-            room_url=room.url,
-            token=token,
-            body={
-                "agent_id": agent_id,
-                "direction": "outbound",
-                "target_number": target_number,
-                # E.164 — kept for Aurora storage (VARCHAR(30)) and
-                # human-readable logs / transcripts.
-                "from_number": from_number,
-                "case_data": case_data or {},
-                "batch_id": batch_id,
-                "batch_row_index": batch_row_index,
-                # Daily SDK key naming: camelCase. Layer 8's
-                # ``on_joined`` handler passes this verbatim to
-                # ``transport.start_dialout``. ``callerId`` MUST be
-                # the Daily phone-number-record UUID, not the E.164
-                # — see method docstring. Only Daily-recognized
-                # keys go in this dict; the E.164 stays available
-                # for logging via ``body.from_number``.
-                "dialout_settings": {
-                    "phoneNumber": target_number,
-                    "callerId": caller_id_for_dailout,
-                },
-            },
-        )
+            logger.info(
+                "outbound_call_dispatching",
+                call_id=call_id,
+                from_number=from_number,
+                target_number=target_number,
+                caller_id_uuid_resolved=caller_id_uuid is not None,
+                caller_id_uuid=caller_id_uuid,
+            )
 
-        logger.info(
-            "outbound_call_dispatching",
-            call_id=call_id,
-            from_number=from_number,
-            target_number=target_number,
-            caller_id_uuid_resolved=caller_id_uuid is not None,
-            caller_id_uuid=caller_id_uuid,
-        )
-
-        await self._spawn(call_id, runner_args)
+            await self._activate_protection_if_first(was_empty)
+            await self._spawn(call_id, runner_args)
+        except Exception:
+            # Release the reservation so capacity isn't leaked when
+            # Daily REST or another await raises before _spawn.
+            self._release_slot(call_id)
+            raise
 
         return CallSpawnResult(
             call_id=call_id,
@@ -264,32 +278,37 @@ class PipelineManager:
         a bot token and a viewer token, spawns the bot. The dashboard
         / Cindy widget joins with the viewer token.
         """
-        self._reject_if_unavailable()
-
-        room = await self._daily.create_browser_room()
-        bot_token = await self._daily.mint_token(room.name, is_owner=True)
-        # Viewer token is non-owner; matches the room's 15-min TTL
-        # so we don't issue a long-lived token to a short-lived room.
-        viewer_token = await self._daily.mint_token(
-            room.name,
-            is_owner=False,
-            exp_secs=900,
-        )
-
         call_id = str(uuid.uuid4())
-        runner_args = DailyRunnerArguments(
-            room_url=room.url,
-            token=bot_token,
-            body={
-                "agent_id": agent_id,
-                "direction": "browser",
-                "target_number": "",
-                "from_number": "",
-                "case_data": case_data or {},
-            },
-        )
+        was_empty = self._reserve_slot(call_id)
+        try:
+            room = await self._daily.create_browser_room()
+            bot_token = await self._daily.mint_token(room.name, is_owner=True)
+            # Viewer token is non-owner; matches the room's 15-min
+            # TTL so we don't issue a long-lived token to a short-
+            # lived room.
+            viewer_token = await self._daily.mint_token(
+                room.name,
+                is_owner=False,
+                exp_secs=900,
+            )
 
-        await self._spawn(call_id, runner_args)
+            runner_args = DailyRunnerArguments(
+                room_url=room.url,
+                token=bot_token,
+                body={
+                    "agent_id": agent_id,
+                    "direction": "browser",
+                    "target_number": "",
+                    "from_number": "",
+                    "case_data": case_data or {},
+                },
+            )
+
+            await self._activate_protection_if_first(was_empty)
+            await self._spawn(call_id, runner_args)
+        except Exception:
+            self._release_slot(call_id)
+            raise
 
         return CallSpawnResult(
             call_id=call_id,
@@ -317,29 +336,33 @@ class PipelineManager:
         ``dialin_settings`` so :class:`DailyTransport` can correlate
         the SIP leg.
         """
-        self._reject_if_unavailable()
-
-        room = await self._daily.create_inbound_room()
-        token = await self._daily.mint_token(room.name)
-
         call_id = str(uuid.uuid4())
-        runner_args = DailyRunnerArguments(
-            room_url=room.url,
-            token=token,
-            body={
-                "agent_id": agent_id,
-                "direction": "inbound",
-                "target_number": to_number,
-                "from_number": from_number,
-                "case_data": {},
-                "dialin_settings": {
-                    "call_id": call_id_external,
-                    "call_domain": call_domain,
-                },
-            },
-        )
+        was_empty = self._reserve_slot(call_id)
+        try:
+            room = await self._daily.create_inbound_room()
+            token = await self._daily.mint_token(room.name)
 
-        await self._spawn(call_id, runner_args)
+            runner_args = DailyRunnerArguments(
+                room_url=room.url,
+                token=token,
+                body={
+                    "agent_id": agent_id,
+                    "direction": "inbound",
+                    "target_number": to_number,
+                    "from_number": from_number,
+                    "case_data": {},
+                    "dialin_settings": {
+                        "call_id": call_id_external,
+                        "call_domain": call_domain,
+                    },
+                },
+            )
+
+            await self._activate_protection_if_first(was_empty)
+            await self._spawn(call_id, runner_args)
+        except Exception:
+            self._release_slot(call_id)
+            raise
 
         return CallSpawnResult(
             call_id=call_id,
@@ -350,43 +373,104 @@ class PipelineManager:
     # ── Internals ────────────────────────────────────────────────
 
     def _reject_if_unavailable(self) -> None:
-        """Synchronous gate at the top of every ``start_*``."""
+        """Synchronous gate. Reads only — does not reserve a slot.
+
+        Use :meth:`_reserve_slot` instead from the public ``start_*``
+        entry points; ``_reject_if_unavailable`` is kept for status
+        callers that need a check-only view (e.g. tests).
+        """
         if self._draining:
             raise CapacityRejected("draining")
         if self.at_capacity:
             raise CapacityRejected("at_capacity")
 
-    async def _spawn(self, call_id: str, runner_args: DailyRunnerArguments) -> None:
-        """Create the asyncio task and register it. Acquire protection
-        on the 0→1 boundary.
+    def _reserve_slot(self, call_id: str) -> bool:
+        """Atomically check capacity AND reserve the active-sessions slot.
 
-        The boundary check + dict insert happen in the same
-        await-free region. Within asyncio's single-threaded loop,
-        no other coroutine can interleave — protection is acquired
-        exactly once for the first call and released exactly once
-        when the last call finishes.
+        Both the read (``at_capacity`` check) and the write (dict
+        insert) happen in the same await-free region. asyncio's
+        single-threaded scheduling guarantees no other coroutine
+        can interleave between them, so the gate IS the lock.
+
+        This closes the check-then-act race the prior implementation
+        had: ``_reject_if_unavailable`` followed by an ``await
+        self._daily.create_outbound_room()`` (and other awaits) gave
+        up the event loop after the check, letting concurrent
+        requests all pass while the dict was still empty. Layer 9.5
+        scale test scenario d (N=10 concurrent /start) reproduced
+        this empirically — 10 calls were accepted past
+        ``max_concurrent=6``.
+
+        The reservation uses ``None`` as a placeholder; ``_spawn``
+        replaces it with the real ``asyncio.Task`` reference once
+        the task is created. If the calling ``start_*`` raises
+        between reserve and spawn (e.g., Daily REST throws), the
+        caller MUST call :meth:`_release_slot` to free the
+        reservation — otherwise capacity leaks.
+
+        Returns:
+            ``True`` if this reservation was the 0→1 transition (the
+            dict was empty before the placeholder went in). Caller
+            awaits :meth:`_activate_protection_if_first` with the
+            return value to handle ECS task protection acquisition.
         """
+        if self._draining:
+            raise CapacityRejected("draining")
+        if self.at_capacity:
+            raise CapacityRejected("at_capacity")
+        # Atomic with the check above — no awaits between read and write.
         was_empty = len(self._active_sessions) == 0
+        self._active_sessions[call_id] = None  # type: ignore[assignment]
+        return was_empty
 
+    def _release_slot(self, call_id: str) -> None:
+        """Release a reservation made by :meth:`_reserve_slot`.
+
+        Idempotent. Only removes the slot if the value is still the
+        ``None`` placeholder; if ``_spawn`` already replaced it with
+        a real task, this is a no-op (the wrapped bot's ``finally``
+        block handles cleanup for spawned tasks).
+        """
+        if call_id in self._active_sessions and self._active_sessions.get(call_id) is None:
+            self._active_sessions.pop(call_id, None)
+
+    async def _activate_protection_if_first(self, was_empty: bool) -> None:
+        """Fire the 0→1 protection-acquire path when this is the first
+        reservation.
+
+        Split from ``_spawn`` so the await happens between the
+        synchronous reservation (``_reserve_slot``) and the actual
+        task creation (``_spawn``). Failures inside
+        ``set_protected`` are swallowed by the protection client's
+        own retry / log policy — the call still proceeds.
+        """
+        if not was_empty:
+            return
+        await self._protection.set_protected(True)
+        if self._heartbeat_task is None or self._heartbeat_task.done():
+            self._heartbeat_task = asyncio.create_task(
+                self._heartbeat_loop(),
+                name="task-protection-heartbeat",
+            )
+
+    async def _spawn(self, call_id: str, runner_args: DailyRunnerArguments) -> None:
+        """Create the asyncio task and replace the reservation placeholder.
+
+        Caller MUST have already reserved the slot via
+        :meth:`_reserve_slot` and run
+        :meth:`_activate_protection_if_first` for the 0→1 case. This
+        method only swaps the dict's ``None`` placeholder for the
+        real ``asyncio.Task``; protection is no longer ``_spawn``'s
+        responsibility.
+        """
         task = asyncio.create_task(
             self._wrapped_bot(call_id, runner_args),
             name=f"call-{call_id}",
         )
+        # Replace the None placeholder reserved by _reserve_slot with
+        # the actual task. (.get returning None is fine; we still
+        # write the task in.)
         self._active_sessions[call_id] = task
-
-        if was_empty:
-            # First call — acquire protection. ``set_protected``
-            # has its own retry policy; if it fails after retries
-            # we still proceed (the call goes through; we just
-            # might get scaled-in if Fargate decides to).
-            await self._protection.set_protected(True)
-            # Start heartbeat coroutine if not already running.
-            if self._heartbeat_task is None or self._heartbeat_task.done():
-                self._heartbeat_task = asyncio.create_task(
-                    self._heartbeat_loop(),
-                    name="task-protection-heartbeat",
-                )
-
         logger.info(
             "call_spawned",
             call_id=call_id,
