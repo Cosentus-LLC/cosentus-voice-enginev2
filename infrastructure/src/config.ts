@@ -1,0 +1,271 @@
+/**
+ * Per-environment CDK configuration.
+ *
+ * Source precedence (highest wins):
+ *   1. CDK context (`cdk synth -c environment=prod`)
+ *   2. Environment variables (`ENVIRONMENT=prod npm run synth:prod`)
+ *   3. `.env.{environment}` file (loaded via dotenv)
+ *   4. Built-in per-env defaults below
+ *
+ * All values are validated at synth time. Validation failures abort synth
+ * loudly — better than discovering a typo in production CloudFormation.
+ *
+ * Locked-in choices baked into the defaults
+ * -----------------------------------------
+ * - Region us-east-1. v1 ships here, Bedrock Sonnet/Haiku inference profiles
+ *   live here, and the Daily PSTN trunk routes through here. Multi-region is
+ *   out of scope for v2.
+ * - Per-task sizing: 1 vCPU, 2 GB memory, stopTimeout=120s, max_concurrent
+ *   _calls=6. Validated empirically in Layer 9.5 — RSS 510 MB, CPU 66% peak,
+ *   FDs flat at ~215. See docs/v2-tech-debt-log.md entry 13 for the burst
+ *   load story.
+ * - NAT gateway counts: staging=1 (~$35/mo saved vs full HA, acceptable for
+ *   non-customer-facing env), prod=3 (one per AZ, full AZ-failure tolerance).
+ */
+
+import * as path from 'path';
+import * as dotenv from 'dotenv';
+import { App } from 'aws-cdk-lib';
+
+export type Environment = 'staging' | 'prod';
+
+export interface VoiceEngineConfig {
+  /** Deployment environment — staging or prod. */
+  readonly environment: Environment;
+  /** AWS account; defaults to the medcloud-voice account (825269749545). */
+  readonly account: string;
+  /** AWS region; pinned to us-east-1 for v2. */
+  readonly region: string;
+  /** Project name prefix for all resource names. */
+  readonly projectName: string;
+  /** VPC CIDR — non-overlapping with v1's vpc-05a1f6c68c04943ec. */
+  readonly vpcCidr: string;
+  /** AZ count for the VPC (3 = full HA on Fargate). */
+  readonly maxAzs: number;
+  /** NAT gateway count. Staging=1, prod=3. */
+  readonly natGateways: number;
+  /** Fargate task definition vCPU. Locked at 1 (1024 units). */
+  readonly cpu: number;
+  /** Fargate task definition memory in MiB. Locked at 2048. */
+  readonly memoryMiB: number;
+  /** Auto-scaling min task count. Staging=1, prod=5 (always-warm). */
+  readonly minCapacity: number;
+  /** Auto-scaling max task count. Staging=3, prod=25. */
+  readonly maxCapacity: number;
+  /** Target percent of session capacity that drives scale-out. 70 = scale out at 70%. */
+  readonly targetSessionsPct: number;
+  /** Max concurrent calls per task (must match engine's max_concurrent_calls). */
+  readonly sessionCapacityPerTask: number;
+  /** ECS task stopTimeout in seconds. Locked at 120 (matches Layer 9 drain budget). */
+  readonly stopTimeoutSeconds: number;
+  /** Apex domain managed at the registrar (GoDaddy). */
+  readonly domainApex: string;
+  /** Per-env hostname pointing at the ALB (e.g., staging.cosentusaibackend.com). */
+  readonly serviceHostname: string;
+  /** Shared wildcard ACM cert ARN. Empty string until CertStack is deployed. */
+  readonly certificateArn: string;
+  /** Daily.co S3 recordings bucket name (existing or to-be-created). */
+  readonly recordingsBucketName: string;
+  /** True when CDK owns the bucket lifecycle; false when we import an existing bucket. */
+  readonly recordingsBucketOwnedByCdk: boolean;
+}
+
+const PROJECT_NAME = 'cosentus-voice-engine';
+const DEFAULT_ACCOUNT = '825269749545';
+const DEFAULT_REGION = 'us-east-1';
+
+const ENV_DEFAULTS: Record<Environment, Partial<VoiceEngineConfig>> = {
+  staging: {
+    vpcCidr: '10.20.0.0/16',
+    maxAzs: 3,
+    natGateways: 1,
+    cpu: 1024,
+    memoryMiB: 2048,
+    minCapacity: 1,
+    maxCapacity: 3,
+    targetSessionsPct: 70,
+    sessionCapacityPerTask: 6,
+    stopTimeoutSeconds: 120,
+    serviceHostname: 'staging.cosentusaibackend.com',
+    recordingsBucketName: 'cosentus-voice-engine-staging-recordings',
+    recordingsBucketOwnedByCdk: true,
+  },
+  prod: {
+    vpcCidr: '10.30.0.0/16',
+    maxAzs: 3,
+    natGateways: 3,
+    cpu: 1024,
+    memoryMiB: 2048,
+    minCapacity: 5,
+    maxCapacity: 25,
+    targetSessionsPct: 70,
+    sessionCapacityPerTask: 6,
+    stopTimeoutSeconds: 120,
+    serviceHostname: 'api.cosentusaibackend.com',
+    recordingsBucketName: 'medcloud-voice-us-prod-825',
+    recordingsBucketOwnedByCdk: false,
+  },
+};
+
+function readSetting(app: App, contextKey: string, envKey: string): string | undefined {
+  const fromContext = app.node.tryGetContext(contextKey);
+  if (typeof fromContext === 'string' && fromContext.length > 0) return fromContext;
+  const fromEnv = process.env[envKey];
+  if (typeof fromEnv === 'string' && fromEnv.length > 0) return fromEnv;
+  return undefined;
+}
+
+function requireEnvironment(raw: string | undefined): Environment {
+  if (raw !== 'staging' && raw !== 'prod') {
+    throw new Error(
+      `Invalid environment '${raw ?? '(unset)'}'. Set ENVIRONMENT or pass ` +
+        `'-c environment=staging|prod'.`,
+    );
+  }
+  return raw;
+}
+
+function requireCidr(raw: string): string {
+  if (!/^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$/.test(raw)) {
+    throw new Error(`Invalid CIDR '${raw}'.`);
+  }
+  return raw;
+}
+
+function requirePositiveInt(raw: string, label: string, min = 1, max = 100): number {
+  const parsed = parseInt(raw, 10);
+  if (Number.isNaN(parsed) || parsed < min || parsed > max) {
+    throw new Error(`Invalid ${label} '${raw}'. Must be integer in [${min}, ${max}].`);
+  }
+  return parsed;
+}
+
+/**
+ * Load + validate config for the resolved environment. Reads from CDK
+ * context, env vars, and `.env.{environment}` files in that order.
+ */
+export function loadConfig(app: App): VoiceEngineConfig {
+  const environment = requireEnvironment(
+    readSetting(app, 'environment', 'ENVIRONMENT'),
+  );
+
+  dotenv.config({
+    path: path.resolve(__dirname, '..', `.env.${environment}`),
+  });
+
+  const defaults = ENV_DEFAULTS[environment];
+  const account =
+    readSetting(app, 'account', 'CDK_DEFAULT_ACCOUNT') ??
+    process.env.AWS_ACCOUNT_ID ??
+    DEFAULT_ACCOUNT;
+  const region =
+    readSetting(app, 'region', 'CDK_DEFAULT_REGION') ?? DEFAULT_REGION;
+
+  if (region !== DEFAULT_REGION) {
+    throw new Error(
+      `v2 is pinned to ${DEFAULT_REGION}. Refusing to synth for ${region}.`,
+    );
+  }
+
+  const vpcCidr = requireCidr(
+    readSetting(app, 'vpcCidr', 'VPC_CIDR') ?? (defaults.vpcCidr as string),
+  );
+  const maxAzs = requirePositiveInt(
+    readSetting(app, 'maxAzs', 'MAX_AZS') ?? String(defaults.maxAzs),
+    'maxAzs',
+    1,
+    6,
+  );
+  const natGateways = requirePositiveInt(
+    readSetting(app, 'natGateways', 'NAT_GATEWAYS') ?? String(defaults.natGateways),
+    'natGateways',
+    0,
+    maxAzs,
+  );
+  const cpu = requirePositiveInt(
+    readSetting(app, 'cpu', 'CPU') ?? String(defaults.cpu),
+    'cpu',
+    256,
+    16384,
+  );
+  const memoryMiB = requirePositiveInt(
+    readSetting(app, 'memoryMiB', 'MEMORY_MIB') ?? String(defaults.memoryMiB),
+    'memoryMiB',
+    512,
+    65536,
+  );
+  const minCapacity = requirePositiveInt(
+    readSetting(app, 'minCapacity', 'MIN_CAPACITY') ?? String(defaults.minCapacity),
+    'minCapacity',
+    1,
+    100,
+  );
+  const maxCapacity = requirePositiveInt(
+    readSetting(app, 'maxCapacity', 'MAX_CAPACITY') ?? String(defaults.maxCapacity),
+    'maxCapacity',
+    minCapacity,
+    200,
+  );
+  const targetSessionsPct = requirePositiveInt(
+    readSetting(app, 'targetSessionsPct', 'TARGET_SESSIONS_PCT') ??
+      String(defaults.targetSessionsPct),
+    'targetSessionsPct',
+    10,
+    95,
+  );
+  const sessionCapacityPerTask = requirePositiveInt(
+    readSetting(app, 'sessionCapacityPerTask', 'SESSION_CAPACITY_PER_TASK') ??
+      String(defaults.sessionCapacityPerTask),
+    'sessionCapacityPerTask',
+    1,
+    50,
+  );
+  const stopTimeoutSeconds = requirePositiveInt(
+    readSetting(app, 'stopTimeoutSeconds', 'STOP_TIMEOUT_SECONDS') ??
+      String(defaults.stopTimeoutSeconds),
+    'stopTimeoutSeconds',
+    30,
+    120,
+  );
+
+  const domainApex =
+    readSetting(app, 'domainApex', 'DOMAIN_APEX') ?? 'cosentusaibackend.com';
+  const serviceHostname =
+    readSetting(app, 'serviceHostname', 'SERVICE_HOSTNAME') ??
+    (defaults.serviceHostname as string);
+  const certificateArn = readSetting(app, 'certificateArn', 'CERTIFICATE_ARN') ?? '';
+
+  const recordingsBucketName =
+    readSetting(app, 'recordingsBucketName', 'RECORDINGS_BUCKET_NAME') ??
+    (defaults.recordingsBucketName as string);
+  const recordingsBucketOwnedByCdk =
+    (readSetting(app, 'recordingsBucketOwnedByCdk', 'RECORDINGS_BUCKET_OWNED_BY_CDK') ??
+      String(defaults.recordingsBucketOwnedByCdk)) === 'true';
+
+  return {
+    environment,
+    account,
+    region,
+    projectName: PROJECT_NAME,
+    vpcCidr,
+    maxAzs,
+    natGateways,
+    cpu,
+    memoryMiB,
+    minCapacity,
+    maxCapacity,
+    targetSessionsPct,
+    sessionCapacityPerTask,
+    stopTimeoutSeconds,
+    domainApex,
+    serviceHostname,
+    certificateArn,
+    recordingsBucketName,
+    recordingsBucketOwnedByCdk,
+  };
+}
+
+/** Resource prefix used by every stack and construct. */
+export function resourcePrefix(config: VoiceEngineConfig): string {
+  return `${config.projectName}-${config.environment}`;
+}
