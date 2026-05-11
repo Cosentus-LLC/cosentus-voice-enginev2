@@ -24,7 +24,7 @@
 import 'source-map-support/register';
 import * as cdk from 'aws-cdk-lib';
 import { loadConfig, resourcePrefix } from './config';
-import { EcrStack, NetworkStack } from './stacks';
+import { EcrStack, NetworkStack, StorageStack } from './stacks';
 
 const app = new cdk.App();
 const config = loadConfig(app);
@@ -56,9 +56,17 @@ const networkStack = new NetworkStack(app, `${prefix}-network`, {
   tags: { ...commonTags, Stack: 'network' },
 });
 
-// ECR is referenced by ComputeStack (Wave 3) via SSM; no direct dependency
-// arrow needed here. NetworkStack stands alone.
+const storageStack = new StorageStack(app, `${prefix}-storage`, {
+  env,
+  config,
+  description: `Voice engine v2 — Secrets Manager + recordings bucket (${config.environment}).`,
+  tags: { ...commonTags, Stack: 'storage' },
+});
+
+// Stacks publish to SSM and are read via valueFromLookup downstream;
+// no direct CFN-level dependency arrows are required here.
 void ecrStack;
 void networkStack;
+void storageStack;
 
 app.synth();

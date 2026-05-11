@@ -39,6 +39,7 @@ export function ssmParams(config: VoiceEngineConfig) {
     ELEVENLABS_API_KEY_SECRET_ARN: `${base}/storage/elevenLabsApiKeySecretArn`,
     RECORDINGS_BUCKET_NAME: `${base}/storage/recordingsBucketName`,
     RECORDINGS_BUCKET_ARN: `${base}/storage/recordingsBucketArn`,
+    RECORDINGS_KMS_KEY_ARN: `${base}/storage/recordingsKmsKeyArn`,
 
     // CertStack (shared cert ARN — env-independent in practice, but per-env
     // SSM key keeps stack composition clean)

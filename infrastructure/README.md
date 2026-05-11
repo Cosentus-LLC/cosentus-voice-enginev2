@@ -6,12 +6,12 @@ independently from one codebase.
 
 ## Status
 
-Wave 1 of 5 — scaffold + `EcrStack` + `NetworkStack`.
+Wave 2 of 5 — `StorageStack` (Secrets Manager + recordings bucket).
 
 | Wave | Scope | Status |
 |------|-------|--------|
 | 1 | Skeleton + ECR + VPC + network | shipped |
-| 2 | `StorageStack` (Secrets Manager + S3 recordings) | pending |
+| 2 | `StorageStack` (Secrets Manager + S3 recordings + KMS) | shipped |
 | 3 | `CertStack` (wildcard ACM) + `ComputeStack` (ALB + ECS + autoscaling) | pending |
 | 4 | Engine-side `cloudwatch:PutMetricData` for `ActiveSessions` | pending |
 | 5 | GitHub Actions (`build-and-push`, `deploy-staging`, `deploy-prod`) + doc cleanup | pending |
@@ -42,8 +42,11 @@ infrastructure/
     stacks/
       ecr-stack.ts               # dedicated ECR repo (env-independent)
       network-stack.ts           # VPC, subnets, security groups, endpoints
+      storage-stack.ts           # Secrets Manager + recordings bucket
     constructs/
       vpc.ts                     # VPC + 8 endpoints + 2 security groups
+      secrets.ts                 # 4 empty Secrets Manager entries (L1 CfnSecret)
+      recordings-bucket.ts       # S3 + KMS (create) or import per env
 ```
 
 ## Locked-in choices
@@ -84,10 +87,53 @@ This avoids migrating the apex (and its existing records like
 | `MIN_CAPACITY` | 1 | 5 |
 | `MAX_CAPACITY` | 3 | 25 |
 | `NAT_GATEWAYS` | 1 | 3 |
-| `RECORDINGS_BUCKET_NAME` | `cosentus-voice-engine-staging-recordings` (CDK creates) | `medcloud-voice-us-prod-825` (imported, owned by v1) |
+| `RECORDINGS_BUCKET_NAME` | `cosentus-voice-recordings-staging` (CDK creates) | `medcloud-voice-us-prod-825` (imported, owned by v1) |
+| `RECORDINGS_KMS_KEY_ARN` | auto-set by CDK at synth | required in `.env.prod` (v1's existing key ARN) |
 
 `config.ts` carries the same defaults so deploying without a `.env`
 file still produces correct synthesized CloudFormation.
+
+## Secrets Manager — populating before deploy
+
+Wave 2 creates four Secrets Manager entries per environment, **all
+empty** (no initial version). The engine task fails fast at startup if
+any of them returns `ResourceNotFoundException`, so the operator must
+populate values via the AWS Console before the first task launch.
+
+Canonical secret names:
+
+```
+cosentus-voice-engine/{env}/api-key             # HTTP bearer auth for /start
+cosentus-voice-engine/{env}/daily-api-key       # Daily.co REST API
+cosentus-voice-engine/{env}/assemblyai-api-key  # AssemblyAI v3 streaming
+cosentus-voice-engine/{env}/elevenlabs-api-key  # ElevenLabs TTS
+```
+
+To populate a secret:
+
+1. AWS Console → Secrets Manager → pick the entry by name.
+2. **Set secret value** → **Plaintext** → paste the API key as the entire
+   value (no JSON wrapping; the engine reads `SecretString` as a raw string).
+3. Save. Confirm a new `AWSCURRENT` version is listed.
+
+Lifecycle: each secret has `RETAIN` set on both deletion and update-replace,
+so destroying the stack leaves the entries (and their populated values)
+intact — intentional to avoid accidentally re-keying production credentials.
+
+## Recordings bucket
+
+| Knob | Staging | Production |
+|------|---------|------------|
+| Bucket name | `cosentus-voice-recordings-staging` | `medcloud-voice-us-prod-825` |
+| Lifecycle | CDK-owned (create) | Imported (CDK touches IAM only) |
+| KMS key | CDK-created, `alias/cosentus-voice-engine-staging-recordings`, rotation enabled | Existing v1 key (ARN must be set in `.env.prod`) |
+| Public access | blocked at bucket level | (out of CDK's scope — unchanged) |
+| Versioning | enabled | (unchanged) |
+| SSL-only | enforced | (unchanged) |
+
+Daily.co's write principal still needs to be granted access via the
+bucket policy. That statement is deferred to Wave 3 (ComputeStack) so
+it lives alongside the task-role grants.
 
 ## Deployment workflows (planned, Wave 5)
 

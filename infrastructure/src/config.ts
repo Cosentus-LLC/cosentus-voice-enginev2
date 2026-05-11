@@ -68,6 +68,19 @@ export interface VoiceEngineConfig {
   readonly recordingsBucketName: string;
   /** True when CDK owns the bucket lifecycle; false when we import an existing bucket. */
   readonly recordingsBucketOwnedByCdk: boolean;
+  /**
+   * KMS key ARN protecting the recordings bucket.
+   *
+   * - Staging: empty here, set at synth time by `RecordingsBucketConstruct`
+   *   from the CDK-created key. The empty default is intentional — we don't
+   *   know the key ARN until CloudFormation runs.
+   * - Prod: must be populated via `.env.prod` (`RECORDINGS_KMS_KEY_ARN`)
+   *   with the ARN of the existing v1 key that encrypts
+   *   `medcloud-voice-us-prod-825`. If empty for prod, ComputeStack will
+   *   still synth but the resulting task-role policy will not grant decrypt
+   *   on a real key — fail-fast at deploy time, not at synth time.
+   */
+  readonly recordingsKmsKeyArn: string;
 }
 
 const PROJECT_NAME = 'cosentus-voice-engine';
@@ -87,8 +100,9 @@ const ENV_DEFAULTS: Record<Environment, Partial<VoiceEngineConfig>> = {
     sessionCapacityPerTask: 6,
     stopTimeoutSeconds: 120,
     serviceHostname: 'staging.cosentusaibackend.com',
-    recordingsBucketName: 'cosentus-voice-engine-staging-recordings',
+    recordingsBucketName: 'cosentus-voice-recordings-staging',
     recordingsBucketOwnedByCdk: true,
+    recordingsKmsKeyArn: '',
   },
   prod: {
     vpcCidr: '10.30.0.0/16',
@@ -104,6 +118,7 @@ const ENV_DEFAULTS: Record<Environment, Partial<VoiceEngineConfig>> = {
     serviceHostname: 'api.cosentusaibackend.com',
     recordingsBucketName: 'medcloud-voice-us-prod-825',
     recordingsBucketOwnedByCdk: false,
+    recordingsKmsKeyArn: '',
   },
 };
 
@@ -241,6 +256,9 @@ export function loadConfig(app: App): VoiceEngineConfig {
   const recordingsBucketOwnedByCdk =
     (readSetting(app, 'recordingsBucketOwnedByCdk', 'RECORDINGS_BUCKET_OWNED_BY_CDK') ??
       String(defaults.recordingsBucketOwnedByCdk)) === 'true';
+  const recordingsKmsKeyArn =
+    readSetting(app, 'recordingsKmsKeyArn', 'RECORDINGS_KMS_KEY_ARN') ??
+    (defaults.recordingsKmsKeyArn as string);
 
   return {
     environment,
@@ -262,6 +280,7 @@ export function loadConfig(app: App): VoiceEngineConfig {
     certificateArn,
     recordingsBucketName,
     recordingsBucketOwnedByCdk,
+    recordingsKmsKeyArn,
   };
 }
 
