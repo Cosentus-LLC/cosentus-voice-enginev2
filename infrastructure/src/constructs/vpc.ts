@@ -85,7 +85,8 @@ export class VpcConstruct extends Construct {
     this.albSecurityGroup = new ec2.SecurityGroup(this, 'AlbSecurityGroup', {
       vpc: this.vpc,
       securityGroupName: `${prefix}-alb-sg`,
-      description: 'Voice engine ALB — accepts HTTPS from the public internet.',
+      // EC2 SG GroupDescription is ASCII-only — CFN rejects em-dashes here.
+      description: 'Voice engine ALB - accepts HTTPS from the public internet.',
       allowAllOutbound: true,
     });
     this.albSecurityGroup.addIngressRule(
@@ -97,7 +98,8 @@ export class VpcConstruct extends Construct {
     this.taskSecurityGroup = new ec2.SecurityGroup(this, 'TaskSecurityGroup', {
       vpc: this.vpc,
       securityGroupName: `${prefix}-task-sg`,
-      description: 'Voice engine Fargate tasks — accepts traffic from ALB only.',
+      // EC2 SG GroupDescription is ASCII-only.
+      description: 'Voice engine Fargate tasks - accepts traffic from ALB only.',
       allowAllOutbound: true,
     });
     this.taskSecurityGroup.addIngressRule(
