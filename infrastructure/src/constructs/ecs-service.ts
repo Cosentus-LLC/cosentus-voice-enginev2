@@ -31,6 +31,13 @@ export interface EcsServiceConstructProps {
   /** May be empty for prod until `.env.prod` is populated. */
   readonly recordingsKmsKeyArn: string;
   readonly targetGroup: elbv2.ApplicationTargetGroup;
+  /**
+   * Lambda name (or alias) the engine invokes for runtime-config and
+   * call-record writes. Maps to `Settings.voice_api_lambda_name`.
+   * Required by the engine's pydantic-settings boot — without it, the
+   * task crashes on startup with ValidationError.
+   */
+  readonly voiceApiLambdaName: string;
 }
 
 /**
@@ -112,6 +119,7 @@ export class EcsServiceConstruct extends Construct {
       recordingsBucketArn,
       recordingsKmsKeyArn,
       targetGroup,
+      voiceApiLambdaName,
     } = props;
 
     const stack = cdk.Stack.of(this);
@@ -150,11 +158,10 @@ export class EcsServiceConstruct extends Construct {
       },
     });
 
-    const apiKeySecret = secretsmanager.Secret.fromSecretCompleteArn(
-      this,
-      'ApiKeySecretRef',
-      secretArns.apiKey,
-    );
+    // The api-key secret is fetched at runtime by the engine
+    // (server.py::_load_api_key) via the API_KEY_SECRET_ARN env var.
+    // No ecs.Secret injection here — the execution role's
+    // secretsmanager:GetSecretValue grant covers the runtime fetch.
     const dailySecret = secretsmanager.Secret.fromSecretCompleteArn(
       this,
       'DailyApiKeySecretRef',
@@ -195,9 +202,17 @@ export class EcsServiceConstruct extends Construct {
           recordingsBucketArn,
           cdk.ArnFormat.NO_RESOURCE_NAME,
         ).resource,
+        // Required by Settings — engine refuses to boot without these.
+        VOICE_API_LAMBDA_NAME: voiceApiLambdaName,
+        API_KEY_SECRET_ARN: secretArns.apiKey,
       },
       secrets: {
-        API_KEY: ecs.Secret.fromSecretsManager(apiKeySecret),
+        // Vendor SDK keys read directly via os.environ in Layer 3
+        // (factory.py) — tech debt entry 7 tracks that. The engine's
+        // /start bearer auth uses Secrets Manager via api_key_secret_arn
+        // (server.py::_load_api_key), so we DO NOT also inject API_KEY
+        // here. apiKeySecret remains referenced so the IAM execution-role
+        // policy grants GetSecretValue on the ARN.
         DAILY_API_KEY: ecs.Secret.fromSecretsManager(dailySecret),
         ASSEMBLYAI_API_KEY: ecs.Secret.fromSecretsManager(aaiSecret),
         ELEVENLABS_API_KEY: ecs.Secret.fromSecretsManager(elevenSecret),

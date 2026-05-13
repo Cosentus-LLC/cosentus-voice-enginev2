@@ -80,6 +80,15 @@ export interface VoiceEngineConfig {
   readonly serviceHostname: string;
   /** Shared wildcard ACM cert ARN. Empty string until CertStack is deployed. */
   readonly certificateArn: string;
+  /**
+   * cosentus-voice-api Lambda function name (or alias) the engine
+   * invokes for runtime-config + call-record writes. Required by the
+   * engine's pydantic-settings boot. Default `medcloud-voice-api:live`
+   * matches the v1 production Lambda. Staging deploys SHOULD repoint
+   * at a staging alias before traffic flows — using prod here is a
+   * deploy-validation-only shortcut.
+   */
+  readonly voiceApiLambdaName: string;
   /** Daily.co S3 recordings bucket name (existing or to-be-created). */
   readonly recordingsBucketName: string;
   /** True when CDK owns the bucket lifecycle; false when we import an existing bucket. */
@@ -121,6 +130,7 @@ const ENV_DEFAULTS: Record<Environment, Partial<VoiceEngineConfig>> = {
     recordingsBucketName: 'cosentus-voice-recordings-staging',
     recordingsBucketOwnedByCdk: true,
     recordingsKmsKeyArn: '',
+    voiceApiLambdaName: 'medcloud-voice-api:live',
   },
   prod: {
     vpcCidr: '10.30.0.0/16',
@@ -139,6 +149,7 @@ const ENV_DEFAULTS: Record<Environment, Partial<VoiceEngineConfig>> = {
     recordingsBucketName: 'medcloud-voice-us-prod-825',
     recordingsBucketOwnedByCdk: false,
     recordingsKmsKeyArn: '',
+    voiceApiLambdaName: 'medcloud-voice-api:live',
   },
 };
 
@@ -293,6 +304,9 @@ export function loadConfig(app: App): VoiceEngineConfig {
   const recordingsKmsKeyArn =
     readSetting(app, 'recordingsKmsKeyArn', 'RECORDINGS_KMS_KEY_ARN') ??
     (defaults.recordingsKmsKeyArn as string);
+  const voiceApiLambdaName =
+    readSetting(app, 'voiceApiLambdaName', 'VOICE_API_LAMBDA_NAME') ??
+    (defaults.voiceApiLambdaName as string);
 
   return {
     environment,
@@ -317,6 +331,7 @@ export function loadConfig(app: App): VoiceEngineConfig {
     recordingsBucketName,
     recordingsBucketOwnedByCdk,
     recordingsKmsKeyArn,
+    voiceApiLambdaName,
   };
 }
 

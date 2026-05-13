@@ -174,6 +174,7 @@ export class ComputeStack extends cdk.Stack {
       recordingsBucketArn,
       recordingsKmsKeyArn: config.recordingsKmsKeyArn,
       targetGroup: this.alb.targetGroup,
+      voiceApiLambdaName: config.voiceApiLambdaName,
     });
 
     this.monitoring = new MonitoringConstruct(this, 'Monitoring', {
