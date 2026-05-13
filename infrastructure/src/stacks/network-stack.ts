@@ -33,15 +33,21 @@ export class NetworkStack extends cdk.Stack {
       stringValue: this.vpcConstruct.vpc.vpcId,
       description: 'VPC ID for the voice engine.',
     });
-    new ssm.StringListParameter(this, 'PrivateSubnetIdsParam', {
+    // Publish subnet IDs as comma-joined StringParameters (not
+    // StringListParameter). ComputeStack reads them via
+    // `valueForStringParameter` and splits with `Fn::Split` — that flow
+    // only works against a `String` SSM type. A `StringList` type at
+    // the SSM side causes CFN to reject the deploy with "Types for SSM
+    // parameters [...] defined in CFN template and SSM are incompatible".
+    new ssm.StringParameter(this, 'PrivateSubnetIdsParam', {
       parameterName: params.PRIVATE_SUBNET_IDS,
-      stringListValue: this.vpcConstruct.taskSubnetIds,
-      description: 'Private subnet IDs for Fargate tasks.',
+      stringValue: this.vpcConstruct.taskSubnetIds.join(','),
+      description: 'Comma-joined private subnet IDs for Fargate tasks.',
     });
-    new ssm.StringListParameter(this, 'PublicSubnetIdsParam', {
+    new ssm.StringParameter(this, 'PublicSubnetIdsParam', {
       parameterName: params.PUBLIC_SUBNET_IDS,
-      stringListValue: this.vpcConstruct.albSubnetIds,
-      description: 'Public subnet IDs for the ALB.',
+      stringValue: this.vpcConstruct.albSubnetIds.join(','),
+      description: 'Comma-joined public subnet IDs for the ALB.',
     });
     new ssm.StringParameter(this, 'TaskSecurityGroupIdParam', {
       parameterName: params.TASK_SECURITY_GROUP_ID,
