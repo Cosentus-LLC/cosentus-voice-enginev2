@@ -600,3 +600,105 @@ that triggered the 1008s.
 **Layer / file.** Vendor / account-side. No v2 code owns this;
 referenced by the Layer 9.5 scale-test report and (future)
 ``docs/runbooks/production-launch-checklist.md``.
+
+## Entry 14: Engine auth uses non-standard `X-API-Key` header instead of `Authorization: Bearer`
+
+**Context.** ``app/runner/server.py::_check_api_key`` reads the
+caller's API key from a custom ``X-API-Key`` header. The web
+ecosystem (RFC 6750, every API gateway, every SDK client) defaults
+to ``Authorization: Bearer <token>``. The mismatch wasn't obvious
+until the first staging smoke test, where the deploy guide
+defaulted to ``Authorization: Bearer`` and every ``/status``
+request returned 401 — value was identical, header name wasn't.
+
+**Why we accepted this.** v2 inherited the header name from v1
+(forked AWS sample). Changing it now would require coordinating
+with every caller (frontend dashboard, batch dispatcher, any
+ad-hoc internal tooling). Low-impact bug-but-not-broken — once
+the convention is known, everyone uses the right header.
+
+**Cost.** One-time documentation friction per new operator. Will
+show up again every time someone tries `curl` against the engine
+for the first time.
+
+**Exit condition.** Phase 5 follow-up after production launch:
+
+1. Make ``_check_api_key`` accept BOTH headers, preferring
+   ``Authorization: Bearer``. New callers use the canonical form;
+   old callers keep working through deprecation.
+2. Deprecate ``X-API-Key`` in a single release. Add a warning
+   header to responses where it was used.
+3. After one full call cycle (or 30 days, whichever is longer)
+   without seeing ``X-API-Key`` in production logs, remove the
+   compat shim.
+
+While we're in there, also swap the comparison from ``==`` to
+``hmac.compare_digest`` to eliminate the timing side channel.
+Single string equality on a secret is a textbook footgun; the
+exploit is impractical in our threat model but it's a 1-line fix
+to remove.
+
+**Severity.** Low — operator friction only, no real-world risk.
+
+**Status.** Open, non-blocking.
+
+**Layer / file.** Layer 9 — ``backend/voice-agent/app/runner/server.py``
+(``_check_api_key`` and call sites).
+
+## Entry 15: Silent fallback to "no-auth" when API-key secret load fails
+
+**Context.** ``app/runner/server.py::_load_api_key`` catches every
+exception from ``SecretsManager.get_secret_value`` and returns
+``""``. Empty-string is then treated by ``_check_api_key`` as
+"local-dev mode, auth disabled" — so any request passes without
+header.
+
+The intent was a clean local-dev story: if you didn't set
+``API_KEY_SECRET_ARN``, you run without auth. The implementation
+conflates two failure modes:
+
+* "no ARN configured" (local dev) — should disable auth.
+* "ARN configured, but Secrets Manager call failed" (prod IAM
+  drift, network blip, secret deleted) — should fail loud, not
+  silently disable auth.
+
+In the second case, the engine boots and starts serving
+**authenticated routes as if no auth were required**. We saw this
+explicitly in the Layer 11 staging deploy code review when
+auditing the auth path.
+
+**Why we accepted this for the initial cutover.** Discovered too
+late in the Layer 11 deploy cycle to rewire pre-staging-launch.
+Risk is mitigated for now because: (a) staging IAM is granting the
+role correctly today (verified by smoke test), (b) Secrets
+Manager has a published 99.99% availability SLA, (c) the secret
+isn't deleted by any automation.
+
+**Cost.** A latent production-security regression if any of those
+conditions break.
+
+**Exit condition.** Phase 5 follow-up:
+
+1. Split the two failure modes in ``_load_api_key``:
+   * ``arn == ""`` ⇒ ``return ""`` (local-dev only-no-auth path,
+     unchanged).
+   * ``arn != ""`` and Secrets Manager call fails ⇒ **raise** so
+     the task crashes at boot. ECS restarts the task; if the
+     condition persists, the deploy circuit-breaker rolls back.
+2. Add a startup-time assertion: in production environments
+   (``settings.environment != "production"`` is for the
+   non-prod path, ``"production"`` and ``"prod"`` mean we MUST
+   have a non-empty key loaded). Fail-fast if the empty-string
+   path is taken in those envs.
+3. Add a smoke-test step to the future runbook: hit
+   ``/status`` without auth from outside the VPC after every
+   deploy. Expect 401. If 200, the bug is back.
+
+**Severity.** Medium — quiet defaults that disable security are
+worse than loud failures.
+
+**Status.** Open, non-blocking for Layer 11 deploy / Wave 6 mock
+load test. Should land before any real production traffic flows.
+
+**Layer / file.** Layer 9 — ``backend/voice-agent/app/runner/server.py``
+(``_load_api_key`` lines 301–339).
