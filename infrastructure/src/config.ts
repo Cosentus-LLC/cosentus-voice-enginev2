@@ -130,7 +130,11 @@ const ENV_DEFAULTS: Record<Environment, Partial<VoiceEngineConfig>> = {
     recordingsBucketName: 'cosentus-voice-recordings-staging',
     recordingsBucketOwnedByCdk: true,
     recordingsKmsKeyArn: '',
-    voiceApiLambdaName: 'medcloud-voice-api:live',
+    // Staging points at the stub Lambda (see VoiceApiStubStack) so
+    // call-record writes don't touch production Aurora. The stub
+    // returns canned runtime-config + accepts writes as no-ops.
+    // Repoint at a real staging Lambda alias in Phase 6.
+    voiceApiLambdaName: 'cosentus-voice-api-staging-stub',
   },
   prod: {
     vpcCidr: '10.30.0.0/16',

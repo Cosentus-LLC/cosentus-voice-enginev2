@@ -6,15 +6,17 @@ independently from one codebase.
 
 ## Status
 
-Wave 3 of 5 — `CertStack` + `ComputeStack` (ALB + ECS + autoscaling + monitoring).
+All foundational CDK shipped. Staging deployed end-to-end. Wave 6 mock
+load test is the next workstream (separate harness, not CDK).
 
 | Wave | Scope | Status |
 |------|-------|--------|
 | 1 | Skeleton + ECR + VPC + network | shipped |
 | 2 | `StorageStack` (Secrets Manager + S3 recordings + KMS) | shipped |
 | 3 | `CertStack` (wildcard ACM) + `ComputeStack` (ALB + ECS + autoscaling + monitoring) | shipped |
-| 4 | Engine-side `cloudwatch:PutMetricData` for `ActiveSessions` | pending |
-| 5 | GitHub Actions (`build-and-push`, `deploy-staging`, `deploy-prod`) + doc cleanup | pending |
+| 4 | Engine-side `cloudwatch:PutMetricData` for `ActiveSessions` + `DrainTimeouts` | shipped |
+| 5 | GitHub Actions (`build-and-push`, `deploy-staging`, `deploy-prod`) + doc cleanup | deferred to Phase 5 (post-prod) |
+| 7 | Staging deploy + `VoiceApiStubStack` for prod-data isolation during testing | shipped |
 
 ## Quick start
 
@@ -45,6 +47,7 @@ infrastructure/
       storage-stack.ts           # Secrets Manager + recordings bucket
       cert-stack.ts              # shared wildcard ACM (env-independent)
       compute-stack.ts           # ALB + ECS + autoscaling + monitoring
+      voice-api-stub-stack.ts    # staging-only stub of cosentus-voice-api Lambda
     constructs/
       vpc.ts                     # VPC + 8 endpoints + 2 security groups
       secrets.ts                 # 4 empty Secrets Manager entries (L1 CfnSecret)
@@ -52,6 +55,9 @@ infrastructure/
       alb.ts                     # internet-facing ALB + HTTPS listener + target group
       ecs-service.ts             # cluster + task def + Fargate service + autoscaling
       monitoring.ts              # SNS alarm topic + 5 alarms + dashboard
+  lambdas/
+    voice-api-stub/
+      handler.py                 # canned runtime-config + no-op writes
 ```
 
 ## Locked-in choices
@@ -108,23 +114,53 @@ the upstream stacks have published their SSM values. The required
 sequence per environment:
 
 ```
-1. cdk deploy cosentus-voice-engine-cert            # one-time, env-independent
-                                                    # then: add CNAME at GoDaddy,
-                                                    # wait for ACM validation
-2. cdk deploy cosentus-voice-engine-<env>-ecr       # creates the ECR repo
-3. (push the engine image, tag it, get a sha)       # CI/CD or manual
-4. cdk deploy cosentus-voice-engine-<env>-network   # VPC, NAT, endpoints
-5. cdk deploy cosentus-voice-engine-<env>-storage   # secrets (empty) + bucket
-6. (populate secrets via AWS Console, see below)    # API keys go in plaintext
-7. cdk deploy cosentus-voice-engine-<env>-compute   # ALB + ECS + autoscaling
-                                                    # then: add CNAME at GoDaddy
-                                                    # pointing serviceHostname →
-                                                    # ALB DNS output
+1. cdk deploy cosentus-voice-engine-cert                       # one-time, env-independent
+                                                               # then: add CNAME at GoDaddy,
+                                                               # wait for ACM validation
+2. cdk deploy cosentus-voice-engine-<env>-ecr                  # creates the ECR repo
+3. (push the engine image, tag it, get a sha)                  # CI/CD or manual
+4. cdk deploy cosentus-voice-engine-<env>-network              # VPC, NAT, endpoints
+5. cdk deploy cosentus-voice-engine-<env>-storage              # secrets (empty) + bucket
+6. (populate secrets via AWS Console / CLI, see below)         # API keys go in plaintext
+7. cdk deploy cosentus-voice-engine-staging-voice-api-stub     # staging only
+8. cdk deploy cosentus-voice-engine-<env>-compute              # ALB + ECS + autoscaling
+                                                               # then: add CNAME at GoDaddy
+                                                               # pointing serviceHostname →
+                                                               # ALB DNS output
 ```
 
-After step 7, subscribe operator endpoints (email / PagerDuty / Slack
+After step 8, subscribe operator endpoints (email / PagerDuty / Slack
 incoming-webhook bridge) to the SNS topic published as
 `AlarmTopicArn` in ComputeStack's outputs.
+
+### Why staging has a voice-api stub Lambda
+
+The engine's Layer 1 + Layer 6 invoke the cosentus-voice-api Lambda
+for runtime-config reads and call-record writes. Production's Lambda
+(`medcloud-voice-api:live`) writes to production Aurora. Staging tests
+should not.
+
+`VoiceApiStubStack` deploys `cosentus-voice-api-staging-stub`, a tiny
+Python Lambda that:
+
+- Returns a canned `AgentConfig` for any `agent_id` (Haiku model,
+  `press_digit` + `end_call` tools, generic system prompt).
+- Accepts `POST /api/calls` and `POST /api/auto-actions` as 200 no-ops.
+- Logs each invocation as JSON for CloudWatch Insights.
+
+The engine's `VOICE_API_LAMBDA_NAME` for staging defaults to this
+stub (see `config.ts`). Phase 6 will deploy a real staging Lambda
+alias against a staging Aurora schema; at that point destroy
+`VoiceApiStubStack` and repoint the env var.
+
+**Shell gotcha noted during Wave 7 deploy.** Don't `source .env.skeleton`
+in the same shell you run `cdk deploy` from — it exports
+`VOICE_API_LAMBDA_NAME` and other vars into the shell, and CDK's
+config.ts will read those env-var overrides instead of the
+per-env defaults. If you must source it (e.g., to populate secrets
+via CLI), spawn a subshell with `bash -c '...'` for the deploy
+or `unset VOICE_API_LAMBDA_NAME API_KEY_SECRET_ARN DAILY_API_KEY
+ASSEMBLYAI_API_KEY ELEVENLABS_API_KEY` first.
 
 ## Secrets Manager — populating before deploy
 

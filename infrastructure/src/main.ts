@@ -30,6 +30,7 @@ import {
   EcrStack,
   NetworkStack,
   StorageStack,
+  VoiceApiStubStack,
 } from './stacks';
 
 function resolveImageTag(app: cdk.App): string {
@@ -88,6 +89,20 @@ const certStack = new CertStack(app, 'cosentus-voice-engine-cert', {
 
 const imageTag = resolveImageTag(app);
 
+// Voice-api stub Lambda — staging only. Stands in for the real
+// cosentus-voice-api Lambda so the staging engine can run end-to-end
+// calls without writing to production Aurora. Destroy when the real
+// staging Lambda alias lands in Phase 6.
+let voiceApiStubStack: VoiceApiStubStack | undefined;
+if (config.environment === 'staging') {
+  voiceApiStubStack = new VoiceApiStubStack(app, `${prefix}-voice-api-stub`, {
+    env,
+    config,
+    description: `Voice engine v2 — voice-api stub Lambda (${config.environment}).`,
+    tags: { ...commonTags, Stack: 'voice-api-stub' },
+  });
+}
+
 const computeStack = new ComputeStack(app, `${prefix}-compute`, {
   env,
   config,
@@ -104,5 +119,6 @@ void networkStack;
 void storageStack;
 void certStack;
 void computeStack;
+void voiceApiStubStack;
 
 app.synth();
