@@ -92,15 +92,26 @@ export class AlbConstruct extends Construct {
       protocol: elbv2.ApplicationProtocol.HTTP,
       targetType: elbv2.TargetType.IP,
       deregistrationDelay: cdk.Duration.seconds(120),
+      // Health-check tolerances tuned by Wave 6 Option I (2026-05-18).
+      // Previous values (interval=15, timeout=5, unhealthyThreshold=3)
+      // were tripped by transient CPU spikes during mid-range sustained
+      // traffic: a saturated task's /ready replies slower than 5 s, ALB
+      // marked it unhealthy after 3 × 15 s = 45 s, ECS replaced it, and
+      // the ~60 s replacement gap left no healthy targets. Loosening to
+      // (30, 10, 4) gives transient saturation time to recover before
+      // we tear down a still-functional task. The trade-off is slower
+      // detection of a TRULY-broken task: ~120 s vs the previous ~45 s.
+      // Autoscaler scale-out (target=40 % per task) now reacts before
+      // we get near these thresholds in practice. See tech-debt entry 16.
       healthCheck: {
         path: '/ready',
         protocol: elbv2.Protocol.HTTP,
         port: '8080',
         healthyHttpCodes: '200',
-        interval: cdk.Duration.seconds(15),
-        timeout: cdk.Duration.seconds(5),
+        interval: cdk.Duration.seconds(30),
+        timeout: cdk.Duration.seconds(10),
         healthyThresholdCount: 2,
-        unhealthyThresholdCount: 3,
+        unhealthyThresholdCount: 4,
       },
     });
 

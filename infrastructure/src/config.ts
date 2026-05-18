@@ -51,10 +51,13 @@ export interface VoiceEngineConfig {
   /**
    * Auto-scaling min task count.
    *
-   * Staging=1 (validation focus, no always-warm cost).
-   * Prod=1 to start. Raised after Wave 6 mock load tests prove the
-   * platform and real traffic estimates are in hand. Validate-then-commit
-   * — don't burn 24/7 always-warm Fargate cost during validation.
+   * Staging=2 and prod=2 (Wave 6 Option I, 2026-05-18). Single-task
+   * fleet is one ECS health-check timeout away from total outage —
+   * we saw exactly this during Phase A revalidation when sustained
+   * mid-range traffic pushed a single task into CPU saturation and
+   * triggered a health-check-driven replacement. Cost of min=2 over
+   * min=1: ~$30/mo Fargate. Cost of single-task outage: a call
+   * volume's worth of dropped traffic.
    */
   readonly minCapacity: number;
   /**
@@ -64,7 +67,16 @@ export interface VoiceEngineConfig {
    * Prod=25 (headroom for 6 concurrent × 25 tasks = 150 concurrent calls).
    */
   readonly maxCapacity: number;
-  /** Target percent of session capacity that drives scale-out. 70 = scale out at 70%. */
+  /**
+   * Target percent of session capacity that drives scale-out.
+   *
+   * 40 = scale out at 40% (= 2.4 sessions/task). Wave 6 Option I
+   * (2026-05-18) lowered this from 70 (= 4.2/task) because target=4.2
+   * gave the autoscaler too little headroom — sustained mid-range
+   * traffic saturated CPU on the still-single task before scale-out
+   * had time to react. 40 gives the autoscaler a generous head start.
+   * Trade-off: more frequent scaling events under mixed traffic.
+   */
   readonly targetSessionsPct: number;
   /** Scale-out cooldown — fast (60s) so capacity ramps quickly under burst. */
   readonly scaleOutCooldownSeconds: number;
@@ -119,9 +131,19 @@ const ENV_DEFAULTS: Record<Environment, Partial<VoiceEngineConfig>> = {
     natGateways: 1,
     cpu: 1024,
     memoryMiB: 2048,
-    minCapacity: 1,
+    // Wave 6 Option I (2026-05-18). minCapacity bumped from 1 to 2:
+    // single-task fleet is one ECS health-check timeout away from
+    // total outage. Cost: ~$30/mo extra Fargate. Worth the resilience.
+    minCapacity: 2,
     maxCapacity: 5,
-    targetSessionsPct: 70,
+    // Wave 6 Option I (2026-05-18). targetSessionsPct lowered from 70
+    // (= 4.2 sessions/task) to 40 (= 2.4 sessions/task) so the
+    // autoscaler scales out BEFORE the single-task CPU bottleneck
+    // and ALB-health-check timeout cascade observed in Phase A
+    // revalidation. Trade-off: more frequent scaling events under
+    // mixed traffic, but each call's CPU headroom is dramatically
+    // bigger. See tech-debt entry 16 for the failure mode.
+    targetSessionsPct: 40,
     scaleOutCooldownSeconds: 60,
     scaleInCooldownSeconds: 300,
     sessionCapacityPerTask: 6,
@@ -142,9 +164,16 @@ const ENV_DEFAULTS: Record<Environment, Partial<VoiceEngineConfig>> = {
     natGateways: 3,
     cpu: 1024,
     memoryMiB: 2048,
-    minCapacity: 1,
+    // Wave 6 Option I (2026-05-18). minCapacity bumped from 1 to 2
+    // matching staging. Single-task fleet is one ECS health-check
+    // timeout away from total outage; prod can't accept that risk.
+    // Cost: ~$30/mo extra Fargate over the prior min=1 plan.
+    minCapacity: 2,
     maxCapacity: 25,
-    targetSessionsPct: 70,
+    // Wave 6 Option I (2026-05-18). targetSessionsPct lowered from 70
+    // to 40 (= 2.4 sessions/task) matching staging. Scales out
+    // before single-task CPU saturation. See tech-debt entry 16.
+    targetSessionsPct: 40,
     scaleOutCooldownSeconds: 60,
     scaleInCooldownSeconds: 300,
     sessionCapacityPerTask: 6,
