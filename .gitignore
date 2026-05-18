@@ -38,3 +38,6 @@ Thumbs.db
 .env.local
 .env.*.local
 .env.skeleton
+
+wave6_results/
+
