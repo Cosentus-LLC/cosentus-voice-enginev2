@@ -519,7 +519,7 @@ requires-dist = [
     { name = "aiohttp" },
     { name = "boto3" },
     { name = "fastapi" },
-    { name = "pipecat-ai", extras = ["daily", "silero", "elevenlabs", "aws", "webrtc", "runner", "assemblyai"], specifier = ">=1.1.0,<2.0.0" },
+    { name = "pipecat-ai", extras = ["daily", "silero", "elevenlabs", "aws", "webrtc", "runner", "assemblyai"], specifier = "==1.1.0" },
     { name = "pydantic", specifier = ">=2" },
     { name = "pydantic-settings", specifier = ">=2.0" },
     { name = "pytest", marker = "extra == 'dev'" },

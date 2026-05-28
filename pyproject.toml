@@ -19,7 +19,16 @@ license = { text = "Proprietary" }
 # absorbed. v2 is greenfield — no inherited patches — so we start on
 # the current stable line.
 dependencies = [
-    "pipecat-ai[daily,silero,elevenlabs,aws,webrtc,runner,assemblyai]>=1.1.0,<2.0.0",
+    # Pinned EXACTLY to 1.1.0 — the version validated across Wave 6
+    # (scale tests, soak tests, every working real PSTN call). pipecat
+    # 1.2.x changed the ElevenLabs TTS WebSocket protocol handling and
+    # breaks our voice_settings config with a 1008 "voice_settings must
+    # be provided in the first message and then not change" error
+    # (caught 2026-05-28 on the prod PSTN smoke; see tech-debt entry 20).
+    # Do NOT widen this back to a range without re-validating TTS end to
+    # end against the new version. The Dockerfile also installs from
+    # uv.lock with --frozen so a stray range can't silently drift again.
+    "pipecat-ai[daily,silero,elevenlabs,aws,webrtc,runner,assemblyai]==1.1.0",
     "boto3",
     "pydantic>=2",
     "pydantic-settings>=2.0",

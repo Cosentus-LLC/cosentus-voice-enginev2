@@ -71,11 +71,28 @@ WORKDIR /build
 # so we need a stub directory present at install time for setuptools
 # to validate the package layout. Real source copied below.
 COPY pyproject.toml ./
+COPY uv.lock ./
 COPY README.md ./
 RUN mkdir -p backend/voice-agent/app \
  && printf '"""stub for builder layer cache; real code copied in next layer."""\n' \
         > backend/voice-agent/app/__init__.py
-RUN uv pip install --system --no-cache-dir .
+# FROZEN dependency install. ``uv export --frozen`` turns the committed
+# uv.lock into a fully-pinned, hash-locked requirements set WITHOUT
+# re-resolving against PyPI; ``uv pip install -r`` then installs exactly
+# those versions into the system site-packages.
+#
+# Why this matters (regression 2026-05-28): the previous
+# ``uv pip install .`` ignored uv.lock and re-resolved the pyproject
+# range on every build. A fresh prod build silently pulled pipecat-ai
+# 1.2.1 instead of the Wave-6-validated 1.1.0, which broke ElevenLabs
+# TTS (1008 voice_settings WebSocket error) and produced a totally
+# silent call. With --frozen, a rebuild months from now installs
+# byte-identical dependency versions. See tech-debt entry 20.
+#
+# ``--no-emit-project`` excludes the local app package (installed
+# separately below with --no-deps); ``--no-dev`` drops pytest et al.
+RUN uv export --frozen --no-emit-project --no-dev --format requirements-txt -o /tmp/requirements.txt \
+ && uv pip install --system --no-cache-dir -r /tmp/requirements.txt
 
 # Copy real app source on top. This invalidates a small layer (the
 # stub install metadata) but the deps are already cached.

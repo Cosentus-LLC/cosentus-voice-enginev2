@@ -1008,3 +1008,76 @@ absolute dollars but materially changes unit economics at scale.
 migration itself; allowlist fix in
 ``cosentus-voice-api-lambda`` commit ``ec17916``.
 
+## Entry 20: pipecat-ai pinned to 1.1.0; 1.2.x ElevenLabs TTS regression
+
+**Status:** pin shipped 2026-05-28. 1.2.x compatibility is an open
+investigation (non-blocking).
+
+**Context.** The first prod PSTN smoke (2026-05-28, call_id
+``022c7451-94f2-46c8-8a91-74c4b84fa313``) produced a totally silent
+call — the engine joined, dialout connected, AssemblyAI captured
+the caller's speech, Haiku generated responses, and the call record
++ PCA wrote to prod Aurora — but **no audio was ever synthesized**.
+Engine logs showed the ElevenLabs TTS WebSocket closing twice with::
+
+    1008 (policy violation) voice_settings field must be provided in
+    the first message and then either be not provided or not change.
+
+**Root cause — silent dependency drift.** Two compounding issues:
+
+1. ``pyproject.toml`` pinned ``pipecat-ai>=1.1.0,<2.0.0`` (a range).
+2. The Dockerfile copied ``pyproject.toml`` but NOT ``uv.lock``, and
+   ran ``uv pip install --system .`` — which re-resolves the range
+   against PyPI on every build, ignoring the lockfile.
+
+The staging image (``1ec5469``, built 2026-05-11) resolved
+pipecat-ai **1.1.0** — the version validated across all of Wave 6.
+The prod image (``14b1d7c``, built 2026-05-28) resolved
+pipecat-ai **1.2.1** (the new latest), because nothing pinned it.
+pipecat 1.2.x changed how the ElevenLabs TTS service serializes
+``voice_settings`` over its streaming WebSocket; with our config
+(per-agent ``stability`` + ``use_speaker_boost``) it now sends
+``voice_settings`` on a message ElevenLabs rejects with 1008.
+
+Confirmed by exec into both images:
+
+* staging ``1ec5469`` → ``pipecat-ai 1.1.0`` (TTS works)
+* prod ``14b1d7c``   → ``pipecat-ai 1.2.1`` (TTS broken)
+
+**Fix shipped.**
+
+1. Pinned ``pipecat-ai==1.1.0`` exactly in ``pyproject.toml`` and
+   regenerated ``uv.lock`` (clean — only the recorded specifier
+   line changed; no transitive drift).
+2. Dockerfile now ``COPY uv.lock`` and installs via
+   ``uv export --frozen --no-emit-project --no-dev`` piped to
+   ``uv pip install -r``. Builds are now reproducible — a rebuild
+   installs byte-identical, hash-locked dependency versions instead
+   of re-resolving. The single shared Dockerfile means staging gets
+   the same protection on its next build (staging's running image
+   is already on 1.1.0, so no immediate staging redeploy needed).
+3. Rebuilt + redeployed the prod image on the pinned 1.1.0.
+
+**Open follow-up (non-blocking) — pipecat 1.2.x compatibility.**
+We are deliberately staying on 1.1.0 for now (matches the validated
+Wave 6 baseline). 1.2.x has real improvements we may want later, but
+adopting it requires:
+
+* Reproducing the 1008 ``voice_settings`` error in a dev/staging
+  harness against 1.2.x.
+* Determining whether it's fixable on our side (e.g. how/when we
+  pass ``stability`` / ``use_speaker_boost`` in ``build_tts`` —
+  ``app/services/factory.py``), an upstream Pipecat bug, or an
+  ElevenLabs protocol tightening.
+* Re-validating full TTS end-to-end (real PSTN call with audio)
+  before bumping the pin.
+
+Do NOT widen the ``pipecat-ai`` pin back to a range without
+completing that validation. The exact pin + frozen Docker install
+are the guardrails.
+
+**Layer / file.** ``pyproject.toml`` (dependency pin), ``uv.lock``
+(regenerated), ``Dockerfile`` (frozen install), ``app/services
+/factory.py::build_tts`` (the voice_settings construction that
+1.2.x rejects). Engine commit pending.
+
