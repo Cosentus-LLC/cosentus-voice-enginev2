@@ -31,7 +31,6 @@ P50/P95/P99 histograms.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import time
 from dataclasses import dataclass, field
@@ -93,11 +92,7 @@ class CallResultBatch:
         for r in self.results:
             if r.outcome in ("accepted_202", "rejected_503"):
                 continue
-            key = (
-                f"status_{r.status_code}"
-                if r.outcome == "other_status"
-                else r.outcome
-            )
+            key = f"status_{r.status_code}" if r.outcome == "other_status" else r.outcome
             out[key] = out.get(key, 0) + 1
         return out
 
@@ -139,7 +134,7 @@ class HttpCaller:
         self._connector = aiohttp.TCPConnector(limit=total_connection_limit)
         self._session: aiohttp.ClientSession | None = None
 
-    async def __aenter__(self) -> "HttpCaller":
+    async def __aenter__(self) -> HttpCaller:
         self._session = aiohttp.ClientSession(
             connector=self._connector,
             timeout=self._timeout,
@@ -216,7 +211,7 @@ class HttpCaller:
                     call_id=call_id,
                     body_preview=preview,
                 )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return CallResult(
                 started_at_ms=started_at_ms,
                 status_code=-1,

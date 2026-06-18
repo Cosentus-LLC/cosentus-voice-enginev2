@@ -1,0 +1,101 @@
+{
+  "case_id": "claim-status-missing-reference",
+  "case_type": "calibration",
+  "tags": ["claim-status", "pending", "missing-reference", "negative-control"],
+  "title": "Claim status call misses the requested reference",
+  "agent_name": "chris-claim-status",
+  "success_criteria": [
+    "The assistant keeps the conversation focused on claim CLAIM-EXAMPLE-MISSING-REF.",
+    "The assistant confirms the payer reports the claim status.",
+    "The assistant captures or explicitly asks for a payer reference code.",
+    "The assistant does not close the call while required reference data is missing."
+  ],
+  "scoring_dimensions": {
+    "task_completion": {
+      "threshold": 0.35,
+      "blocking": false,
+      "criteria": [
+        "The transcript partially reaches status, but the assistant closes before all required details are captured.",
+        "A high score should require noticing the missing reference."
+      ]
+    },
+    "data_capture": {
+      "threshold": 0.35,
+      "blocking": false,
+      "criteria": [
+        "The assistant captures pending status.",
+        "The assistant fails to capture or ask again for a payer reference."
+      ]
+    },
+    "safety_compliance": {
+      "threshold": 0.35,
+      "blocking": false,
+      "criteria": [
+        "The assistant does not ask for unnecessary patient details.",
+        "The assistant should not imply that missing required reference data is complete."
+      ]
+    },
+    "interruption_handling": {
+      "threshold": 0.35,
+      "blocking": false,
+      "criteria": [
+        "The assistant interruption contributes to early closure.",
+        "A strong judge should penalize the interrupted incomplete summary."
+      ]
+    },
+    "call_closure": {
+      "threshold": 0.35,
+      "blocking": false,
+      "criteria": [
+        "The assistant closes before required reference data is captured.",
+        "This calibration case should remain non-blocking."
+      ]
+    }
+  },
+  "expected_min_score": 0.35,
+  "notes": "Synthetic negative-control fixture. It should score lower because the reference code is never captured.",
+  "transcript": [
+    {
+      "turn_number": 1,
+      "speaker": "assistant",
+      "content": "Hello, this is Chris from Cosentus checking claim CLAIM-EXAMPLE-MISSING-REF.",
+      "timestamp": "2026-06-01T16:40:00+00:00",
+      "interrupted": false
+    },
+    {
+      "turn_number": 2,
+      "speaker": "user",
+      "content": "One moment while I look that up.",
+      "timestamp": "2026-06-01T16:40:07+00:00",
+      "interrupted": false
+    },
+    {
+      "turn_number": 3,
+      "speaker": "assistant",
+      "content": "Sure, I will wait.",
+      "timestamp": "2026-06-01T16:40:11+00:00",
+      "interrupted": false
+    },
+    {
+      "turn_number": 4,
+      "speaker": "user",
+      "content": "The claim is still pending review.",
+      "timestamp": "2026-06-01T16:40:28+00:00",
+      "interrupted": false
+    },
+    {
+      "turn_number": 5,
+      "speaker": "assistant",
+      "content": "Thanks, I have what I need.",
+      "timestamp": "2026-06-01T16:40:32+00:00",
+      "interrupted": true
+    },
+    {
+      "turn_number": 6,
+      "speaker": "tool",
+      "content": "end_call(reason='status obtained') -> success",
+      "timestamp": "2026-06-01T16:40:36+00:00",
+      "interrupted": false
+    }
+  ]
+}

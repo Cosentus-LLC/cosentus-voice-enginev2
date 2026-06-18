@@ -492,7 +492,9 @@ class PipelineManager:
         consumed.
         """
         try:
-            await bot(runner_args)
+            # Pass the boot-time Settings singleton so ``bot`` /
+            # ``run_bot`` don't reconstruct it per call (F3).
+            await bot(runner_args, self._settings)
         finally:
             self._active_sessions.pop(call_id, None)
             if len(self._active_sessions) == 0 and self._protection.is_protected:

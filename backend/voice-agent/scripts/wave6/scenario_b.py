@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -48,7 +48,7 @@ POST_BURST_QUIESCE_SECS = 30  # let the autoscaler settle
 
 async def run(paths: config.RunPaths) -> scenario_base.ScenarioResult:
     """Execute scenario B against staging. Returns a ScenarioResult."""
-    started_dt = datetime.now(timezone.utc)
+    started_dt = datetime.now(UTC)
     started_ts = scenario_base.now_iso()
     started_perf = time.perf_counter()
 
@@ -71,7 +71,7 @@ async def run(paths: config.RunPaths) -> scenario_base.ScenarioResult:
     # Let CloudWatch ingest the last datapoints before querying.
     await asyncio.sleep(120)
     post_state = await ecs.describe_service()
-    ended_dt = datetime.now(timezone.utc)
+    ended_dt = datetime.now(UTC)
     ended_ts = scenario_base.now_iso()
     duration_secs = round(time.perf_counter() - started_perf, 1)
 
@@ -261,9 +261,15 @@ def _build_checks(
         checks.append(
             scenario_base.Check.inconclusive(
                 "capacity_gate_fired",
-                "No 503 observed; possibly all 50 calls drained fast enough that no overflow occurred.",
+                (
+                    "No 503 observed; possibly all 50 calls drained fast enough that no "
+                    "overflow occurred."
+                ),
                 observed=burst_batch.rejected_503,
-                note="The fast-fail call lifetime is ~1.7s. At 50 over 10s, some slots open up before overflow lands.",
+                note=(
+                    "The fast-fail call lifetime is ~1.7s. At 50 over 10s, some slots "
+                    "open up before overflow lands."
+                ),
             )
         )
 
@@ -312,10 +318,19 @@ def _build_checks(
         checks.append(
             scenario_base.Check.inconclusive(
                 "autoscaler_added_task",
-                "Average ActiveSessions hit the scaling target but task count did not grow within the window.",
-                observed=f"{pre_state.running_count} -> {post_state.running_count}; avg max={sessions_avg.maximum}",
+                (
+                    "Average ActiveSessions hit the scaling target but task count did not "
+                    "grow within the window."
+                ),
+                observed=(
+                    f"{pre_state.running_count} -> {post_state.running_count}; "
+                    f"avg max={sessions_avg.maximum}"
+                ),
                 expected="> pre",
-                note="Target-tracking policies typically need 1-3 min to react. The 2 min post-load window may be too tight.",
+                note=(
+                    "Target-tracking policies typically need 1-3 min to react. The 2 min "
+                    "post-load window may be too tight."
+                ),
             )
         )
     else:

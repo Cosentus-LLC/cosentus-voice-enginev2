@@ -51,10 +51,11 @@ in v1's phase-8 branch:
 
 from __future__ import annotations
 
-import os
 import re
+from typing import Any
 
 import structlog
+from botocore.exceptions import ClientError, ConnectTimeoutError, ReadTimeoutError
 from pipecat.services.assemblyai.stt import AssemblyAISTTService
 from pipecat.services.aws.llm import AWSBedrockLLMService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
@@ -119,11 +120,12 @@ _ELEVENLABS_DEFAULT_VOICE_ID = "vW1NxlzqX8WROgpQAghR"
 hardcoded); v2 dropped SSM, so the chain is per-agent → this."""
 
 _ELEVENLABS_DEFAULT_MODEL = "eleven_flash_v2_5"
-"""Platform-wide fallback model. Matches v1's production-running
-value. ``AgentConfig.tts.model`` defaults to ``eleven_turbo_v2_5``
-on the Layer-1 side; that default is only consulted when the lambda
-omits the field, which it won't for any real agent — the factory
-fallback is the actual safety net."""
+"""Platform-wide fallback model, and the single source of truth for
+the TTS-model default. Matches v1's production-running value.
+``AgentConfig.tts.model`` defaults to ``""`` on the Layer-1 side
+(like ``voice_id``), so the chain is per-agent → this. Real agents
+always send ``tts.model``; this only fires on the omitted/empty
+path."""
 
 
 # ── Bedrock fallback ───────────────────────────────────────────────────────
@@ -153,6 +155,17 @@ the boundary."""
 # pipeline (no LLM output, no errors in logs) — a typo here means
 # every call goes to dead air. Production incident 2026-04-24 traces
 # back to exactly this failure mode.
+#
+# SINGLE SOURCE OF TRUTH FOR THE ALLOWLIST = THE API, NOT HERE.
+# The set of *accepted short model names* is owned by the API
+# (``api-lambda-v2`` → ``lib/agent-schema.ts`` → ``VALID_LLM_MODELS``,
+# a single Zod source). This table's KEYS are the engine's view of
+# that allowlist and MUST stay in sync with it: a model added on one
+# side only makes calls 400 (the 2026-05-27 prod incident — tech-debt
+# Entry 19). The contract test
+# ``tests/services/test_model_contract.py::test_model_map_matches_api_allowlist``
+# fails the build the moment the two drift, so the divergence is
+# caught at CI time rather than mid-call.
 
 _SHORT_TO_BEDROCK: dict[str, str] = {
     # Sonnet 4.6's inference profile has no date suffix (unlike older
@@ -227,17 +240,20 @@ def resolve_bedrock_model_id(short_or_full: str) -> str:
     return short_or_full
 
 
-def build_stt(agent: AgentConfig) -> AssemblyAISTTService:
+def build_stt(agent: AgentConfig, settings: Settings) -> AssemblyAISTTService:
     """Construct the AssemblyAI STT service with Mode-2 locked-in settings.
 
     The agent contributes only ``stt.keywords`` (wired into
     ``keyterms_prompt`` for AssemblyAI's keyword-boost feature). The
     rest are platform constants.
 
-    Reads ``ASSEMBLYAI_API_KEY`` from the environment — populated at
-    boot by the Layer 6 secrets-loader from Secrets Manager.
+    The API key comes from Layer 2 ``Settings.assemblyai_api_key`` (the
+    Fargate task definition injects it from Secrets Manager as the
+    ``ASSEMBLYAI_API_KEY`` env var; ``Settings`` reads it at boot). This
+    keeps secrets behind the ``Settings`` boundary rather than reading
+    ``os.environ`` directly in Layer 3.
     """
-    api_key = os.environ.get("ASSEMBLYAI_API_KEY")
+    api_key = settings.assemblyai_api_key
     if not api_key:
         raise ValueError("ASSEMBLYAI_API_KEY not set in environment")
 
@@ -266,7 +282,7 @@ def build_stt(agent: AgentConfig) -> AssemblyAISTTService:
     )
 
 
-def build_tts(agent: AgentConfig) -> ElevenLabsTTSService:
+def build_tts(agent: AgentConfig, settings: Settings) -> ElevenLabsTTSService:
     """Construct the ElevenLabs WebSocket TTS service.
 
     Per-agent: ``tts.voice_id``, ``tts.model``,
@@ -274,9 +290,12 @@ def build_tts(agent: AgentConfig) -> ElevenLabsTTSService:
     Each falls through to the platform default (or the vendor's own
     default) when unset.
 
-    Reads ``ELEVENLABS_API_KEY`` from the environment.
+    The API key comes from Layer 2 ``Settings.elevenlabs_api_key`` (the
+    Fargate task definition injects it from Secrets Manager as the
+    ``ELEVENLABS_API_KEY`` env var; ``Settings`` reads it at boot) —
+    not from ``os.environ``.
     """
-    api_key = os.environ.get("ELEVENLABS_API_KEY")
+    api_key = settings.elevenlabs_api_key
     if not api_key:
         raise ValueError("ELEVENLABS_API_KEY not set in environment")
 
@@ -302,6 +321,174 @@ def build_tts(agent: AgentConfig) -> ElevenLabsTTSService:
     )
 
 
+# ── Live mid-call Bedrock model failover (#52) ─────────────────────────────
+#
+# When the live (in-call) Bedrock model is throttled / at capacity /
+# not-ready, fail over to a backup Bedrock model so the call doesn't break.
+# The seam is ``AWSBedrockLLMService._create_converse_stream`` (see
+# _FailoverBedrockLLMService below): a *retryable* Bedrock error fires there,
+# at the ``converse_stream`` call, BEFORE any tokens stream to TTS — so we can
+# swap the model and retry without ever double-speaking. Mid-stream failures
+# (after tokens started) are out of scope.
+
+# Bedrock error codes that justify retrying the LIVE turn on the NEXT model in
+# the fallback chain — transient / capacity conditions a different model (or
+# its capacity pool) may survive. Anything else (AccessDeniedException,
+# ValidationException, a bad model id) is a hard failure another model won't
+# fix, so it propagates unchanged to Pipecat's existing push_error path.
+#
+# Intentionally a LOCAL copy of post_call._RETRYABLE_FAILOVER_ERROR_CODES
+# (the OFFLINE path, #20): Layer 3 (this factory) must not import from Layer 6
+# (post_call), and keeping it here avoids touching post_call.py. The two lists
+# describe the same Bedrock transient-error surface; keep them in sync.
+_RETRYABLE_FAILOVER_ERROR_CODES = frozenset(
+    {
+        "ThrottlingException",
+        "ServiceUnavailableException",
+        "ModelNotReadyException",
+    }
+)
+
+
+def _is_retryable_bedrock_error(exc: Exception) -> bool:
+    """True when ``exc`` is a transient Bedrock condition worth retrying on the
+    NEXT model in the live fallback chain (#52).
+
+    Retryable: connect / read timeouts (botocore ``*TimeoutError``) and the
+    throttling / capacity error codes in :data:`_RETRYABLE_FAILOVER_ERROR_CODES`.
+    Everything else — auth (``AccessDeniedException``), validation (a bad model
+    id), etc. — is a hard failure another model won't fix, so the override
+    re-raises and Pipecat handles it as today. Mirrors
+    ``post_call._is_retryable_failover_error``.
+    """
+    if isinstance(exc, (ReadTimeoutError, ConnectTimeoutError)):
+        return True
+    if isinstance(exc, ClientError):
+        code = exc.response.get("Error", {}).get("Code", "")
+        return code in _RETRYABLE_FAILOVER_ERROR_CODES
+    return False
+
+
+def _parse_model_fallback_chain(csv_string: str | None) -> list[str]:
+    """Parse the ``live_model_fallback_chain`` CSV into an ordered list of
+    model short-names.
+
+    Whitespace-stripped, empty entries dropped, order preserved — mirrors
+    ``post_call._parse_fallback_chain`` and Layer 8's CSV parsers. Empty /
+    unset → ``[]`` (no failover, today's behavior).
+    """
+    if not csv_string:
+        return []
+    return [m.strip() for m in csv_string.split(",") if m.strip()]
+
+
+def resolve_live_model_chain(primary_short: str, settings: Settings) -> list[str]:
+    """Build the ordered, de-duplicated list of Bedrock inference-profile IDs the
+    LIVE in-call LLM should try (#52): the primary model first, then each
+    fallback from ``Settings.live_model_fallback_chain``.
+
+    Every entry is resolved through :func:`resolve_bedrock_model_id` (the same
+    path as the primary), so short-names, dated short-names, and full IDs all
+    normalize identically; an unknown short-name warns and passes through
+    rather than being silently dropped. Duplicates (e.g. a fallback equal to
+    the primary) are dropped so the same model is never re-tried. Always
+    returns at least one element (the primary) — so an empty chain yields
+    ``[primary]`` and :func:`build_llm` builds the plain service.
+    """
+    chain: list[str] = []
+    seen: set[str] = set()
+    for short in (
+        primary_short,
+        *_parse_model_fallback_chain(settings.live_model_fallback_chain),
+    ):
+        bedrock_id = resolve_bedrock_model_id(short)
+        if bedrock_id not in seen:
+            seen.add(bedrock_id)
+            chain.append(bedrock_id)
+    return chain
+
+
+class _FailoverBedrockLLMService(AWSBedrockLLMService):
+    """``AWSBedrockLLMService`` that fails over to a backup Bedrock model on a
+    retryable error at the live ``converse_stream`` call (#52).
+
+    Only constructed by :func:`build_llm` when ``Settings.live_model_fallback_chain``
+    is non-empty; otherwise the plain ``AWSBedrockLLMService`` is built and this
+    class is never involved (flag-off path is byte-identical).
+
+    ⚠️ PINNED-1.1.0 INTERNAL: this overrides
+    ``AWSBedrockLLMService._create_converse_stream`` — a Pipecat-private method.
+    Safe under the exact ``pipecat-ai==1.1.0`` pin (see CLAUDE.md / #26); a
+    Pipecat bump MUST re-validate this seam. The failover tests call this
+    override directly, so a signature/behavior change fails the suite loudly.
+
+    Failover semantics:
+
+    * On a *retryable* Bedrock error (throttle / capacity / model-not-ready /
+      connect+read timeout) with another model left in the chain, swap
+      ``request_params["modelId"]`` to the next model and retry the call.
+    * On a *non-retryable* error (validation / auth) or the last model in the
+      chain, re-raise — Pipecat's ``_process_context`` handles it via
+      ``push_error`` exactly as today.
+    * After a successful failover the surviving model **sticks** for the rest
+      of the call (``self._settings.model`` is updated), so subsequent turns
+      start there instead of re-paying a throttled primary's latency. This is
+      strictly call-scoped: ``build_llm`` constructs one service instance per
+      call, so there is no cross-call leakage.
+
+    Out of scope: mid-stream failures (errors after tokens have started
+    streaming — the partial text is already on the TTS path), and the
+    out-of-band ``run_inference`` summarization path (it uses ``converse``,
+    not ``converse_stream``, and is best-effort off the critical path).
+    """
+
+    def __init__(self, *, fallback_model_ids: list[str], **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        # Models to try AFTER the primary, in order. Already resolved Bedrock
+        # inference-profile IDs (resolve_live_model_chain), de-duped against
+        # the primary.
+        self._fallback_model_ids = list(fallback_model_ids)
+
+    async def _create_converse_stream(self, client: Any, request_params: dict[str, Any]) -> Any:
+        # Ordered chain: whatever model the caller set first (normally the
+        # primary, or the stuck-to fallback from a prior turn), then any
+        # configured fallback not already at the head.
+        current = request_params["modelId"]
+        chain = [current, *[m for m in self._fallback_model_ids if m != current]]
+        last_exc: Exception | None = None
+        for index, model_id in enumerate(chain):
+            request_params["modelId"] = model_id
+            is_last = index == len(chain) - 1
+            try:
+                response = await super()._create_converse_stream(client, request_params)
+            except Exception as exc:  # noqa: BLE001 — classify, then re-raise
+                if _is_retryable_bedrock_error(exc) and not is_last:
+                    logger.warning(
+                        "live_llm_model_failover",
+                        from_model=model_id,
+                        to_model=chain[index + 1],
+                        error_type=type(exc).__name__,
+                    )
+                    last_exc = exc
+                    continue
+                # Non-retryable, or no model left: let Pipecat's
+                # _process_context handle it (push_error) as today.
+                raise
+            if index > 0:
+                # Stick to the surviving model for the rest of this (call-
+                # scoped) instance's turns.
+                self._settings.model = model_id
+                logger.warning(
+                    "live_llm_model_failover_succeeded",
+                    model=model_id,
+                    models_tried=index + 1,
+                )
+            return response
+        # Unreachable: the loop returns on success and re-raises on the last
+        # model's failure. Re-raise defensively to satisfy the type checker.
+        raise last_exc  # type: ignore[misc]
+
+
 def build_llm(
     agent: AgentConfig,
     settings: Settings,
@@ -319,6 +506,27 @@ def build_llm(
     long-form system prompts (Cosentus's are several KB) only pay
     full input cost on the first request and cached cost
     thereafter.
+
+    Cache mechanics (verified for #21): Pipecat appends a single
+    ``{"cachePoint": {"type": "default"}}`` to the **end of the
+    Bedrock ``system`` block** — i.e. right after the system prompt
+    and **before** the per-turn ``messages``. That is the correct
+    breakpoint boundary: the cached prefix is exactly the system
+    prompt, which is seeded once from ``system_instruction`` and is
+    therefore byte-identical turn-to-turn **within a call**, so
+    turn 2+ reads the cached prefix (``cache_read`` > 0). It is not
+    stable **across** calls — Layer 5 hydration injects per-call
+    values (e.g. ``{{current_time}}``) — so the win is within-call
+    multi-turn, which is exactly what live calls need. The Bedrock
+    ``cachePoint`` only supports the 5-minute ``default`` TTL (the
+    1-hour TTL is a first-party-Anthropic-API feature, not available
+    on Bedrock Converse); 5 minutes covers every turn of a live call
+    since turns are seconds apart. Caveat: on Claude Haiku 4.5 (the
+    live model) the minimum cacheable prefix is ~4096 tokens, so a
+    short agent prompt silently won't cache even though the
+    breakpoint is correct — Cosentus's multi-KB prompts clear it.
+    Hit rate is observable via the ``voice.llm.tokens.cache_read`` /
+    ``voice.llm.tokens.cache_creation`` span attributes (#28).
 
     The system prompt is passed via ``Settings.system_instruction``
     rather than as a ``role="system"`` entry in the
@@ -345,6 +553,13 @@ def build_llm(
     Region comes from Layer 2 ``Settings.aws_region``. Credentials
     use boto3's default chain (Fargate task IAM role) — no explicit
     keys passed.
+
+    Live model failover (#52): when ``Settings.live_model_fallback_chain``
+    is non-empty this returns a :class:`_FailoverBedrockLLMService` that
+    fails the in-call turn over to the next Bedrock model on a retryable
+    error (throttle / capacity / timeout) raised before any tokens stream.
+    With the chain empty (default) the plain ``AWSBedrockLLMService`` is
+    returned and behavior is unchanged.
     """
     model_id = resolve_bedrock_model_id(agent.llm.model)
 
@@ -371,8 +586,20 @@ def build_llm(
     if agent.llm.temperature is not None:
         llm_settings_kwargs["temperature"] = agent.llm.temperature
 
-    return AWSBedrockLLMService(
-        model=model_id,
-        aws_region=settings.aws_region,
-        settings=AWSBedrockLLMService.Settings(**llm_settings_kwargs),
-    )
+    # Live mid-call model failover (#52). ``chain[0]`` is always the resolved
+    # primary (== model_id); any operator-configured fallbacks follow. With no
+    # fallback configured (the default) the chain is just the primary, so we
+    # build the plain service and the failover subclass is never involved —
+    # the flag-off path is byte-identical to before.
+    model_chain = resolve_live_model_chain(agent.llm.model, settings)
+    service_kwargs: dict[str, Any] = {
+        "model": model_id,
+        "aws_region": settings.aws_region,
+        "settings": AWSBedrockLLMService.Settings(**llm_settings_kwargs),
+    }
+    if len(model_chain) > 1:
+        return _FailoverBedrockLLMService(
+            fallback_model_ids=model_chain[1:],
+            **service_kwargs,
+        )
+    return AWSBedrockLLMService(**service_kwargs)

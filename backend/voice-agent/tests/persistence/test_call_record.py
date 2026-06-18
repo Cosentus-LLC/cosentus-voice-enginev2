@@ -56,6 +56,9 @@ def test_to_lambda_body_contains_every_voice_calls_column():
         "batch_id",
         "batch_row_index",
         "session_id",
+        "llm_tokens_in",
+        "llm_tokens_out",
+        "tts_chars",
         "updated_at",
     }
     assert set(body.keys()) == expected_keys
@@ -219,3 +222,22 @@ def test_batch_fields_passed_through():
     body = rec.to_lambda_body()
     assert body["batch_id"] == "22222222-2222-2222-2222-222222222222"
     assert body["batch_row_index"] == 5
+
+
+# ── Usage / cost capture (#28) ─────────────────────────────────────────────
+
+
+def test_usage_fields_default_zero():
+    """Metrics unavailable → 0 on the wire (matches API estimate-fallback)."""
+    body = _full_record().to_lambda_body()
+    assert body["llm_tokens_in"] == 0
+    assert body["llm_tokens_out"] == 0
+    assert body["tts_chars"] == 0
+
+
+def test_usage_fields_serialized():
+    rec = _full_record(llm_tokens_in=1500, llm_tokens_out=320, tts_chars=842)
+    body = rec.to_lambda_body()
+    assert body["llm_tokens_in"] == 1500
+    assert body["llm_tokens_out"] == 320
+    assert body["tts_chars"] == 842

@@ -46,7 +46,7 @@ import asyncio
 import json
 import os
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import structlog
@@ -61,18 +61,22 @@ logger = structlog.get_logger(__name__)
 # shorter Path-A revalidation runs (e.g., 2 h after Option I to verify
 # the autoscaling + force_gc fix holds before declaring Wave 6 done).
 SOAK_DURATION_SECS = int(os.environ.get("WAVE6_SOAK_DURATION_SECS", str(4 * 60 * 60)))
-SOAK_CALLS_PER_SEC = 0.2          # 12 cpm
+SOAK_CALLS_PER_SEC = 0.2  # 12 cpm
 HEARTBEAT_INTERVAL_SECS = 60
 ERROR_RATE_THRESHOLD_PCT = 1.0
 
 
 async def run(paths: config.RunPaths) -> scenario_base.ScenarioResult:
-    started_dt = datetime.now(timezone.utc)
+    started_dt = datetime.now(UTC)
     started_ts = scenario_base.now_iso()
     started_perf = time.perf_counter()
 
     pre_state = await ecs.describe_service()
-    logger.info("scenario_e_starting", pre=pre_state.as_dict(), duration_h=SOAK_DURATION_SECS / 3600)
+    logger.info(
+        "scenario_e_starting",
+        pre=pre_state.as_dict(),
+        duration_h=SOAK_DURATION_SECS / 3600,
+    )
 
     # Resume from previous heartbeat, if any.
     heartbeat_path = paths.soak_heartbeat()
@@ -95,14 +99,16 @@ async def run(paths: config.RunPaths) -> scenario_base.ScenarioResult:
                 heartbeat_path=heartbeat_path,
                 cycle_log=cycle_log,
                 log_fh=log_fh,
-                resumed_from_secs=(resumed_from or {}).get("elapsed_secs", 0.0) if resumed_from else 0.0,
+                resumed_from_secs=(
+                    (resumed_from or {}).get("elapsed_secs", 0.0) if resumed_from else 0.0
+                ),
             )
     finally:
         log_fh.close()
 
     await asyncio.sleep(120)
     post_state = await ecs.describe_service()
-    ended_dt = datetime.now(timezone.utc)
+    ended_dt = datetime.now(UTC)
     ended_ts = scenario_base.now_iso()
     duration_secs = round(time.perf_counter() - started_perf, 1)
 
@@ -265,6 +271,7 @@ async def _split_memory_trend(
     if duration_secs < 2 * 3600:
         return None, None
     from datetime import timedelta
+
     first_end = started_dt + timedelta(hours=1)
     last_start = ended_dt - timedelta(hours=1)
     first = await cloudwatch.query_ecs_memory_utilization(start=started_dt, end=first_end)
@@ -315,7 +322,12 @@ def _build_checks(
         )
 
     # 2. Memory growth between first and last hour: < 20% absolute pct points.
-    if mem_first_hour and mem_last_hour and mem_first_hour.datapoints > 0 and mem_last_hour.datapoints > 0:
+    if (
+        mem_first_hour
+        and mem_last_hour
+        and mem_first_hour.datapoints > 0
+        and mem_last_hour.datapoints > 0
+    ):
         delta_pct = mem_last_hour.average - mem_first_hour.average
         if delta_pct < 20.0:
             checks.append(
@@ -380,7 +392,10 @@ def _build_checks(
                 "no_task_replacement",
                 "ECS task count changed during soak.",
                 observed=f"{pre_state.running_count} -> {post_state.running_count}",
-                note="May be benign (CloudWatch alarm autoscale or planned redeploy). Inspect cycle_log for the transition.",
+                note=(
+                    "May be benign (CloudWatch alarm autoscale or planned redeploy). "
+                    "Inspect cycle_log for the transition."
+                ),
             )
         )
 
@@ -410,7 +425,7 @@ def _build_checks(
         checks.append(
             scenario_base.Check.passed(
                 "cycle_log_complete",
-                f"Heartbeat log captured >= 90% of expected cycles.",
+                "Heartbeat log captured >= 90% of expected cycles.",
                 observed=len(cycle_log),
                 expected=f"~{expected_cycles}",
             )

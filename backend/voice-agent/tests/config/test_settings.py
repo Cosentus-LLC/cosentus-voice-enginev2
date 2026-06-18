@@ -15,12 +15,18 @@ from pydantic import ValidationError
 _ALL_SETTINGS_ENV = (
     "VOICE_API_LAMBDA_NAME",
     "API_KEY_SECRET_ARN",
+    "ASSEMBLYAI_API_KEY",
+    "ELEVENLABS_API_KEY",
     "AWS_REGION",
     "ENVIRONMENT",
     "LOG_LEVEL",
     "SERVICE_PORT",
     "MAX_CONCURRENT_CALLS",
+    "DAILY_DIALIN_WEBHOOK_HMAC",
     "DISABLED_TOOLS",
+    "KNOWLEDGE_PREFETCH_ENABLED",
+    "KNOWLEDGE_CACHE_TTL_SECS",
+    "KNOWLEDGE_CACHE_MAX_ENTRIES",
 )
 
 
@@ -89,8 +95,12 @@ class TestSettingsDefaults:
             "LOG_LEVEL",
             "SERVICE_PORT",
             "MAX_CONCURRENT_CALLS",
+            "DAILY_DIALIN_WEBHOOK_HMAC",
             "DISABLED_TOOLS",
+            "POST_CALL_MODEL_FALLBACK_CHAIN",
             "DAILY_API_KEY",
+            "ASSEMBLYAI_API_KEY",
+            "ELEVENLABS_API_KEY",
             "RECORDING_BUCKET",
             "RECORDING_ROLE_ARN",
         ):
@@ -104,11 +114,58 @@ class TestSettingsDefaults:
         # Layer 9 starting point; Layer 9.5 scale test will validate.
         assert s.max_concurrent_calls == 6
         assert s.disabled_tools == ""
+        # #20 offline failover is opt-in; empty default = no fallback chain.
+        assert s.post_call_model_fallback_chain == ""
         # Layer 9 fields default to empty so local dev / unit tests
         # don't require Daily / S3 access just to construct Settings.
         assert s.daily_api_key == ""
+        assert s.daily_dialin_webhook_hmac == ""
         assert s.recording_bucket == ""
         assert s.recording_role_arn == ""
+        # Vendor API keys default to empty too — build_stt / build_tts
+        # raise a clear ValueError if they're still empty at call time.
+        assert s.assemblyai_api_key == ""
+        assert s.elevenlabs_api_key == ""
+        # #56 knowledge prefetch is opt-in and bounded per call.
+        assert s.knowledge_prefetch_enabled is False
+        assert s.knowledge_cache_ttl_secs == 300
+        assert s.knowledge_cache_max_entries == 64
+
+
+class TestSettingsFeatureFlags:
+    def test_context_summarization_defaults_off(self, monkeypatch: pytest.MonkeyPatch):
+        """#22 bounded-context summarization ships gated and off by default,
+        so the flow-off production path is byte-identical to pre-#22."""
+        _set_required(monkeypatch)
+        monkeypatch.delenv("CONTEXT_SUMMARIZATION_ENABLED", raising=False)
+        assert _settings().context_summarization_enabled is False
+
+    def test_context_summarization_enables_from_env(self, monkeypatch: pytest.MonkeyPatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("CONTEXT_SUMMARIZATION_ENABLED", "true")
+        assert _settings().context_summarization_enabled is True
+
+    def test_knowledge_prefetch_defaults_off(self, monkeypatch: pytest.MonkeyPatch):
+        _set_required(monkeypatch)
+        monkeypatch.delenv("KNOWLEDGE_PREFETCH_ENABLED", raising=False)
+        assert _settings().knowledge_prefetch_enabled is False
+
+    def test_knowledge_prefetch_enables_from_env(self, monkeypatch: pytest.MonkeyPatch):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("KNOWLEDGE_PREFETCH_ENABLED", "true")
+        assert _settings().knowledge_prefetch_enabled is True
+
+    def test_knowledge_cache_knobs_coerce_from_env_strings(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        _set_required(monkeypatch)
+        monkeypatch.setenv("KNOWLEDGE_CACHE_TTL_SECS", "120")
+        monkeypatch.setenv("KNOWLEDGE_CACHE_MAX_ENTRIES", "12")
+        settings = _settings()
+
+        assert settings.knowledge_cache_ttl_secs == 120
+        assert settings.knowledge_cache_max_entries == 12
 
 
 # ── Type coercion ───────────────────────────────────────────────────────────
@@ -143,8 +200,10 @@ class TestSettingsCaseInsensitive:
     def test_uppercase_env_vars_bind(self, monkeypatch: pytest.MonkeyPatch):
         # Standard env-var convention.
         _set_required(monkeypatch)
+        monkeypatch.setenv("DAILY_DIALIN_WEBHOOK_HMAC", "base64-secret")
         s = _settings()
         assert s.voice_api_lambda_name == "medcloud-voice-api:test"
+        assert s.daily_dialin_webhook_hmac == "base64-secret"
 
     def test_lowercase_env_vars_also_bind(self, monkeypatch: pytest.MonkeyPatch):
         # case_sensitive=False: lowercase resolves to the same field.
@@ -171,6 +230,28 @@ class TestSettingsExtraIgnore:
         # No exception; settings still loads.
         s = _settings()
         assert s.voice_api_lambda_name == "medcloud-voice-api:test"
+
+
+# ── Vendor API keys ─────────────────────────────────────────────────────────
+
+
+class TestSettingsVendorApiKeys:
+    def test_read_from_env(self, monkeypatch: pytest.MonkeyPatch):
+        # The Fargate task definition injects these from Secrets
+        # Manager as env vars; pydantic-settings reads them at boot.
+        _set_required(monkeypatch)
+        monkeypatch.setenv("ASSEMBLYAI_API_KEY", "aa-from-env")
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "el-from-env")
+
+        s = _settings()
+        assert s.assemblyai_api_key == "aa-from-env"
+        assert s.elevenlabs_api_key == "el-from-env"
+
+    def test_default_empty_when_unset(self, monkeypatch: pytest.MonkeyPatch):
+        _set_required(monkeypatch)
+        s = _settings()
+        assert s.assemblyai_api_key == ""
+        assert s.elevenlabs_api_key == ""
 
 
 # ── disabled_tools handling ─────────────────────────────────────────────────

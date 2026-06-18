@@ -25,21 +25,27 @@ from app.bot.bot import (
     _build_dialin_settings,
     _extract_session_id,
     _get_daily_api_key,
+    _resolve_payer_id,
     bot,
     run_bot,
 )
 from app.config.agent_config import AgentConfig, ToolConfig
 from app.config.settings import Settings
+from app.flows import PRE_VERIFICATION_ROLE_MESSAGE
+from app.flows.steps import NAVIGATE
+from app.hydration.hydrator import MissingRequiredCaseDataError
+from app.tools.result import ToolResult, ToolStatus
 from pipecat.frames.frames import LLMRunFrame, TTSSpeakFrame
 from pipecat.runner.types import DailyRunnerArguments, RunnerArguments
 
 # ── Fixtures ──────────────────────────────────────────────────────────────
 
 
-def _settings() -> Settings:
+def _settings(**overrides) -> Settings:
     return Settings(
         voice_api_lambda_name="test-voice-api",
         api_key_secret_arn="arn:aws:secretsmanager:us-east-1:0:secret:test",
+        **overrides,
     )
 
 
@@ -291,6 +297,120 @@ async def test_run_bot_raises_when_agent_id_missing():
         await run_bot(transport, ra, _settings())
 
 
+# ── D2 required-case_data guard (#27) ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_run_bot_blocks_outbound_when_required_case_data_missing():
+    """Outbound + a required key missing → raise before dialing, no dialout."""
+    transport = _make_transport_mock()
+    settings = _settings(required_case_data_keys="Patient_Name,Claim#")
+    # Patient_Name supplied, Claim# missing → blocked.
+    ra = _runner_args(direction="outbound", case_data={"Patient_Name": "Jane"})
+    with pytest.raises(MissingRequiredCaseDataError, match="Claim#"):
+        await run_bot(transport, ra, settings)
+    # The guard fires before the transport ever joins / dials.
+    transport.start_dialout.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_bot_blocks_outbound_when_required_value_blank():
+    """A whitespace-only required value is treated as missing."""
+    transport = _make_transport_mock()
+    settings = _settings(required_case_data_keys="Patient_Name")
+    ra = _runner_args(direction="outbound", case_data={"Patient_Name": "   "})
+    with pytest.raises(MissingRequiredCaseDataError, match="Patient_Name"):
+        await run_bot(transport, ra, settings)
+
+
+@pytest.mark.asyncio
+async def test_run_bot_logs_distinct_event_when_blocking(caplog):
+    """The block must be observable: a distinct structured log carrying
+    agent_id + the missing key NAMES (never values — PHI)."""
+    transport = _make_transport_mock()
+    settings = _settings(required_case_data_keys="Patient_Name,Claim#")
+    ra = _runner_args(direction="outbound", case_data={})
+    with patch("app.bot.bot.logger") as mock_logger:
+        with pytest.raises(MissingRequiredCaseDataError):
+            await run_bot(transport, ra, settings)
+        error_calls = [c for c in mock_logger.error.call_args_list if c.args]
+        blocked = next(
+            c for c in error_calls if c.args[0] == "outbound_call_blocked_missing_required"
+        )
+        assert blocked.kwargs["missing_fields"] == ["Claim#", "Patient_Name"]
+        assert blocked.kwargs["agent_id"] == "test-agent-id"
+
+
+@pytest.mark.asyncio
+async def test_run_bot_allows_outbound_when_required_case_data_present():
+    """Outbound + all required keys present + non-blank → runs normally."""
+    agent, mocks = _patch_run_bot_dependencies()
+    transport = _make_transport_mock()
+    patches = _start_run_bot_patches(agent, mocks, transport)
+    for p in patches:
+        p.start()
+    try:
+        await run_bot(
+            transport,
+            _runner_args(
+                direction="outbound",
+                case_data={"Patient_Name": "Jane Doe", "Claim#": "ABC123"},
+            ),
+            _settings(required_case_data_keys="Patient_Name,Claim#"),
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert mocks.get("finalize_kwargs") is not None
+    assert mocks["finalize_kwargs"]["end_status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_run_bot_does_not_block_inbound_when_required_keys_configured():
+    """Inbound carries no dispatcher case_data and is never guarded —
+    even with required keys configured and empty case_data."""
+    agent, mocks = _patch_run_bot_dependencies()
+    transport = _make_transport_mock()
+    patches = _start_run_bot_patches(agent, mocks, transport)
+    for p in patches:
+        p.start()
+    try:
+        await run_bot(
+            transport,
+            _runner_args(direction="inbound", case_data={}),
+            _settings(required_case_data_keys="Patient_Name,Claim#"),
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert mocks.get("finalize_kwargs") is not None
+    assert mocks["finalize_kwargs"]["end_status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_run_bot_does_not_block_outbound_when_no_required_keys():
+    """No required keys configured (the default) → no guard, outbound runs."""
+    agent, mocks = _patch_run_bot_dependencies()
+    transport = _make_transport_mock()
+    patches = _start_run_bot_patches(agent, mocks, transport)
+    for p in patches:
+        p.start()
+    try:
+        await run_bot(
+            transport,
+            _runner_args(direction="outbound", case_data={}),
+            _settings(),  # required_case_data_keys defaults to ""
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert mocks.get("finalize_kwargs") is not None
+    assert mocks["finalize_kwargs"]["end_status"] == "completed"
+
+
 # ── run_bot full happy paths ─────────────────────────────────────────────
 
 
@@ -410,12 +530,11 @@ async def test_run_bot_constructs_pipeline_runner_with_force_gc_true():
 
 
 @pytest.mark.asyncio
-async def test_run_bot_attaches_error_observer_to_pipeline_task():
-    """After the May 2026 transcript-observer rewrite, only the
-    ErrorObserver remains on PipelineTask.observers. Transcript
-    capture is wired via aggregator event handlers
-    (``on_user_turn_stopped`` / ``on_assistant_turn_stopped``) and
-    isn't an observer in the BaseObserver sense.
+async def test_run_bot_attaches_error_and_metrics_observers_to_pipeline_task():
+    """PipelineTask.observers carries the ErrorObserver and (#13) the
+    MetricsObserver. Transcript capture is wired via aggregator event
+    handlers (``on_user_turn_stopped`` / ``on_assistant_turn_stopped``)
+    and isn't an observer in the BaseObserver sense.
     """
     agent, mocks = _patch_run_bot_dependencies()
     transport = _make_transport_mock()
@@ -429,10 +548,10 @@ async def test_run_bot_attaches_error_observer_to_pipeline_task():
             p.stop()
 
     observers = mocks["pipeline_task_kwargs"]["observers"]
-    # Only the ErrorObserver is left in the observers list.
-    assert len(observers) == 1
+    assert len(observers) == 2
     class_names = {type(o).__name__ for o in observers}
     assert "ErrorObserver" in class_names
+    assert "MetricsObserver" in class_names
     assert "TranscriptObserver" not in class_names
 
 
@@ -540,6 +659,386 @@ async def test_run_bot_registers_each_tool_with_llm():
     assert len(register_calls) == 2
     registered_names = {c.kwargs["function_name"] for c in register_calls}
     assert registered_names == {"end_call", "press_digit"}
+
+
+# ── Flows wiring (#41 scaffold → #42 identity gate) ──────────────────────
+
+
+def _flow_manager_mock() -> MagicMock:
+    fm = MagicMock()
+    fm.initialize = AsyncMock()
+    return fm
+
+
+@pytest.mark.asyncio
+async def test_run_bot_constructs_flow_manager_always_with_real_collaborators():
+    """Construct-always: build_flow_manager fires every call (even flag
+    off), wired to the real task / llm / aggregator / transport, and the
+    node is NOT initialized when the flag is off."""
+    agent, mocks = _patch_run_bot_dependencies()
+    transport = _make_transport_mock()
+    fm = _flow_manager_mock()
+    build_spy = MagicMock(return_value=fm)
+    patches = _start_run_bot_patches(agent, mocks, transport) + [
+        patch("app.bot.bot.build_flow_manager", build_spy),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        await run_bot(transport, _runner_args(), _settings())  # flows_enabled defaults False
+    finally:
+        for p in patches:
+            p.stop()
+
+    build_spy.assert_called_once()
+    kwargs = build_spy.call_args.kwargs
+    assert set(kwargs) == {"task", "llm", "context_aggregator", "transport"}
+    assert kwargs["task"] is mocks["pipeline_task"]
+    assert kwargs["llm"] is mocks["llm"]
+    assert kwargs["transport"] is transport
+    # Flag off → the node path never runs.
+    fm.initialize.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_bot_flag_off_queues_no_flow_frames():
+    """The safety guarantee behind "opener intact": with the flag off,
+    assembling run_bot queues NO frames — byte-identical to the
+    pre-Flows pipeline. Exercises the REAL build_flow_manager, so this
+    also proves construction is side-effect-free.
+
+    User-first mode is used because it seeds no opener of its own, so
+    any queued frame here could only have come from the Flows layer."""
+    agent, mocks = _patch_run_bot_dependencies(
+        agent=_agent(speak_first=False, first_message=""),
+    )
+    transport = _make_transport_mock()
+    patches = _start_run_bot_patches(agent, mocks, transport)  # real build_flow_manager
+    for p in patches:
+        p.start()
+    try:
+        await run_bot(transport, _runner_args(), _settings())
+    finally:
+        for p in patches:
+            p.stop()
+
+    pt = mocks["pipeline_task"]
+    pt.queue_frames.assert_not_called()
+    pt.queue_frame.assert_not_called()
+    # Opener-seeded context is untouched (user-first → empty).
+    assert mocks["initial_messages"] == []
+
+
+@pytest.mark.asyncio
+async def test_run_bot_flag_on_initializes_identity_gate_node():
+    """Flag on → the flow initializes at the identity-gate node (16b),
+    which advertises ONLY ``verify_identity`` and never auto-responds."""
+    agent, mocks = _patch_run_bot_dependencies()
+    transport = _make_transport_mock()
+    fm = _flow_manager_mock()
+    patches = _start_run_bot_patches(agent, mocks, transport) + [
+        patch("app.bot.bot.build_flow_manager", MagicMock(return_value=fm)),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        await run_bot(
+            transport,
+            _runner_args(),
+            _settings(flows_enabled=True, identity_verification_keys="patient_name"),
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    fm.initialize.assert_awaited_once()
+    node = fm.initialize.await_args.args[0]
+    assert node["name"] == "identity_gate"
+    assert [f.name for f in node["functions"]] == ["verify_identity"]
+    assert node["respond_immediately"] is False
+
+
+@pytest.mark.asyncio
+async def test_run_bot_knowledge_flag_off_constructs_no_knowledge_warmer():
+    agent, mocks = _patch_run_bot_dependencies()
+    transport = _make_transport_mock()
+    warmer_cls = MagicMock()
+    wire_hook = MagicMock()
+    patches = _start_run_bot_patches(agent, mocks, transport) + [
+        patch("app.bot.bot.PrefetchWarmer", warmer_cls),
+        patch("app.bot.bot.wire_knowledge_prefetch_handler", wire_hook),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        await run_bot(transport, _runner_args(), _settings())
+    finally:
+        for p in patches:
+            p.stop()
+
+    warmer_cls.assert_not_called()
+    wire_hook.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_bot_knowledge_flag_on_constructs_per_call_cache_and_wires_turn_hook():
+    agent, mocks = _patch_run_bot_dependencies()
+    transport = _make_transport_mock()
+    warmer = MagicMock()
+    warmer.aclose = AsyncMock()
+    warmer_cls = MagicMock(return_value=warmer)
+    wire_hook = MagicMock()
+    cache_cls = MagicMock(return_value=MagicMock())
+    patches = _start_run_bot_patches(agent, mocks, transport) + [
+        patch("app.bot.bot.PrefetchWarmer", warmer_cls),
+        patch("app.bot.bot.SemanticCache", cache_cls),
+        patch("app.bot.bot.wire_knowledge_prefetch_handler", wire_hook),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        await run_bot(
+            transport,
+            _runner_args(case_data={"payer_name": "Aetna"}),
+            _settings(
+                knowledge_prefetch_enabled=True,
+                knowledge_cache_ttl_secs=123,
+                knowledge_cache_max_entries=9,
+            ),
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    cache_cls.assert_called_once_with(ttl_secs=123, max_entries=9)
+    warmer_cls.assert_called_once()
+    wire_hook.assert_called_once()
+    assert wire_hook.call_args.kwargs["warmer"] is warmer
+    warmer.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_bot_passes_knowledge_warmer_to_step_chain_only_when_flag_enabled():
+    agent, mocks = _patch_run_bot_dependencies()
+    transport = _make_transport_mock()
+    fm = _flow_manager_mock()
+    warmer = MagicMock()
+    warmer.aclose = AsyncMock()
+    step_chain = MagicMock(
+        return_value={"name": NAVIGATE, "task_messages": [], "functions": []},
+    )
+    patches = _start_run_bot_patches(agent, mocks, transport) + [
+        patch("app.bot.bot.build_flow_manager", MagicMock(return_value=fm)),
+        patch("app.bot.bot.PrefetchWarmer", MagicMock(return_value=warmer)),
+        patch("app.bot.bot.wire_knowledge_prefetch_handler", MagicMock()),
+        patch("app.bot.bot.build_step_chain", step_chain),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        await run_bot(
+            transport,
+            _runner_args(case_data={"payer_name": "Aetna"}),
+            _settings(
+                flows_enabled=True,
+                identity_verification_keys="patient_name",
+                knowledge_prefetch_enabled=True,
+            ),
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    step_chain.assert_called_once()
+    assert step_chain.call_args.kwargs["knowledge_warmer"] is warmer
+    assert step_chain.call_args.kwargs["knowledge_context"].payer == "Aetna"
+
+
+@pytest.mark.asyncio
+async def test_flag_on_gate_is_phi_free_and_verified_node_is_step_chain(monkeypatch):
+    """16c: flag on → the gate node carries the PHI-free role_message, and
+    the verified node is the ordered step chain whose first step restores
+    the hydrated (PHI-bearing) prompt — so PHI loads only post-verification.
+    """
+    agent, mocks = _patch_run_bot_dependencies(
+        agent=_agent(),  # system_prompt="You are a test agent.", no placeholders
+    )
+    transport = _make_transport_mock()
+    fm = _flow_manager_mock()
+
+    # Spy build_identity_gate_flow to capture the verified_node kwarg
+    # (the step-chain head), which the gate node otherwise hides in a closure.
+    capture: dict = {}
+    real_build = __import__(
+        "app.bot.bot", fromlist=["build_identity_gate_flow"]
+    ).build_identity_gate_flow
+
+    def _spy(**kwargs):
+        capture.update(kwargs)
+        return real_build(**kwargs)
+
+    patches = _start_run_bot_patches(agent, mocks, transport) + [
+        patch("app.bot.bot.build_flow_manager", MagicMock(return_value=fm)),
+        patch("app.bot.bot.build_identity_gate_flow", _spy),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        await run_bot(
+            transport,
+            _runner_args(),
+            _settings(flows_enabled=True, identity_verification_keys="patient_name"),
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    # Gate node (what initialize received) is PHI-free.
+    gate_node = fm.initialize.await_args.args[0]
+    assert gate_node["role_message"] == PRE_VERIFICATION_ROLE_MESSAGE
+
+    # Verified node = the step-chain head; it restores the hydrated prompt.
+    verified = capture["verified_node"]
+    assert verified["name"] == NAVIGATE
+    assert verified["role_message"] == "You are a test agent."  # hydrated system prompt
+    # And the two are distinct — PHI is not present pre-verification.
+    assert verified["role_message"] != gate_node["role_message"]
+
+
+# ── Identity gate — code-enforced tool gate (16b, #42) ───────────────────
+
+
+class _FakeParams:
+    """Minimal stand-in for Pipecat's FunctionCallParams."""
+
+    def __init__(self, arguments: dict | None = None):
+        self.arguments = arguments or {}
+        self.result_callback = AsyncMock()
+
+
+def _executor_mock(result: ToolResult) -> MagicMock:
+    """A ToolExecutor whose ``execute`` is an awaitable returning ``result``."""
+    ex = MagicMock()
+    ex.execute = AsyncMock(return_value=result)
+    return ex
+
+
+async def _run_bot_capturing_tool_handlers(
+    *,
+    tools: list[ToolConfig],
+    settings: Settings,
+    executor: MagicMock,
+    capture: dict | None = None,
+):
+    """Run run_bot with the given tools + executor; return {name: handler}.
+
+    ``capture`` (optional) is populated with the kwargs passed to
+    ``build_identity_gate_flow`` so a test can reach the shared
+    ``verification_state`` dict.
+    """
+    agent, mocks = _patch_run_bot_dependencies(
+        agent=_agent(tools=tools),
+    )
+    mocks["registry"].names = MagicMock(return_value=[t.type for t in tools])
+    transport = _make_transport_mock()
+
+    # Mock the FlowManager so only bot.py's make_tool_handler loop
+    # registers tools (by kwargs). build_identity_gate_flow still runs —
+    # so ``capture`` works — but its real node never gets initialized
+    # (which would register verify_identity positionally and pollute the
+    # handler map). The gate flag still reads from ``flows_enabled``.
+    extra = [
+        patch("app.bot.bot.ToolExecutor", MagicMock(return_value=executor)),
+        patch("app.bot.bot.build_flow_manager", MagicMock(return_value=_flow_manager_mock())),
+    ]
+    if capture is not None:
+        real_build = __import__(
+            "app.bot.bot", fromlist=["build_identity_gate_flow"]
+        ).build_identity_gate_flow
+
+        def _spy(**kwargs):
+            capture.update(kwargs)
+            return real_build(**kwargs)
+
+        extra.append(patch("app.bot.bot.build_identity_gate_flow", _spy))
+
+    patches = _start_run_bot_patches(agent, mocks, transport) + extra
+    for p in patches:
+        p.start()
+    try:
+        await run_bot(transport, _runner_args(), settings)
+    finally:
+        for p in patches:
+            p.stop()
+
+    return {
+        c.kwargs["function_name"]: c.kwargs["handler"]
+        for c in mocks["llm"].register_function.call_args_list
+        if "function_name" in c.kwargs
+    }
+
+
+@pytest.mark.asyncio
+async def test_gated_tool_blocked_when_flows_enabled_and_unverified():
+    """Flag on + unverified → a gated tool (transfer_call) is refused in
+    code: the executor is never run and the LLM is told to verify first."""
+    executor = _executor_mock(ToolResult(status=ToolStatus.SUCCESS, run_llm=False))
+    handlers = await _run_bot_capturing_tool_handlers(
+        tools=[ToolConfig(type="transfer_call", description="")],
+        settings=_settings(flows_enabled=True, identity_verification_keys="patient_name"),
+        executor=executor,
+    )
+    params = _FakeParams({"target": "billing"})
+    await handlers["transfer_call"](params)
+
+    executor.execute.assert_not_awaited()
+    payload = params.result_callback.await_args.args[0]
+    assert "not verified" in payload["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_end_call_exempt_from_gate_when_unverified():
+    """end_call is exempt — the bot must always be able to terminate."""
+    executor = _executor_mock(ToolResult(status=ToolStatus.SUCCESS, run_llm=False))
+    handlers = await _run_bot_capturing_tool_handlers(
+        tools=[ToolConfig(type="end_call", description="")],
+        settings=_settings(flows_enabled=True, identity_verification_keys="patient_name"),
+        executor=executor,
+    )
+    await handlers["end_call"](_FakeParams({"reason": "done"}))
+    executor.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_gated_tool_allowed_when_flows_disabled():
+    """Flag off → gate inert (verified starts True) → tool executes,
+    byte-identical to the pre-gate pipeline."""
+    executor = _executor_mock(ToolResult(status=ToolStatus.SUCCESS, run_llm=False))
+    handlers = await _run_bot_capturing_tool_handlers(
+        tools=[ToolConfig(type="transfer_call", description="")],
+        settings=_settings(),  # flows_enabled defaults False
+        executor=executor,
+    )
+    await handlers["transfer_call"](_FakeParams({"target": "billing"}))
+    executor.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_verified_caller_can_use_gated_tool():
+    """Once the shared verification_state flips to verified, the same
+    gated tool handler executes — proving the gate + flow share one dict."""
+    executor = _executor_mock(ToolResult(status=ToolStatus.SUCCESS, run_llm=False))
+    capture: dict = {}
+    handlers = await _run_bot_capturing_tool_handlers(
+        tools=[ToolConfig(type="transfer_call", description="")],
+        settings=_settings(flows_enabled=True, identity_verification_keys="patient_name"),
+        executor=executor,
+        capture=capture,
+    )
+    # The flow received the same verification_state the gate reads.
+    capture["verification_state"]["verified"] = True
+    await handlers["transfer_call"](_FakeParams({"target": "billing"}))
+    executor.execute.assert_awaited_once()
 
 
 # ── Event-handler behavior ────────────────────────────────────────────────
@@ -808,6 +1307,30 @@ async def test_bot_builds_daily_transport_and_calls_run_bot(monkeypatch):
     run_bot_mock.assert_called_once()
     # First positional arg to run_bot is the transport mock.
     assert run_bot_mock.call_args.args[0] is transport_mock
+
+
+@pytest.mark.asyncio
+async def test_bot_threads_passed_settings_without_reconstructing(monkeypatch):
+    """When Layer 9 passes the boot Settings singleton, bot() threads
+    that exact object to run_bot — it does NOT build a new Settings
+    per call (F3)."""
+    monkeypatch.setenv("DAILY_API_KEY", "test-key")
+
+    boot_settings = _settings()
+    transport_mock = MagicMock()
+    create_transport_mock = AsyncMock(return_value=transport_mock)
+    run_bot_mock = AsyncMock()
+
+    with (
+        patch("app.bot.bot.create_transport", create_transport_mock),
+        patch("app.bot.bot.run_bot", run_bot_mock),
+        patch("app.bot.bot.Settings", side_effect=AssertionError("Settings reconstructed")),
+    ):
+        await bot(_runner_args(), boot_settings)
+
+    # Third positional arg to run_bot is the settings object — the
+    # same instance we passed in, not a freshly constructed one.
+    assert run_bot_mock.call_args.args[2] is boot_settings
 
 
 @pytest.mark.asyncio
@@ -1193,3 +1716,201 @@ async def test_safe_cancel_calls_pipeline_task_cancel_exactly_once():
 
     pt = mocks["pipeline_task"]
     assert pt.cancel.await_count == 1
+
+
+# ── Bounded-context summarization (#22) ───────────────────────────────────
+
+
+class TestBuildAssistantParams:
+    """Unit tests for ``_build_assistant_params`` — the #22 sliding-window +
+    running-summary config builder."""
+
+    def test_none_when_flag_disabled(self):
+        """Flag off (the default) → None, so the aggregator pair falls back
+        to its stock assistant params: behavior byte-identical to pre-#22."""
+        from app.bot.bot import _build_assistant_params
+
+        assert _build_assistant_params(_settings()) is None
+        assert _settings().context_summarization_enabled is False
+
+    def test_enabled_config_thresholds_window_and_prompt(self):
+        """Flag on → auto-summarization enabled with the module's tuned
+        thresholds, the sliding-window size, and the PHI-aware prompt."""
+        from app.bot.bot import (
+            _CONTEXT_MAX_TOKENS,
+            _CONTEXT_MAX_UNSUMMARIZED_MESSAGES,
+            _CONTEXT_MIN_MESSAGES_AFTER_SUMMARY,
+            _CONTEXT_SUMMARY_TARGET_TOKENS,
+            _CONTEXT_SUMMARY_TEMPLATE,
+            _build_assistant_params,
+        )
+
+        params = _build_assistant_params(_settings(context_summarization_enabled=True))
+        assert params is not None
+        assert params.enable_auto_context_summarization is True
+
+        cfg = params.auto_context_summarization_config
+        assert cfg.max_context_tokens == _CONTEXT_MAX_TOKENS
+        assert cfg.max_unsummarized_messages == _CONTEXT_MAX_UNSUMMARIZED_MESSAGES
+
+        sc = cfg.summary_config
+        assert sc.min_messages_after_summary == _CONTEXT_MIN_MESSAGES_AFTER_SUMMARY
+        assert sc.target_context_tokens == _CONTEXT_SUMMARY_TARGET_TOKENS
+        assert sc.summary_message_template == _CONTEXT_SUMMARY_TEMPLATE
+        # Domain-specific prompt is wired (not the generic Pipecat default).
+        assert sc.summarization_prompt is not None
+        assert "medical-billing" in sc.summarization_prompt
+        # Summarizer LLM left unset — routing to a cheaper model is #20's job.
+        assert sc.llm is None
+
+
+async def _run_bot_capturing(settings, *, agent=None):
+    """Run ``run_bot`` under the standard mocks, overriding Pipeline and
+    LLMContextAggregatorPair with capturing mocks. Returns the captured
+    ``LLMContextAggregatorPair`` mock, the Pipeline positional args, the
+    tts sentinel, the llm mock, and the PipelineTask kwargs."""
+    agent, mocks = _patch_run_bot_dependencies(agent=agent)
+    transport = _make_transport_mock()
+
+    agg_pair_mock = MagicMock(
+        return_value=MagicMock(user=lambda: MagicMock(), assistant=lambda: MagicMock())
+    )
+    pipeline_capture: dict = {}
+
+    def _record_pipeline(processors, *a, **kw):
+        pipeline_capture["processors"] = processors
+        return MagicMock()
+
+    tts_sentinel = MagicMock(name="tts")
+
+    patches = _start_run_bot_patches(agent, mocks, transport)
+    overrides = [
+        patch("app.bot.bot.build_tts", MagicMock(return_value=tts_sentinel)),
+        patch("app.bot.bot.Pipeline", MagicMock(side_effect=_record_pipeline)),
+        patch("app.bot.bot.LLMContextAggregatorPair", agg_pair_mock),
+    ]
+    for p in patches + overrides:
+        p.start()
+    try:
+        await run_bot(transport, _runner_args(), settings)
+    finally:
+        for p in patches + overrides:
+            p.stop()
+
+    return {
+        "agg_pair": agg_pair_mock,
+        "pipeline_processors": pipeline_capture.get("processors"),
+        "tts": tts_sentinel,
+        "llm": mocks["llm"],
+        "pipeline_task_kwargs": mocks["pipeline_task_kwargs"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_aggregator_pair_gets_no_assistant_params_when_disabled():
+    """Flag off → run_bot passes assistant_params=None into the pair, and the
+    locked-in user_params (turn machinery) are still passed."""
+    cap = await _run_bot_capturing(_settings())
+    kwargs = cap["agg_pair"].call_args.kwargs
+    assert kwargs["assistant_params"] is None
+    assert kwargs["user_params"] is not None
+
+
+@pytest.mark.asyncio
+async def test_aggregator_pair_gets_summarization_params_when_enabled():
+    """Flag on → run_bot passes a configured LLMAssistantAggregatorParams
+    enabling auto context summarization."""
+    cap = await _run_bot_capturing(_settings(context_summarization_enabled=True))
+    assistant_params = cap["agg_pair"].call_args.kwargs["assistant_params"]
+    assert assistant_params is not None
+    assert assistant_params.enable_auto_context_summarization is True
+
+
+@pytest.mark.asyncio
+async def test_streaming_pipeline_keeps_llm_feeding_tts_directly():
+    """The 'confirm streaming' deliverable: verify (not change) that the LLM
+    feeds the TTS directly — streamed LLM tokens flow straight into synthesis
+    (sentence aggregation lives in the TTS service), so first audio starts
+    before the full turn is generated. This ordering must hold with the #22
+    bounded-context change in place."""
+    cap = await _run_bot_capturing(_settings(context_summarization_enabled=True))
+    processors = cap["pipeline_processors"]
+    assert processors is not None
+    # LLM is immediately upstream of TTS → token/sentence streaming to speech.
+    llm_index = processors.index(cap["llm"])
+    assert processors[llm_index + 1] is cap["tts"]
+
+
+@pytest.mark.asyncio
+async def test_long_conversation_bounded_to_window_plus_summary():
+    """Acceptance criterion: on a long call, per-turn input is bounded — the
+    real Pipecat summarizer (driven by our config) compresses to a running
+    summary + the last-N turns verbatim, with recent turns preserved.
+
+    Drives Pipecat 1.1.0's LLMContextSummarizer directly with the config that
+    ``_build_assistant_params`` produces (the same object run_bot wires in)."""
+    from app.bot.bot import _build_assistant_params
+    from pipecat.processors.aggregators.llm_context import LLMContext
+    from pipecat.processors.aggregators.llm_context_summarizer import LLMContextSummarizer
+
+    cfg = _build_assistant_params(
+        _settings(context_summarization_enabled=True)
+    ).auto_context_summarization_config
+    keep = cfg.summary_config.min_messages_after_summary
+
+    # A long synthetic call: 60 exchanges = 120 messages, well past the
+    # message + token thresholds.
+    messages: list[dict] = []
+    for i in range(60):
+        messages.append({"role": "user", "content": f"caller turn {i}: " + "detail " * 20})
+        messages.append({"role": "assistant", "content": f"agent turn {i}: " + "reply " * 20})
+    context = LLMContext(messages=list(messages))
+
+    summarizer = LLMContextSummarizer(context=context, config=cfg, auto_trigger=True)
+
+    # The unbounded long context trips the trigger...
+    assert summarizer._should_summarize() is True
+
+    # ...and applying the summary bounds it to [summary] + last-N verbatim.
+    last_summarized_index = len(context.messages) - 1 - keep
+    await summarizer._apply_summary("running summary of the call", last_summarized_index)
+
+    out = context.messages
+    assert len(out) == keep + 1  # one summary message + the window
+    assert out[0]["role"] == "user"
+    assert "running summary of the call" in out[0]["content"]
+    # Recent turns kept verbatim, including the very last one.
+    assert out[-keep:] == messages[-keep:]
+
+    # And once bounded, the trigger no longer fires (per-turn input stays flat).
+    assert summarizer._should_summarize() is False
+
+
+# ── Payer-id resolution for the verified IVR path (#17) ───────────────────
+
+
+class TestResolvePayerId:
+    def test_reads_configured_key_from_case_data(self):
+        settings = _settings(payer_id_case_data_key="payer_name")
+        assert (
+            _resolve_payer_id({"payer_name": "United Healthcare"}, settings) == "United Healthcare"
+        )
+
+    def test_default_key_is_payer_name(self):
+        assert _resolve_payer_id({"payer_name": "Aetna"}, _settings()) == "Aetna"
+
+    def test_value_is_stripped(self):
+        assert _resolve_payer_id({"payer_name": "  Cigna  "}, _settings()) == "Cigna"
+
+    def test_none_when_key_absent(self):
+        assert _resolve_payer_id({"Patient_Name": "Jane"}, _settings()) is None
+
+    def test_none_when_value_blank(self):
+        assert _resolve_payer_id({"payer_name": "   "}, _settings()) is None
+
+    def test_none_for_inbound_empty_case_data(self):
+        assert _resolve_payer_id({}, _settings()) is None
+
+    def test_none_when_configured_key_blank(self):
+        settings = _settings(payer_id_case_data_key="")
+        assert _resolve_payer_id({"payer_name": "Aetna"}, settings) is None

@@ -10,6 +10,7 @@ from app.bot.lifecycle import finalize_call
 from app.config.agent_config import AgentConfig, PostCallConfig, PostCallField
 from app.config.settings import Settings
 from app.observers.error_state import ErrorState
+from app.observers.usage_accumulator import UsageAccumulator
 from app.persistence.transcript import TranscriptAccumulator
 
 # ── Fixtures ──────────────────────────────────────────────────────────────
@@ -180,7 +181,9 @@ async def test_pca_runs_for_completed_call_with_configured_analyses():
         write_calls.append(record.post_call_analyses)
         return True
 
-    async def fake_pca(agent, case_data, transcript, settings):
+    async def fake_pca(
+        agent, case_data, transcript, settings, otel_parent_context=None, usage_accumulator=None
+    ):
         return {"summary": "extracted text"}
 
     with (
@@ -249,6 +252,85 @@ async def test_pca_returns_empty_dict_no_second_write():
         await finalize_call(**_kwargs(agent=_agent_with_pca()))
 
     assert write_count["n"] == 1
+
+
+# ── Usage / cost capture (#28) ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_usage_totals_copied_to_record():
+    """Live-pipeline usage in the accumulator lands on the written record."""
+    usage = UsageAccumulator()
+    usage.add_llm_usage(1200, 300)
+    usage.add_tts_chars(640)
+    captured = {}
+
+    async def fake_write(record, settings):
+        captured["record"] = record
+        return True
+
+    with (
+        patch("app.bot.lifecycle.write_call_record", side_effect=fake_write),
+        patch("app.bot.lifecycle.trigger_auto_actions", return_value=None),
+    ):
+        await finalize_call(**_kwargs(usage_accumulator=usage))
+
+    rec = captured["record"]
+    assert rec.llm_tokens_in == 1200
+    assert rec.llm_tokens_out == 300
+    assert rec.tts_chars == 640
+
+
+@pytest.mark.asyncio
+async def test_usage_fields_default_zero_without_accumulator():
+    """No accumulator passed (tracing/metrics off) → fields stay 0."""
+    captured = {}
+
+    async def fake_write(record, settings):
+        captured["record"] = record
+        return True
+
+    with (
+        patch("app.bot.lifecycle.write_call_record", side_effect=fake_write),
+        patch("app.bot.lifecycle.trigger_auto_actions", return_value=None),
+    ):
+        await finalize_call(**_kwargs())
+
+    rec = captured["record"]
+    assert rec.llm_tokens_in == 0
+    assert rec.llm_tokens_out == 0
+    assert rec.tts_chars == 0
+
+
+@pytest.mark.asyncio
+async def test_second_write_picks_up_post_call_usage():
+    """The extraction call's tokens (added during PCA) appear on the 2nd write."""
+    usage = UsageAccumulator()
+    usage.add_llm_usage(1000, 200)  # live-pipeline usage before finalize
+    writes = []
+
+    async def fake_write(record, settings):
+        writes.append((record.llm_tokens_in, record.llm_tokens_out))
+        return True
+
+    async def fake_pca(
+        agent, case_data, transcript, settings, *, otel_parent_context=None, usage_accumulator=None
+    ):
+        # Mirror run_post_call_analyses folding its Converse usage in.
+        if usage_accumulator is not None:
+            usage_accumulator.add_llm_usage(500, 80)
+        return {"summary": "x"}
+
+    with (
+        patch("app.bot.lifecycle.write_call_record", side_effect=fake_write),
+        patch("app.bot.lifecycle.run_post_call_analyses", side_effect=fake_pca),
+        patch("app.bot.lifecycle.trigger_auto_actions", return_value=None),
+    ):
+        await finalize_call(**_kwargs(agent=_agent_with_pca(), usage_accumulator=usage))
+
+    # First write: live usage only. Second write: live + extraction.
+    assert writes[0] == (1000, 200)
+    assert writes[1] == (1500, 280)
 
 
 # ── auto-actions gating ───────────────────────────────────────────────────

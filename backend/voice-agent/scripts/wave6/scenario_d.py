@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import structlog
 
@@ -52,7 +52,7 @@ WAIT_FOR_TASKS_TIMEOUT_SECS = 600.0
 
 
 async def run(paths: config.RunPaths) -> scenario_base.ScenarioResult:
-    started_dt = datetime.now(timezone.utc)
+    started_dt = datetime.now(UTC)
     started_ts = scenario_base.now_iso()
     started_perf = time.perf_counter()
 
@@ -95,7 +95,7 @@ async def run(paths: config.RunPaths) -> scenario_base.ScenarioResult:
 
     await asyncio.sleep(120)
     post_state = await ecs.describe_service()
-    ended_dt = datetime.now(timezone.utc)
+    ended_dt = datetime.now(UTC)
     ended_ts = scenario_base.now_iso()
     duration_secs = round(time.perf_counter() - started_perf, 1)
 
@@ -152,8 +152,12 @@ async def run(paths: config.RunPaths) -> scenario_base.ScenarioResult:
         },
         ecs={
             "pre": pre_state.as_dict(),
-            "fleet_state_at_saturate": fleet_state_at_saturate.as_dict() if fleet_state_at_saturate else None,
-            "fleet_state_after_burst": fleet_state_after_burst.as_dict() if fleet_state_after_burst else None,
+            "fleet_state_at_saturate": fleet_state_at_saturate.as_dict()
+            if fleet_state_at_saturate
+            else None,
+            "fleet_state_after_burst": fleet_state_after_burst.as_dict()
+            if fleet_state_after_burst
+            else None,
             "post": post_state.as_dict(),
             "previous_desired": previous_desired,
             "pinned_desired": target_tasks,
@@ -226,7 +230,10 @@ def _build_checks(
     expected_max_concurrent = target_tasks * config.PER_TASK_CONCURRENCY
 
     # 1. Fleet actually reached target_tasks.
-    if fleet_state_at_saturate is not None and fleet_state_at_saturate.running_count == target_tasks:
+    if (
+        fleet_state_at_saturate is not None
+        and fleet_state_at_saturate.running_count == target_tasks
+    ):
         checks.append(
             scenario_base.Check.passed(
                 "fleet_reached_max",
@@ -262,7 +269,10 @@ def _build_checks(
         checks.append(
             scenario_base.Check.failed(
                 "saturate_rejected_majority",
-                "Saturation didn't produce expected reject rate — gate may be misbehaving or fleet has more capacity than expected.",
+                (
+                    "Saturation didn't produce expected reject rate — gate may be "
+                    "misbehaving or fleet has more capacity than expected."
+                ),
                 observed=observed,
                 expected=">= 50%",
             )
@@ -329,7 +339,10 @@ def _build_checks(
         checks.append(
             scenario_base.Check.inconclusive(
                 "burst_overflow_rejected",
-                "Burst overflow did not majority-reject; either saturation drained too quickly or scenario sized too low.",
+                (
+                    "Burst overflow did not majority-reject; either saturation drained too "
+                    "quickly or scenario sized too low."
+                ),
                 observed=f"{burst.rejected_503}/{burst.count}",
             )
         )

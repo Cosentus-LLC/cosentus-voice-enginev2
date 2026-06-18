@@ -236,8 +236,8 @@ async def main() -> None:
         # ── 6. Build STT / TTS / LLM via Layer 3 ───────────────────────────
         # Pass the hydrated system prompt via system_instruction so
         # Layer 3 doesn't need to know about case_data.
-        stt = build_stt(agent)
-        tts = build_tts(agent)
+        stt = build_stt(agent, settings)
+        tts = build_tts(agent, settings)
         llm = build_llm(
             agent,
             settings=settings,

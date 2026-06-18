@@ -37,6 +37,7 @@ import structlog
 from app.config.agent_config import AgentConfig
 from app.config.settings import Settings
 from app.observers.error_state import ErrorState
+from app.observers.usage_accumulator import UsageAccumulator
 from app.persistence.call_record import CallRecord
 from app.persistence.call_writer import trigger_auto_actions, write_call_record
 from app.persistence.post_call import run_post_call_analyses
@@ -62,6 +63,8 @@ async def finalize_call(
     batch_id: str | None,
     batch_row_index: int | None,
     settings: Settings,
+    otel_parent_context: Any = None,
+    usage_accumulator: UsageAccumulator | None = None,
 ) -> None:
     """Build :class:`CallRecord`, fire Layer 6 writes, run PCA + auto-actions.
 
@@ -106,6 +109,21 @@ async def finalize_call(
         session_id=session_id,
     )
 
+    def _apply_usage() -> None:
+        """Copy the running usage tally onto the record (#28). Idempotent —
+        re-read before each write so the second write picks up the post-call
+        extraction's tokens. No-op when tracing/metrics are off."""
+        if usage_accumulator is None:
+            return
+        totals = usage_accumulator.totals()
+        record.llm_tokens_in = totals.llm_tokens_in
+        record.llm_tokens_out = totals.llm_tokens_out
+        record.tts_chars = totals.tts_chars
+
+    # Live-pipeline usage is fully accumulated by now (the pipeline has torn
+    # down before finalize runs); copy it on before the first write.
+    _apply_usage()
+
     logger.info(
         "finalize_call_starting",
         call_id=call_id,
@@ -133,9 +151,14 @@ async def finalize_call(
             case_data,
             transcript,
             settings,
+            otel_parent_context=otel_parent_context,
+            usage_accumulator=usage_accumulator,
         )
         if analyses:
             record.post_call_analyses = analyses
+            # Re-read the tally so the second write also carries the
+            # extraction call's tokens (folded in by run_post_call_analyses).
+            _apply_usage()
             second_ok = await write_call_record(record, settings)
             logger.info(
                 "post_call_analyses_persisted",

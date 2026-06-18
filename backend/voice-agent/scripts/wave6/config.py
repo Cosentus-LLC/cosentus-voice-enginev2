@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
-
 # ── Staging targets ─────────────────────────────────────────────────────────
 
 STAGING_HOSTNAME: Final = "staging.cosentusaibackend.com"
@@ -97,11 +96,7 @@ class RunPaths:
 
 def fresh_run_dir(timestamp_iso: str) -> RunPaths:
     """Make a wave6_results/<UTC-timestamp>/ directory."""
-    base = (
-        Path(__file__).resolve().parents[3]
-        / "wave6_results"
-        / timestamp_iso
-    )
+    base = Path(__file__).resolve().parents[3] / "wave6_results" / timestamp_iso
     base.mkdir(parents=True, exist_ok=True)
     return RunPaths(root=base)
 
@@ -114,9 +109,9 @@ def fresh_run_dir(timestamp_iso: str) -> RunPaths:
 # fail). Soak scenario e is the dominant line item.
 
 BUDGET_CALLS_PER_SCENARIO: Final = {
-    "a": 600,    # 30 min × ~10 cpm avg + spike headroom
-    "b": 100,    # 50 burst + 5 min sustained refire
-    "c": 60,     # 5 min × ~3 cpm + replacement overhead
-    "d": 200,    # 5 min × 30 concurrent + 50-call overflow burst
+    "a": 600,  # 30 min × ~10 cpm avg + spike headroom
+    "b": 100,  # 50 burst + 5 min sustained refire
+    "c": 60,  # 5 min × ~3 cpm + replacement overhead
+    "d": 200,  # 5 min × 30 concurrent + 50-call overflow burst
     "e": 30000,  # 4 h × ~12 calls/min sustained × 1.5× headroom
 }

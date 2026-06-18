@@ -11,6 +11,10 @@ spin up real bots. Daily client + protection are also mocked.
 from __future__ import annotations
 
 import asyncio
+import base64
+import hmac
+import json
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -18,7 +22,10 @@ from aiohttp import web
 from app.config.settings import Settings
 from app.runner.manager import CallSpawnResult, CapacityRejected, PipelineManager
 from app.runner.server import (
+    APP_KEY_API_KEY,
     DEFAULT_DRAIN_BUDGET_SECS,
+    _check_api_key,
+    _load_api_key,
     build_app,
     graceful_drain,
 )
@@ -26,10 +33,17 @@ from app.runner.server import (
 # ── Fixtures ──────────────────────────────────────────────────────────────
 
 
-def _settings(*, api_key_arn: str = "") -> Settings:
+def _settings(
+    *,
+    api_key_arn: str = "",
+    daily_dialin_webhook_hmac: str = "",
+    environment: str = "test",
+) -> Settings:
     return Settings(
         voice_api_lambda_name="test-voice-api",
         api_key_secret_arn=api_key_arn,
+        daily_dialin_webhook_hmac=daily_dialin_webhook_hmac,
+        environment=environment,
         max_concurrent_calls=6,
     )
 
@@ -66,6 +80,44 @@ async def _build_app_for_test(
     settings = settings or _settings()
     with patch("app.runner.server._load_api_key", AsyncMock(return_value=api_key)):
         return await build_app(settings, manager)
+
+
+def _daily_hmac_secret() -> str:
+    return base64.b64encode(b"daily-test-secret").decode("ascii")
+
+
+def _dialin_body_bytes(**overrides: str | None) -> bytes:
+    body = {
+        "From": "+19494360836",
+        "To": "+12098075018",
+        "callId": "ext-call",
+        "callDomain": "x.daily.co",
+    }
+    for key, value in overrides.items():
+        if value is None:
+            body.pop(key, None)
+        else:
+            body[key] = value
+    return json.dumps(body, separators=(",", ":")).encode("utf-8")
+
+
+def _signed_dialin_headers(
+    raw_body: bytes,
+    hmac_secret: str,
+    *,
+    timestamp: str | None = None,
+) -> dict[str, str]:
+    timestamp = timestamp or str(int(time.time()))
+    secret_bytes = base64.b64decode(hmac_secret)
+    signed_payload = timestamp.encode("utf-8") + b"." + raw_body
+    signature = base64.b64encode(hmac.new(secret_bytes, signed_payload, "sha256").digest()).decode(
+        "ascii"
+    )
+    return {
+        "Content-Type": "application/json",
+        "X-Pinless-Timestamp": timestamp,
+        "X-Pinless-Signature": signature,
+    }
 
 
 # ── /health ──────────────────────────────────────────────────────────────
@@ -132,6 +184,17 @@ async def test_status_requires_auth_when_key_configured(aiohttp_client):
     assert resp.status == 401
 
 
+def test_check_api_key_uses_compare_digest():
+    request = MagicMock()
+    request.app = {APP_KEY_API_KEY: "secret-key"}
+    request.headers = {"X-API-Key": "provided-key"}
+
+    with patch("app.runner.server.secrets.compare_digest", return_value=True) as compare_digest:
+        assert _check_api_key(request) is True
+
+    compare_digest.assert_called_once_with("provided-key", "secret-key")
+
+
 @pytest.mark.asyncio
 async def test_status_returns_with_valid_key(aiohttp_client):
     manager = _manager_mock()
@@ -144,6 +207,15 @@ async def test_status_returns_with_valid_key(aiohttp_client):
 
 
 @pytest.mark.asyncio
+async def test_status_rejects_wrong_key(aiohttp_client):
+    manager = _manager_mock()
+    app = await _build_app_for_test(manager, api_key="secret-key")
+    client = await aiohttp_client(app)
+    resp = await client.get("/status", headers={"X-API-Key": "wrong-key"})
+    assert resp.status == 401
+
+
+@pytest.mark.asyncio
 async def test_status_open_in_local_dev(aiohttp_client):
     """Empty api_key_secret_arn → no auth required."""
     manager = _manager_mock()
@@ -151,6 +223,74 @@ async def test_status_open_in_local_dev(aiohttp_client):
     client = await aiohttp_client(app)
     resp = await client.get("/status")
     assert resp.status == 200
+
+
+# ── Auth helpers ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_load_api_key_no_arn_returns_empty_string():
+    with patch("app.runner.server.boto3.client") as boto3_client:
+        result = await _load_api_key(_settings(api_key_arn=""))
+
+    assert result == ""
+    boto3_client.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_load_api_key_parses_json_secret():
+    settings = _settings(api_key_arn="arn:test")
+    secret_client = MagicMock()
+    secret_client.get_secret_value = MagicMock(
+        return_value={"SecretString": '{"api_key": "secret-key"}'}
+    )
+
+    with patch("app.runner.server.boto3.client", return_value=secret_client) as boto3_client:
+        result = await _load_api_key(settings)
+
+    assert result == "secret-key"
+    boto3_client.assert_called_once_with("secretsmanager", region_name=settings.aws_region)
+    secret_client.get_secret_value.assert_called_once_with(SecretId="arn:test")
+
+
+@pytest.mark.asyncio
+async def test_load_api_key_uses_plain_string_secret():
+    settings = _settings(api_key_arn="arn:test")
+    secret_client = MagicMock()
+    secret_client.get_secret_value = MagicMock(return_value={"SecretString": "plain-secret-key"})
+
+    with patch("app.runner.server.boto3.client", return_value=secret_client):
+        result = await _load_api_key(settings)
+
+    assert result == "plain-secret-key"
+
+
+@pytest.mark.asyncio
+async def test_load_api_key_raises_when_secret_manager_fails():
+    settings = _settings(api_key_arn="arn:test")
+    secret_client = MagicMock()
+    secret_client.get_secret_value = MagicMock(side_effect=RuntimeError("boom"))
+
+    with (
+        patch("app.runner.server.boto3.client", return_value=secret_client),
+        pytest.raises(RuntimeError, match="API key secret load failed"),
+    ):
+        await _load_api_key(settings)
+
+
+@pytest.mark.asyncio
+async def test_load_api_key_raises_when_arn_configured_but_key_empty():
+    settings = _settings(api_key_arn="arn:test")
+    secret_client = MagicMock()
+    secret_client.get_secret_value = MagicMock(
+        return_value={"SecretString": '{"not_api_key": "x"}'}
+    )
+
+    with (
+        patch("app.runner.server.boto3.client", return_value=secret_client),
+        pytest.raises(RuntimeError, match="API key secret resolved to an empty value"),
+    ):
+        await _load_api_key(settings)
 
 
 # ── /start outbound ──────────────────────────────────────────────────────
@@ -279,25 +419,80 @@ async def test_start_400_invalid_json(aiohttp_client):
 
 
 @pytest.mark.asyncio
-async def test_dialin_webhook_with_valid_lookup(aiohttp_client):
+async def test_dialin_webhook_rejects_missing_signature(aiohttp_client):
+    manager = _manager_mock()
+    settings = _settings(
+        daily_dialin_webhook_hmac=_daily_hmac_secret(),
+        environment="production",
+    )
+    app = await _build_app_for_test(manager, settings=settings)
+    client = await aiohttp_client(app)
+    lookup = AsyncMock(return_value="agent-id-from-lambda")
+
+    with patch("app.runner.server._lookup_inbound_agent", lookup):
+        resp = await client.post(
+            "/daily-dialin-webhook",
+            data=_dialin_body_bytes(),
+            headers={"Content-Type": "application/json"},
+        )
+
+    assert resp.status == 403
+    lookup.assert_not_awaited()
+    manager.start_inbound.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dialin_webhook_rejects_bad_signature(aiohttp_client):
+    manager = _manager_mock()
+    settings = _settings(
+        daily_dialin_webhook_hmac=_daily_hmac_secret(),
+        environment="production",
+    )
+    app = await _build_app_for_test(manager, settings=settings)
+    client = await aiohttp_client(app)
+    raw_body = _dialin_body_bytes()
+    headers = {
+        "Content-Type": "application/json",
+        "X-Pinless-Timestamp": str(int(time.time())),
+        "X-Pinless-Signature": "bad-signature",
+    }
+    lookup = AsyncMock(return_value="agent-id-from-lambda")
+
+    with patch("app.runner.server._lookup_inbound_agent", lookup):
+        resp = await client.post(
+            "/daily-dialin-webhook",
+            data=raw_body,
+            headers=headers,
+        )
+
+    assert resp.status == 403
+    lookup.assert_not_awaited()
+    manager.start_inbound.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dialin_webhook_accepts_valid_signature(aiohttp_client):
     manager = _manager_mock()
     manager.start_inbound = AsyncMock(
         return_value=CallSpawnResult(call_id="call-in", room_name="rin", room_url="https://x/rin")
     )
-    app = await _build_app_for_test(manager)
+    hmac_secret = _daily_hmac_secret()
+    settings = _settings(
+        daily_dialin_webhook_hmac=hmac_secret,
+        environment="production",
+    )
+    app = await _build_app_for_test(manager, settings=settings)
     client = await aiohttp_client(app)
+    raw_body = _dialin_body_bytes()
+
     with patch(
         "app.runner.server._lookup_inbound_agent",
         AsyncMock(return_value="agent-id-from-lambda"),
     ):
         resp = await client.post(
             "/daily-dialin-webhook",
-            json={
-                "From": "+19494360836",
-                "To": "+12098075018",
-                "callId": "ext-call",
-                "callDomain": "x.daily.co",
-            },
+            data=raw_body,
+            headers=_signed_dialin_headers(raw_body, hmac_secret),
         )
     assert resp.status == 200
     body = await resp.json()
@@ -308,15 +503,29 @@ async def test_dialin_webhook_with_valid_lookup(aiohttp_client):
 @pytest.mark.asyncio
 async def test_dialin_webhook_503_when_agent_lookup_fails(aiohttp_client):
     manager = _manager_mock()
-    app = await _build_app_for_test(manager)
+    hmac_secret = _daily_hmac_secret()
+    app = await _build_app_for_test(
+        manager,
+        settings=_settings(
+            daily_dialin_webhook_hmac=hmac_secret,
+            environment="production",
+        ),
+    )
     client = await aiohttp_client(app)
+    raw_body = _dialin_body_bytes(
+        From="+1",
+        To="+1234567890",
+        callId="x",
+        callDomain="y",
+    )
     with patch(
         "app.runner.server._lookup_inbound_agent",
         AsyncMock(return_value=None),
     ):
         resp = await client.post(
             "/daily-dialin-webhook",
-            json={"From": "+1", "To": "+1234567890", "callId": "x", "callDomain": "y"},
+            data=raw_body,
+            headers=_signed_dialin_headers(raw_body, hmac_secret),
         )
     assert resp.status == 503
     body = await resp.json()
@@ -326,13 +535,193 @@ async def test_dialin_webhook_503_when_agent_lookup_fails(aiohttp_client):
 @pytest.mark.asyncio
 async def test_dialin_webhook_400_without_to(aiohttp_client):
     manager = _manager_mock()
-    app = await _build_app_for_test(manager)
+    hmac_secret = _daily_hmac_secret()
+    app = await _build_app_for_test(
+        manager,
+        settings=_settings(
+            daily_dialin_webhook_hmac=hmac_secret,
+            environment="production",
+        ),
+    )
     client = await aiohttp_client(app)
+    raw_body = _dialin_body_bytes(To=None, From="+1", callId="x", callDomain="y")
     resp = await client.post(
         "/daily-dialin-webhook",
-        json={"From": "+1", "callId": "x", "callDomain": "y"},
+        data=raw_body,
+        headers=_signed_dialin_headers(raw_body, hmac_secret),
     )
     assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_dialin_lookup_path_unchanged(aiohttp_client):
+    manager = _manager_mock()
+    manager.start_inbound = AsyncMock(
+        return_value=CallSpawnResult(call_id="call-in", room_name="rin", room_url="https://x/rin")
+    )
+    hmac_secret = _daily_hmac_secret()
+    settings = _settings(
+        daily_dialin_webhook_hmac=hmac_secret,
+        environment="production",
+    )
+    app = await _build_app_for_test(manager, settings=settings)
+    client = await aiohttp_client(app)
+    raw_body = _dialin_body_bytes()
+    lookup = AsyncMock(return_value="agent-id-from-lambda")
+
+    with patch("app.runner.server._lookup_inbound_agent", lookup):
+        resp = await client.post(
+            "/daily-dialin-webhook",
+            data=raw_body,
+            headers=_signed_dialin_headers(raw_body, hmac_secret),
+        )
+
+    assert resp.status == 200
+    lookup.assert_awaited_once_with("+12098075018", settings)
+    manager.start_inbound.assert_awaited_once_with(
+        agent_id="agent-id-from-lambda",
+        from_number="+19494360836",
+        to_number="+12098075018",
+        call_id_external="ext-call",
+        call_domain="x.daily.co",
+    )
+
+
+@pytest.mark.asyncio
+async def test_dialin_webhook_rejects_stale_signature(aiohttp_client):
+    manager = _manager_mock()
+    hmac_secret = _daily_hmac_secret()
+    app = await _build_app_for_test(
+        manager,
+        settings=_settings(
+            daily_dialin_webhook_hmac=hmac_secret,
+            environment="production",
+        ),
+    )
+    client = await aiohttp_client(app)
+    raw_body = _dialin_body_bytes()
+    lookup = AsyncMock(return_value="agent-id-from-lambda")
+
+    with patch("app.runner.server._lookup_inbound_agent", lookup):
+        resp = await client.post(
+            "/daily-dialin-webhook",
+            data=raw_body,
+            headers=_signed_dialin_headers(raw_body, hmac_secret, timestamp="1"),
+        )
+
+    assert resp.status == 403
+    lookup.assert_not_awaited()
+    manager.start_inbound.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dialin_webhook_rejects_missing_timestamp(aiohttp_client):
+    manager = _manager_mock()
+    hmac_secret = _daily_hmac_secret()
+    app = await _build_app_for_test(
+        manager,
+        settings=_settings(
+            daily_dialin_webhook_hmac=hmac_secret,
+            environment="production",
+        ),
+    )
+    client = await aiohttp_client(app)
+    raw_body = _dialin_body_bytes()
+    signed_headers = _signed_dialin_headers(raw_body, hmac_secret)
+    signed_headers.pop("X-Pinless-Timestamp")
+    lookup = AsyncMock(return_value="agent-id-from-lambda")
+
+    with patch("app.runner.server._lookup_inbound_agent", lookup):
+        resp = await client.post(
+            "/daily-dialin-webhook",
+            data=raw_body,
+            headers=signed_headers,
+        )
+
+    assert resp.status == 403
+    lookup.assert_not_awaited()
+    manager.start_inbound.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dialin_webhook_rejects_production_when_hmac_unset(aiohttp_client):
+    manager = _manager_mock()
+    app = await _build_app_for_test(
+        manager,
+        settings=_settings(environment="production"),
+    )
+    client = await aiohttp_client(app)
+    lookup = AsyncMock(return_value="agent-id-from-lambda")
+
+    with patch("app.runner.server._lookup_inbound_agent", lookup):
+        resp = await client.post(
+            "/daily-dialin-webhook",
+            data=_dialin_body_bytes(),
+            headers={"Content-Type": "application/json"},
+        )
+
+    assert resp.status == 403
+    lookup.assert_not_awaited()
+    manager.start_inbound.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dialin_webhook_allows_unsigned_local_dev_when_hmac_unset(aiohttp_client):
+    manager = _manager_mock()
+    manager.start_inbound = AsyncMock(
+        return_value=CallSpawnResult(call_id="call-in", room_name="rin", room_url="https://x/rin")
+    )
+    app = await _build_app_for_test(
+        manager,
+        settings=_settings(environment="local"),
+    )
+    client = await aiohttp_client(app)
+    lookup = AsyncMock(return_value="agent-id-from-lambda")
+
+    with patch("app.runner.server._lookup_inbound_agent", lookup):
+        resp = await client.post(
+            "/daily-dialin-webhook",
+            data=_dialin_body_bytes(),
+            headers={"Content-Type": "application/json"},
+        )
+
+    assert resp.status == 200
+    lookup.assert_awaited_once()
+    manager.start_inbound.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_dialin_signature_uses_constant_time_compare(aiohttp_client):
+    manager = _manager_mock()
+    manager.start_inbound = AsyncMock(
+        return_value=CallSpawnResult(call_id="call-in", room_name="rin", room_url="https://x/rin")
+    )
+    hmac_secret = _daily_hmac_secret()
+    app = await _build_app_for_test(
+        manager,
+        settings=_settings(
+            daily_dialin_webhook_hmac=hmac_secret,
+            environment="production",
+        ),
+    )
+    client = await aiohttp_client(app)
+    raw_body = _dialin_body_bytes()
+    headers = _signed_dialin_headers(raw_body, hmac_secret)
+    expected_signature = headers["X-Pinless-Signature"]
+    lookup = AsyncMock(return_value="agent-id-from-lambda")
+
+    with (
+        patch("app.runner.server.hmac.compare_digest", return_value=True) as compare_digest,
+        patch("app.runner.server._lookup_inbound_agent", lookup),
+    ):
+        resp = await client.post(
+            "/daily-dialin-webhook",
+            data=raw_body,
+            headers=headers,
+        )
+
+    assert resp.status == 200
+    compare_digest.assert_called_once_with(headers["X-Pinless-Signature"], expected_signature)
 
 
 # ── _lookup_inbound_agent: real lambda envelope shape ────────────────────

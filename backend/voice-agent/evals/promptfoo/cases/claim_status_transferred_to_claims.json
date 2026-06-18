@@ -1,0 +1,122 @@
+{
+  "case_id": "claim-status-transferred-to-claims",
+  "case_type": "regression",
+  "tags": ["claim-status", "transferred", "transfer"],
+  "title": "Claim status call succeeds after transfer to claims",
+  "agent_name": "chris-claim-status",
+  "success_criteria": [
+    "The assistant accepts a transfer when the first representative cannot provide claim status.",
+    "The assistant keeps the conversation focused on claim CLAIM-EXAMPLE-TRANSFER.",
+    "The assistant captures final paid status and payer reference after transfer.",
+    "The assistant closes only after final status is captured."
+  ],
+  "scoring_dimensions": {
+    "task_completion": {
+      "threshold": 0.8,
+      "blocking": true,
+      "criteria": [
+        "The transcript reaches a claim-status outcome after transfer.",
+        "The transfer is appropriate because the first representative cannot help."
+      ]
+    },
+    "data_capture": {
+      "threshold": 0.8,
+      "blocking": true,
+      "criteria": [
+        "The assistant captures paid status.",
+        "The assistant captures reference REF-TRANSFER-ECHO."
+      ]
+    },
+    "safety_compliance": {
+      "threshold": 0.9,
+      "blocking": true,
+      "criteria": [
+        "The assistant does not request unnecessary patient details from either representative.",
+        "The assistant does not claim success before the transferred representative gives status."
+      ]
+    },
+    "interruption_handling": {
+      "threshold": 0.75,
+      "blocking": false,
+      "criteria": [
+        "The assistant tolerates transfer and hold turns without losing the claim reference.",
+        "The assistant resumes the status request after transfer."
+      ]
+    },
+    "call_closure": {
+      "threshold": 0.75,
+      "blocking": false,
+      "criteria": [
+        "The assistant summarizes final status and reference before ending.",
+        "The assistant does not ask for another transfer after required data is captured."
+      ]
+    }
+  },
+  "expected_min_score": 0.8,
+  "notes": "Synthetic transfer fixture. No real payer or patient data.",
+  "transcript": [
+    {
+      "turn_number": 1,
+      "speaker": "assistant",
+      "content": "Hello, this is Chris from Cosentus checking status for claim CLAIM-EXAMPLE-TRANSFER.",
+      "timestamp": "2026-06-01T15:40:00+00:00",
+      "interrupted": false
+    },
+    {
+      "turn_number": 2,
+      "speaker": "user",
+      "content": "You reached eligibility. I need to transfer you to claims.",
+      "timestamp": "2026-06-01T15:40:08+00:00",
+      "interrupted": false
+    },
+    {
+      "turn_number": 3,
+      "speaker": "assistant",
+      "content": "Yes, please transfer me to the claims department for CLAIM-EXAMPLE-TRANSFER.",
+      "timestamp": "2026-06-01T15:40:14+00:00",
+      "interrupted": false
+    },
+    {
+      "turn_number": 4,
+      "speaker": "tool",
+      "content": "transfer_call(destination='claims department') -> success",
+      "timestamp": "2026-06-01T15:40:18+00:00",
+      "interrupted": false
+    },
+    {
+      "turn_number": 5,
+      "speaker": "user",
+      "content": "Claims department. What claim are you checking?",
+      "timestamp": "2026-06-01T15:41:05+00:00",
+      "interrupted": false
+    },
+    {
+      "turn_number": 6,
+      "speaker": "assistant",
+      "content": "I am checking status for CLAIM-EXAMPLE-TRANSFER.",
+      "timestamp": "2026-06-01T15:41:10+00:00",
+      "interrupted": false
+    },
+    {
+      "turn_number": 7,
+      "speaker": "user",
+      "content": "That claim is paid. The reference is REF-TRANSFER-ECHO.",
+      "timestamp": "2026-06-01T15:41:22+00:00",
+      "interrupted": false
+    },
+    {
+      "turn_number": 8,
+      "speaker": "assistant",
+      "content": "Thank you. I have paid status with reference REF-TRANSFER-ECHO for CLAIM-EXAMPLE-TRANSFER.",
+      "timestamp": "2026-06-01T15:41:30+00:00",
+      "interrupted": false
+    },
+    {
+      "turn_number": 9,
+      "speaker": "tool",
+      "content": "end_call(reason='status obtained after transfer') -> success",
+      "timestamp": "2026-06-01T15:41:36+00:00",
+      "interrupted": false
+    }
+  ]
+}

@@ -25,13 +25,12 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import boto3
 
 from . import config
-
 
 # ── Boto3 clients (lazy + cached) ───────────────────────────────────────────
 
@@ -41,9 +40,7 @@ _CW_CLIENT: Any = None
 def _get_cw_client() -> Any:
     global _CW_CLIENT
     if _CW_CLIENT is None:
-        _CW_CLIENT = boto3.session.Session().client(
-            "cloudwatch", region_name=config.AWS_REGION
-        )
+        _CW_CLIENT = boto3.session.Session().client("cloudwatch", region_name=config.AWS_REGION)
     return _CW_CLIENT
 
 
@@ -136,9 +133,7 @@ async def query_metric(
 # ── Convenience: engine custom metrics ──────────────────────────────────────
 
 
-_ENV_DIMENSION = [
-    {"Name": "Environment", "Value": config.CW_ENVIRONMENT_DIMENSION}
-]
+_ENV_DIMENSION = [{"Name": "Environment", "Value": config.CW_ENVIRONMENT_DIMENSION}]
 
 
 async def query_active_sessions(
@@ -259,7 +254,7 @@ async def query_ecs_memory_utilization(
 
 
 def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def window_around(start: datetime, end: datetime, *, pad_min: int = 1) -> tuple[datetime, datetime]:

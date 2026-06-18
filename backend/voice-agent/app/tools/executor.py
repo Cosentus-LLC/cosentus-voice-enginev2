@@ -12,10 +12,12 @@ by Layer 8's tool handler closures.
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 import structlog
 
+from app.observability.tracing import set_span_attrs, tool_span
 from app.tools.context import ToolContext
 from app.tools.registry import ToolRegistry
 from app.tools.result import (
@@ -78,41 +80,75 @@ class ToolExecutor:
             )
             return error_result(f"Unknown tool: {tool_name}")
 
-        try:
-            result = await asyncio.wait_for(
-                tool.executor(arguments, context),
-                timeout=tool.timeout_secs,
-            )
-        except TimeoutError:
-            logger.error(
-                "tool_timeout",
-                tool_name=tool_name,
-                timeout_secs=tool.timeout_secs,
-                call_id=context.call_id,
-            )
-            return timeout_result()
-        except asyncio.CancelledError:
-            logger.warning(
-                "tool_cancelled",
-                tool_name=tool_name,
-                call_id=context.call_id,
-            )
-            return cancelled_result()
-        except Exception as exc:  # noqa: BLE001 — last-resort wrapping
-            logger.exception(
-                "tool_error",
-                tool_name=tool_name,
-                error=str(exc),
-                error_type=type(exc).__name__,
-                call_id=context.call_id,
-            )
-            return error_result(str(exc))
+        # ``voice.tool`` span (#13), parented to the call root via the
+        # explicitly-propagated context. PHI-free: only the tool name,
+        # status, run_llm flag, timing, and error *type* — never the
+        # arguments or result data.
+        with tool_span(tool_name=tool_name, parent_context=context.otel_context) as span:
+            start = time.monotonic()
 
-        logger.info(
-            "tool_executed",
-            tool_name=tool_name,
-            status=result.status.value,
-            run_llm=result.run_llm,
-            call_id=context.call_id,
-        )
-        return result
+            def _duration_ms() -> float:
+                return round((time.monotonic() - start) * 1000, 2)
+
+            try:
+                result = await asyncio.wait_for(
+                    tool.executor(arguments, context),
+                    timeout=tool.timeout_secs,
+                )
+            except TimeoutError:
+                logger.error(
+                    "tool_timeout",
+                    tool_name=tool_name,
+                    timeout_secs=tool.timeout_secs,
+                    call_id=context.call_id,
+                )
+                set_span_attrs(
+                    span,
+                    {"voice.tool.status": "timeout", "voice.tool.duration_ms": _duration_ms()},
+                )
+                return timeout_result()
+            except asyncio.CancelledError:
+                logger.warning(
+                    "tool_cancelled",
+                    tool_name=tool_name,
+                    call_id=context.call_id,
+                )
+                set_span_attrs(
+                    span,
+                    {"voice.tool.status": "cancelled", "voice.tool.duration_ms": _duration_ms()},
+                )
+                return cancelled_result()
+            except Exception as exc:  # noqa: BLE001 — last-resort wrapping
+                logger.exception(
+                    "tool_error",
+                    tool_name=tool_name,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                    call_id=context.call_id,
+                )
+                set_span_attrs(
+                    span,
+                    {
+                        "voice.tool.status": "error",
+                        "voice.tool.error_type": type(exc).__name__,
+                        "voice.tool.duration_ms": _duration_ms(),
+                    },
+                )
+                return error_result(str(exc))
+
+            logger.info(
+                "tool_executed",
+                tool_name=tool_name,
+                status=result.status.value,
+                run_llm=result.run_llm,
+                call_id=context.call_id,
+            )
+            set_span_attrs(
+                span,
+                {
+                    "voice.tool.status": result.status.value,
+                    "voice.tool.run_llm": result.run_llm,
+                    "voice.tool.duration_ms": _duration_ms(),
+                },
+            )
+            return result

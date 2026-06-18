@@ -34,16 +34,13 @@ import boto3
 
 from . import config
 
-
 _ECS_CLIENT: Any = None
 
 
 def _get_ecs_client() -> Any:
     global _ECS_CLIENT
     if _ECS_CLIENT is None:
-        _ECS_CLIENT = boto3.session.Session().client(
-            "ecs", region_name=config.AWS_REGION
-        )
+        _ECS_CLIENT = boto3.session.Session().client("ecs", region_name=config.AWS_REGION)
     return _ECS_CLIENT
 
 

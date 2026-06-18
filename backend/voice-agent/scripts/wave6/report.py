@@ -16,7 +16,6 @@ from typing import Any
 
 from . import config
 
-
 _SCENARIOS_IN_ORDER = ("a", "b", "c", "d", "e")
 
 
@@ -77,7 +76,8 @@ def _render_summary_table(results: dict[str, dict[str, Any]]) -> str:
     lines = [
         "## Overall summary",
         "",
-        "| Scenario | Status | Duration (s) | Calls | Accepted | Rejected 503 | Other | P95 latency (ms) |",
+        "| Scenario | Status | Duration (s) | Calls | Accepted | Rejected 503 | Other | "
+        "P95 latency (ms) |",
         "|---|---|---|---|---|---|---|---|",
     ]
     for name in _SCENARIOS_IN_ORDER:
@@ -87,14 +87,15 @@ def _render_summary_table(results: dict[str, dict[str, Any]]) -> str:
             continue
         status = _STATUS_TEXT.get(r.get("overall_status", "inconclusive"), "INCONCLUSIVE")
         dur = r.get("duration_secs", "—")
-        calls = (r.get("calls") or {})
+        calls = r.get("calls") or {}
         count = calls.get("count", "—")
         accepted = calls.get("accepted_202", "—")
         rejected = calls.get("rejected_503", "—")
         other = sum((calls.get("other") or {}).values()) if calls.get("other") else 0
         latency = (calls.get("latency_ms") or {}).get("p95", "—")
         lines.append(
-            f"| {name.upper()} | {status} | {dur} | {count} | {accepted} | {rejected} | {other} | {latency} |"
+            f"| {name.upper()} | {status} | {dur} | {count} | {accepted} | "
+            f"{rejected} | {other} | {latency} |"
         )
     return "\n".join(lines)
 

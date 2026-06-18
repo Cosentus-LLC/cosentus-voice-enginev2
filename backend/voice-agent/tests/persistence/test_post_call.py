@@ -1,8 +1,13 @@
-"""Tests for ``app/persistence/post_call.py``."""
+"""Tests for ``app/persistence/post_call.py``.
+
+Post-call extraction runs through a Bedrock Converse **forced tool**: the
+model's ``toolUse.input`` arrives as an already-parsed object, validated
+against the per-agent field schema. Bedrock is mocked here so the gate
+stays offline/deterministic; live field-accuracy is validated on staging.
+"""
 
 from __future__ import annotations
 
-import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -13,13 +18,17 @@ from app.config.agent_config import (
     PostCallField,
 )
 from app.config.settings import Settings
+from app.observers.usage_accumulator import UsageAccumulator
 from app.persistence import post_call as post_call_module
 from app.persistence.post_call import (
     _build_extraction_prompt,
-    _parse_and_validate,
+    _build_tool_config,
+    _is_retryable_failover_error,
+    _resolve_model_chain,
+    _validate_tool_input,
     run_post_call_analyses,
 )
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, ReadTimeoutError
 
 # ── Test fixtures ──────────────────────────────────────────────────────────
 
@@ -28,6 +37,35 @@ def _settings() -> Settings:
     return Settings(
         voice_api_lambda_name="test-voice-api",
         api_key_secret_arn="arn:aws:secretsmanager:us-east-1:0:secret:test",
+    )
+
+
+def _settings_with_chain(chain: str) -> Settings:
+    """Settings with an offline model fallback chain configured (#20)."""
+    return Settings(
+        voice_api_lambda_name="test-voice-api",
+        api_key_secret_arn="arn:aws:secretsmanager:us-east-1:0:secret:test",
+        post_call_model_fallback_chain=chain,
+    )
+
+
+def _throttling_error() -> ClientError:
+    """A retryable Bedrock throttling error (triggers offline failover)."""
+    return ClientError(
+        {"Error": {"Code": "ThrottlingException", "Message": "slow down"}}, "Converse"
+    )
+
+
+def _pca_agent(model: str) -> AgentConfig:
+    """Agent with a single-field post-call config pinned to ``model``."""
+    return AgentConfig(
+        name="test-agent",
+        display_name="Test",
+        system_prompt="You are a test agent.",
+        post_call_analyses=PostCallConfig(
+            model=model,
+            fields=[PostCallField(name="summary", type="text", description="A summary.")],
+        ),
     )
 
 
@@ -59,14 +97,40 @@ def _transcript() -> list[dict]:
     ]
 
 
-def _bedrock_response(text: str) -> dict:
+def _tool_response(tool_input: dict) -> dict:
+    """A Converse response where the model called the extraction tool."""
     return {
         "output": {
             "message": {
                 "role": "assistant",
-                "content": [{"text": text}],
+                "content": [
+                    {
+                        "toolUse": {
+                            "toolUseId": "tu-1",
+                            "name": "extract_post_call",
+                            "input": tool_input,
+                        }
+                    }
+                ],
             }
         }
+    }
+
+
+def _text_response(text: str) -> dict:
+    """A Converse response with no tool use — the model answered in text."""
+    return {"output": {"message": {"role": "assistant", "content": [{"text": text}]}}}
+
+
+def _with_usage(response: dict, *, in_tokens: int, out_tokens: int) -> dict:
+    """Attach a Converse ``usage`` block (as Bedrock returns it)."""
+    return {
+        **response,
+        "usage": {
+            "inputTokens": in_tokens,
+            "outputTokens": out_tokens,
+            "totalTokens": in_tokens + out_tokens,
+        },
     }
 
 
@@ -104,9 +168,10 @@ async def test_returns_text_field_extracted():
             PostCallField(name="summary", type="text", description="A summary."),
         ]
     )
-    bedrock_text = json.dumps({"summary": "Claim 12345 is paid."})
     with patch("app.persistence.post_call._BEDROCK_CLIENT") as mock_br:
-        mock_br.converse = MagicMock(return_value=_bedrock_response(bedrock_text))
+        mock_br.converse = MagicMock(
+            return_value=_tool_response({"summary": "Claim 12345 is paid."})
+        )
         result = await run_post_call_analyses(agent, {}, _transcript(), _settings())
     assert result == {"summary": "Claim 12345 is paid."}
 
@@ -123,16 +188,15 @@ async def test_returns_selector_field_with_valid_choice():
             )
         ]
     )
-    bedrock_text = json.dumps({"outcome": "resolved"})
     with patch("app.persistence.post_call._BEDROCK_CLIENT") as mock_br:
-        mock_br.converse = MagicMock(return_value=_bedrock_response(bedrock_text))
+        mock_br.converse = MagicMock(return_value=_tool_response({"outcome": "resolved"}))
         result = await run_post_call_analyses(agent, {}, _transcript(), _settings())
     assert result == {"outcome": "resolved"}
 
 
 @pytest.mark.asyncio
 async def test_returns_invalid_marker_for_off_list_selector_choice():
-    """v1 semantics: invalid choice gets ``invalid: <value>`` prefix.
+    """Invalid choice gets ``invalid: <value>`` prefix.
 
     Surfaces the LLM's actual output for operator triage rather than
     silently swallowing it.
@@ -146,11 +210,52 @@ async def test_returns_invalid_marker_for_off_list_selector_choice():
             )
         ]
     )
-    bedrock_text = json.dumps({"outcome": "in_progress"})
     with patch("app.persistence.post_call._BEDROCK_CLIENT") as mock_br:
-        mock_br.converse = MagicMock(return_value=_bedrock_response(bedrock_text))
+        mock_br.converse = MagicMock(return_value=_tool_response({"outcome": "in_progress"}))
         result = await run_post_call_analyses(agent, {}, _transcript(), _settings())
     assert result == {"outcome": "invalid: in_progress"}
+
+
+@pytest.mark.asyncio
+async def test_default_offline_model_is_sonnet():
+    """When the per-agent ``post_call_analyses.model`` is empty, the offline
+    extraction falls back to the stronger model (#20 — Sonnet), not the live
+    Haiku. Assert the Bedrock Converse call targets the resolved Sonnet id."""
+    agent = AgentConfig(
+        name="test-agent",
+        display_name="Test",
+        system_prompt="You are a test agent.",
+        post_call_analyses=PostCallConfig(
+            model="",
+            fields=[PostCallField(name="summary", type="text", description="A summary.")],
+        ),
+    )
+    with patch("app.persistence.post_call._BEDROCK_CLIENT") as mock_br:
+        mock_br.converse = MagicMock(return_value=_tool_response({"summary": "ok"}))
+        await run_post_call_analyses(agent, {}, _transcript(), _settings())
+    assert mock_br.converse.call_args.kwargs["modelId"] == "us.anthropic.claude-sonnet-4-6"
+
+
+@pytest.mark.asyncio
+async def test_per_agent_model_overrides_default():
+    """An explicit per-agent ``post_call_analyses.model`` still wins over the
+    Sonnet default — operators who pinned a model keep it (#20)."""
+    agent = AgentConfig(
+        name="test-agent",
+        display_name="Test",
+        system_prompt="You are a test agent.",
+        post_call_analyses=PostCallConfig(
+            model="claude-haiku-4-5",
+            fields=[PostCallField(name="summary", type="text", description="A summary.")],
+        ),
+    )
+    with patch("app.persistence.post_call._BEDROCK_CLIENT") as mock_br:
+        mock_br.converse = MagicMock(return_value=_tool_response({"summary": "ok"}))
+        await run_post_call_analyses(agent, {}, _transcript(), _settings())
+    assert (
+        mock_br.converse.call_args.kwargs["modelId"]
+        == "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    )
 
 
 @pytest.mark.asyncio
@@ -161,25 +266,25 @@ async def test_handles_multiple_fields():
             PostCallField(name="outcome", type="selector", choices=["resolved", "dropped"]),
         ]
     )
-    bedrock_text = json.dumps({"summary": "Done.", "outcome": "resolved"})
     with patch("app.persistence.post_call._BEDROCK_CLIENT") as mock_br:
-        mock_br.converse = MagicMock(return_value=_bedrock_response(bedrock_text))
+        mock_br.converse = MagicMock(
+            return_value=_tool_response({"summary": "Done.", "outcome": "resolved"})
+        )
         result = await run_post_call_analyses(agent, {}, _transcript(), _settings())
     assert result == {"summary": "Done.", "outcome": "resolved"}
 
 
 @pytest.mark.asyncio
 async def test_missing_field_in_response_defaults_to_empty():
-    """Bedrock omits a field → coerce to empty string, don't fail."""
+    """Model omits a field → coerce to empty string, don't fail."""
     agent = _agent(
         fields=[
             PostCallField(name="summary", type="text"),
             PostCallField(name="reference_number", type="text"),
         ]
     )
-    bedrock_text = json.dumps({"summary": "ok"})  # reference_number missing
     with patch("app.persistence.post_call._BEDROCK_CLIENT") as mock_br:
-        mock_br.converse = MagicMock(return_value=_bedrock_response(bedrock_text))
+        mock_br.converse = MagicMock(return_value=_tool_response({"summary": "ok"}))
         result = await run_post_call_analyses(agent, {}, _transcript(), _settings())
     assert result["summary"] == "ok"
     assert result["reference_number"] == ""
@@ -202,16 +307,14 @@ async def test_returns_empty_on_bedrock_error():
 
 
 @pytest.mark.asyncio
-async def test_retries_once_on_invalid_json():
+async def test_retries_once_when_no_tool_use_block():
+    """Model answers in text first (no tool use), then calls the tool."""
     agent = _agent(fields=[PostCallField(name="summary", type="text")])
-    invalid = "this isn't json"
-    valid = json.dumps({"summary": "fixed it"})
     with patch("app.persistence.post_call._BEDROCK_CLIENT") as mock_br:
-        # First call returns garbage, second call returns valid JSON.
         mock_br.converse = MagicMock(
             side_effect=[
-                _bedrock_response(invalid),
-                _bedrock_response(valid),
+                _text_response("I think the claim is paid."),
+                _tool_response({"summary": "fixed it"}),
             ]
         )
         result = await run_post_call_analyses(agent, {}, _transcript(), _settings())
@@ -220,23 +323,34 @@ async def test_retries_once_on_invalid_json():
 
 
 @pytest.mark.asyncio
-async def test_returns_empty_after_retry_still_invalid_json():
+async def test_returns_empty_after_retry_still_no_tool_use():
     agent = _agent(fields=[PostCallField(name="summary", type="text")])
     with patch("app.persistence.post_call._BEDROCK_CLIENT") as mock_br:
-        mock_br.converse = MagicMock(return_value=_bedrock_response("never going to be JSON"))
+        mock_br.converse = MagicMock(return_value=_text_response("never calls the tool"))
         result = await run_post_call_analyses(agent, {}, _transcript(), _settings())
     assert result == {}
     assert mock_br.converse.call_count == 2  # original + 1 retry
 
 
 @pytest.mark.asyncio
-async def test_returns_empty_on_non_dict_json():
-    """LLM returns a JSON array, not an object — invalid for our schema."""
+async def test_returns_empty_when_tool_input_not_dict():
+    """``toolUse.input`` that isn't an object is unusable → no tool input → {}."""
     agent = _agent(fields=[PostCallField(name="summary", type="text")])
+    bad = {
+        "output": {
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"toolUse": {"toolUseId": "x", "name": "extract_post_call", "input": [1, 2]}}
+                ],
+            }
+        }
+    }
     with patch("app.persistence.post_call._BEDROCK_CLIENT") as mock_br:
-        mock_br.converse = MagicMock(return_value=_bedrock_response("[1, 2, 3]"))
+        mock_br.converse = MagicMock(return_value=bad)
         result = await run_post_call_analyses(agent, {}, _transcript(), _settings())
     assert result == {}
+    assert mock_br.converse.call_count == 2
 
 
 @pytest.mark.asyncio
@@ -249,100 +363,287 @@ async def test_never_raises_on_unexpected_exception():
     assert result == {}
 
 
-# ── Markdown-fence stripping ───────────────────────────────────────────────
+# ── Offline model failover (#20) ────────────────────────────────────────────
+
+_SONNET_ID = "us.anthropic.claude-sonnet-4-6"
+_HAIKU_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
 
-def test_parse_strips_json_code_fence():
-    pca = PostCallConfig(
-        model="claude-haiku-4-5",
-        fields=[PostCallField(name="summary", type="text")],
+@pytest.mark.asyncio
+async def test_fails_over_to_next_model_on_throttling():
+    """A retryable error (throttling) on the primary moves to the next model
+    in the chain, which succeeds. Converse is hit on both models, in order."""
+    agent = _pca_agent("claude-sonnet-4-6")
+    with patch("app.persistence.post_call._BEDROCK_CLIENT") as mock_br:
+        mock_br.converse = MagicMock(
+            side_effect=[_throttling_error(), _tool_response({"summary": "ok"})]
+        )
+        result = await run_post_call_analyses(
+            agent, {}, _transcript(), _settings_with_chain("claude-haiku-4-5")
+        )
+    assert result == {"summary": "ok"}
+    assert mock_br.converse.call_count == 2
+    assert mock_br.converse.call_args_list[0].kwargs["modelId"] == _SONNET_ID
+    assert mock_br.converse.call_args_list[1].kwargs["modelId"] == _HAIKU_ID
+
+
+@pytest.mark.asyncio
+async def test_fails_over_on_read_timeout():
+    """A botocore read timeout is retryable → fail over to the next model."""
+    agent = _pca_agent("claude-sonnet-4-6")
+    timeout = ReadTimeoutError(endpoint_url="https://bedrock-runtime.us-east-1.amazonaws.com")
+    with patch("app.persistence.post_call._BEDROCK_CLIENT") as mock_br:
+        mock_br.converse = MagicMock(
+            side_effect=[timeout, _tool_response({"summary": "recovered"})]
+        )
+        result = await run_post_call_analyses(
+            agent, {}, _transcript(), _settings_with_chain("claude-haiku-4-5")
+        )
+    assert result == {"summary": "recovered"}
+    assert mock_br.converse.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_no_failover_on_non_retryable_error_even_with_chain():
+    """A non-retryable error (AccessDenied) fails fast → {} — no failover,
+    even with a fallback chain configured. Only the primary is hit."""
+    agent = _pca_agent("claude-sonnet-4-6")
+    err = ClientError(
+        {"Error": {"Code": "AccessDeniedException", "Message": "no entitlement"}}, "Converse"
     )
-    raw = '```json\n{"summary": "ok"}\n```'
-    result = _parse_and_validate(raw, pca)
+    with patch("app.persistence.post_call._BEDROCK_CLIENT") as mock_br:
+        mock_br.converse = MagicMock(side_effect=err)
+        result = await run_post_call_analyses(
+            agent, {}, _transcript(), _settings_with_chain("claude-haiku-4-5")
+        )
+    assert result == {}
+    assert mock_br.converse.call_count == 1
+    assert mock_br.converse.call_args_list[0].kwargs["modelId"] == _SONNET_ID
+
+
+@pytest.mark.asyncio
+async def test_chain_exhausted_returns_empty():
+    """Retryable errors on every model in the chain → {} once exhausted.
+    Both models are tried; the never-raises {} contract holds."""
+    agent = _pca_agent("claude-sonnet-4-6")
+    with patch("app.persistence.post_call._BEDROCK_CLIENT") as mock_br:
+        mock_br.converse = MagicMock(side_effect=[_throttling_error(), _throttling_error()])
+        result = await run_post_call_analyses(
+            agent, {}, _transcript(), _settings_with_chain("claude-haiku-4-5")
+        )
+    assert result == {}
+    assert mock_br.converse.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_empty_chain_no_failover_on_throttling():
+    """With no fallback chain (default), a retryable error returns {} after
+    the primary — today's behavior, byte-for-byte."""
+    agent = _pca_agent("claude-sonnet-4-6")
+    with patch("app.persistence.post_call._BEDROCK_CLIENT") as mock_br:
+        mock_br.converse = MagicMock(side_effect=_throttling_error())
+        result = await run_post_call_analyses(agent, {}, _transcript(), _settings())
+    assert result == {}
+    assert mock_br.converse.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_no_failover_on_no_structured_output():
+    """A no-tool-output result is NOT a retryable error, so it retries on the
+    SAME model (once) and then gives up — the chain is not consulted."""
+    agent = _pca_agent("claude-sonnet-4-6")
+    with patch("app.persistence.post_call._BEDROCK_CLIENT") as mock_br:
+        mock_br.converse = MagicMock(return_value=_text_response("no tool call"))
+        result = await run_post_call_analyses(
+            agent, {}, _transcript(), _settings_with_chain("claude-haiku-4-5")
+        )
+    assert result == {}
+    # original + 1 same-model retry; the Haiku fallback is never tried.
+    assert mock_br.converse.call_count == 2
+    assert all(c.kwargs["modelId"] == _SONNET_ID for c in mock_br.converse.call_args_list)
+
+
+def test_is_retryable_failover_error_classification():
+    """Throttling / capacity codes + timeouts are retryable; auth/validation
+    and unrelated exceptions are not."""
+    assert _is_retryable_failover_error(_throttling_error()) is True
+    assert (
+        _is_retryable_failover_error(
+            ClientError(
+                {"Error": {"Code": "ServiceUnavailableException", "Message": "x"}}, "Converse"
+            )
+        )
+        is True
+    )
+    assert _is_retryable_failover_error(ReadTimeoutError(endpoint_url="https://x")) is True
+    assert (
+        _is_retryable_failover_error(
+            ClientError({"Error": {"Code": "ValidationException", "Message": "x"}}, "Converse")
+        )
+        is False
+    )
+    assert _is_retryable_failover_error(RuntimeError("boom")) is False
+
+
+def test_resolve_model_chain_dedupes_and_preserves_order():
+    """Primary first, then fallbacks left-to-right; resolved to Bedrock ids
+    and de-duplicated (a fallback equal to the primary is dropped)."""
+    chain = _resolve_model_chain(
+        "claude-sonnet-4-6", _settings_with_chain("claude-haiku-4-5, claude-sonnet-4-6")
+    )
+    assert chain == [_SONNET_ID, _HAIKU_ID]
+
+
+def test_resolve_model_chain_primary_only_when_chain_empty():
+    chain = _resolve_model_chain("claude-sonnet-4-6", _settings())
+    assert chain == [_SONNET_ID]
+
+
+# ── Usage capture for cost (#28) ───────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_feeds_usage_accumulator_on_success():
+    """The extraction call's Converse usage is folded into the tally."""
+    agent = _agent(fields=[PostCallField(name="summary", type="text")])
+    usage = UsageAccumulator()
+    with patch("app.persistence.post_call._BEDROCK_CLIENT") as mock_br:
+        mock_br.converse = MagicMock(
+            return_value=_with_usage(
+                _tool_response({"summary": "ok"}), in_tokens=900, out_tokens=40
+            )
+        )
+        await run_post_call_analyses(agent, {}, _transcript(), _settings(), usage_accumulator=usage)
+    totals = usage.totals()
+    assert totals.llm_tokens_in == 900
+    assert totals.llm_tokens_out == 40
+    assert totals.tts_chars == 0  # post-call has no TTS
+
+
+@pytest.mark.asyncio
+async def test_feeds_usage_accumulator_on_every_attempt():
+    """The retry consumed tokens too — both attempts' usage is captured."""
+    agent = _agent(fields=[PostCallField(name="summary", type="text")])
+    usage = UsageAccumulator()
+    with patch("app.persistence.post_call._BEDROCK_CLIENT") as mock_br:
+        mock_br.converse = MagicMock(
+            side_effect=[
+                _with_usage(_text_response("no tool"), in_tokens=100, out_tokens=10),
+                _with_usage(_tool_response({"summary": "ok"}), in_tokens=120, out_tokens=15),
+            ]
+        )
+        await run_post_call_analyses(agent, {}, _transcript(), _settings(), usage_accumulator=usage)
+    totals = usage.totals()
+    assert totals.llm_tokens_in == 220
+    assert totals.llm_tokens_out == 25
+
+
+@pytest.mark.asyncio
+async def test_usage_accumulator_none_is_safe():
+    """Default (no accumulator) — extraction still works, nothing to feed."""
+    agent = _agent(fields=[PostCallField(name="summary", type="text")])
+    with patch("app.persistence.post_call._BEDROCK_CLIENT") as mock_br:
+        mock_br.converse = MagicMock(
+            return_value=_with_usage(_tool_response({"summary": "ok"}), in_tokens=5, out_tokens=1)
+        )
+        result = await run_post_call_analyses(agent, {}, _transcript(), _settings())
     assert result == {"summary": "ok"}
 
 
-def test_parse_strips_bare_code_fence():
-    pca = PostCallConfig(
-        model="claude-haiku-4-5",
-        fields=[PostCallField(name="summary", type="text")],
+# ── Tool input validation (replaces the old free-text JSON parser) ─────────
+
+
+def _pca(*fields: PostCallField) -> PostCallConfig:
+    return PostCallConfig(model="claude-haiku-4-5", fields=list(fields))
+
+
+def test_validate_selector_wrong_case_marked_invalid():
+    pca = _pca(PostCallField(name="outcome", type="selector", choices=["paid", "denied"]))
+    assert _validate_tool_input({"outcome": "Paid"}, pca) == {"outcome": "invalid: Paid"}
+
+
+def test_validate_out_of_enum_selector_marked_invalid():
+    pca = _pca(PostCallField(name="outcome", type="selector", choices=["resolved", "escalated"]))
+    assert _validate_tool_input({"outcome": "approved"}, pca) == {"outcome": "invalid: approved"}
+
+
+def test_validate_missing_field_defaults_empty():
+    pca = _pca(PostCallField(name="summary", type="text"), PostCallField(name="ref", type="text"))
+    assert _validate_tool_input({"summary": "ok"}, pca) == {"summary": "ok", "ref": ""}
+
+
+def test_validate_ignores_extra_keys():
+    pca = _pca(PostCallField(name="summary", type="text"))
+    assert _validate_tool_input({"summary": "ok", "sentiment": "positive"}, pca) == {
+        "summary": "ok"
+    }
+
+
+def test_validate_coerces_non_string_to_str():
+    """Model returns an int for a text field; coerce to str rather than failing."""
+    pca = _pca(PostCallField(name="count", type="text"))
+    assert _validate_tool_input({"count": 42}, pca) == {"count": "42"}
+
+
+def test_validate_returns_none_on_non_dict_input():
+    pca = _pca(PostCallField(name="summary", type="text"))
+    assert _validate_tool_input([1, 2, 3], pca) is None
+
+
+# ── Tool config built dynamically from the field schema ────────────────────
+
+
+def test_build_tool_config_selector_has_enum():
+    pca = _pca(
+        PostCallField(name="outcome", type="selector", choices=["resolved", "escalated"]),
+        PostCallField(name="summary", type="text"),
     )
-    raw = '```\n{"summary": "ok"}\n```'
-    result = _parse_and_validate(raw, pca)
-    assert result == {"summary": "ok"}
+    props = _build_tool_config(pca)["tools"][0]["toolSpec"]["inputSchema"]["json"]["properties"]
+    assert props["outcome"]["enum"] == ["resolved", "escalated"]
+    assert props["outcome"]["type"] == "string"
+    assert "enum" not in props["summary"]
+    assert props["summary"]["type"] == "string"
 
 
-def test_parse_handles_no_fence():
-    pca = PostCallConfig(
-        model="claude-haiku-4-5",
-        fields=[PostCallField(name="summary", type="text")],
-    )
-    raw = '{"summary": "ok"}'
-    result = _parse_and_validate(raw, pca)
-    assert result == {"summary": "ok"}
+def test_build_tool_config_forces_tool_and_marks_nothing_required():
+    pca = _pca(PostCallField(name="summary", type="text"))
+    cfg = _build_tool_config(pca)
+    assert cfg["toolChoice"] == {"tool": {"name": "extract_post_call"}}
+    json_schema = cfg["tools"][0]["toolSpec"]["inputSchema"]["json"]
+    assert "required" not in json_schema
 
 
-def test_parse_returns_none_on_completely_invalid_json():
-    pca = PostCallConfig(
-        model="claude-haiku-4-5",
-        fields=[PostCallField(name="summary", type="text")],
-    )
-    assert _parse_and_validate("totally not json", pca) is None
-
-
-def test_parse_returns_none_on_empty_string():
-    pca = PostCallConfig(
-        model="claude-haiku-4-5",
-        fields=[PostCallField(name="summary", type="text")],
-    )
-    assert _parse_and_validate("", pca) is None
-
-
-def test_parse_coerces_non_string_text_field():
-    """LLM returns an int for a text field; coerce to str rather than failing."""
-    pca = PostCallConfig(
-        model="claude-haiku-4-5",
-        fields=[PostCallField(name="count", type="text")],
-    )
-    raw = '{"count": 42}'
-    result = _parse_and_validate(raw, pca)
-    assert result == {"count": "42"}
+def test_build_tool_config_selector_without_choices_is_plain_string():
+    pca = _pca(PostCallField(name="outcome", type="selector", choices=[]))
+    props = _build_tool_config(pca)["tools"][0]["toolSpec"]["inputSchema"]["json"]["properties"]
+    assert "enum" not in props["outcome"]
 
 
 # ── Prompt construction ───────────────────────────────────────────────────
 
 
 def test_prompt_includes_case_data():
-    pca = PostCallConfig(
-        model="claude-haiku-4-5",
-        fields=[PostCallField(name="summary", type="text")],
-    )
+    pca = _pca(PostCallField(name="summary", type="text"))
     prompt = _build_extraction_prompt(pca, {"claim_id": "12345"}, _transcript())
     assert "claim_id" in prompt
     assert "12345" in prompt
 
 
 def test_prompt_includes_all_transcript_turns():
-    pca = PostCallConfig(
-        model="claude-haiku-4-5",
-        fields=[PostCallField(name="summary", type="text")],
-    )
+    pca = _pca(PostCallField(name="summary", type="text"))
     prompt = _build_extraction_prompt(pca, {}, _transcript())
     assert "I need to check claim 12345." in prompt
     assert "Of course. The claim is paid." in prompt
 
 
 def test_prompt_renders_selector_with_choices():
-    pca = PostCallConfig(
-        model="claude-haiku-4-5",
-        fields=[
-            PostCallField(
-                name="outcome",
-                type="selector",
-                choices=["resolved", "escalated"],
-                description="What happened?",
-            )
-        ],
+    pca = _pca(
+        PostCallField(
+            name="outcome",
+            type="selector",
+            choices=["resolved", "escalated"],
+            description="What happened?",
+        )
     )
     prompt = _build_extraction_prompt(pca, {}, _transcript())
     assert "selector" in prompt
@@ -352,37 +653,28 @@ def test_prompt_renders_selector_with_choices():
 
 
 def test_prompt_renders_text_field_clean():
-    pca = PostCallConfig(
-        model="claude-haiku-4-5",
-        fields=[PostCallField(name="summary", type="text", description="2 sentences.")],
-    )
+    pca = _pca(PostCallField(name="summary", type="text", description="2 sentences."))
     prompt = _build_extraction_prompt(pca, {}, _transcript())
     assert "summary (text)" in prompt
     assert "2 sentences." in prompt
 
 
 def test_prompt_includes_format_examples():
-    pca = PostCallConfig(
-        model="claude-haiku-4-5",
-        fields=[
-            PostCallField(
-                name="reference",
-                type="text",
-                format_examples=["REF-12345"],
-            )
-        ],
-    )
+    pca = _pca(PostCallField(name="reference", type="text", format_examples=["REF-12345"]))
     prompt = _build_extraction_prompt(pca, {}, _transcript())
     assert "REF-12345" in prompt
 
 
 def test_prompt_handles_empty_case_data():
-    pca = PostCallConfig(
-        model="claude-haiku-4-5",
-        fields=[PostCallField(name="summary", type="text")],
-    )
+    pca = _pca(PostCallField(name="summary", type="text"))
     prompt = _build_extraction_prompt(pca, {}, _transcript())
     assert "(none)" in prompt
+
+
+def test_prompt_instructs_tool_call():
+    pca = _pca(PostCallField(name="summary", type="text"))
+    prompt = _build_extraction_prompt(pca, {}, _transcript())
+    assert "extract_post_call" in prompt
 
 
 # ── Lazy-init Bedrock client binding ───────────────────────────────────────
@@ -409,14 +701,7 @@ async def test_bedrock_client_binds_region_from_settings_on_first_call():
         captured["service"] = service
         captured["region"] = region_name
         mock = MagicMock()
-        mock.converse.return_value = {
-            "output": {
-                "message": {
-                    "role": "assistant",
-                    "content": [{"text": json.dumps({"summary": "ok"})}],
-                }
-            }
-        }
+        mock.converse.return_value = _tool_response({"summary": "ok"})
         return mock
 
     fake_session = MagicMock()

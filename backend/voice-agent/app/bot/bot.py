@@ -76,6 +76,7 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
+    LLMAssistantAggregatorParams,
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
@@ -91,14 +92,40 @@ from pipecat.turns.user_stop.turn_analyzer_user_turn_stop_strategy import (
     TurnAnalyzerUserTurnStopStrategy,
 )
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
+from pipecat.utils.context.llm_context_summarization import (
+    LLMAutoContextSummarizationConfig,
+    LLMContextSummaryConfig,
+)
 
 from app.bot.lifecycle import finalize_call
 from app.config.agent_config import load_agent_config
+from app.config.payer_knowledge import load_payer_ivr_path
 from app.config.settings import Settings
-from app.hydration.hydrator import hydrate_prompt
+from app.flows import (
+    IDENTITY_GATE_NODE,
+    build_flow_manager,
+    build_identity_gate_flow,
+    build_step_chain,
+)
+from app.hydration.hydrator import (
+    MissingRequiredCaseDataError,
+    find_missing_required,
+    hydrate_prompt,
+)
+from app.knowledge.fixtures import DeidentifiedFixtureKnowledgeSource
+from app.knowledge.live import build_prefetch_context, wire_knowledge_prefetch_handler
+from app.knowledge.prefetch import PrefetchContext, PrefetchWarmer
+from app.knowledge.semantic_cache import LocalHashEmbeddingProvider, SemanticCache
+from app.observability.tracing import (
+    context_of,
+    end_call_span,
+    start_call_span,
+)
 from app.observers.error_observer import ErrorObserver
 from app.observers.error_state import ErrorState
+from app.observers.metrics_observer import MetricsObserver
 from app.observers.transcript_observer import wire_transcript_handlers
+from app.observers.usage_accumulator import UsageAccumulator
 from app.persistence.transcript import TranscriptAccumulator
 from app.services.factory import build_llm, build_stt, build_tts
 from app.tools.executor import ToolExecutor
@@ -150,6 +177,92 @@ _MIN_WORDS_INTERRUPT_THRESHOLD = 3
 # walking-skeleton round 3 and v1.
 _DEFAULT_IDLE_TIMEOUT_SECS = 300
 
+# Tools the identity gate (16b, #42) leaves available BEFORE the caller
+# is verified. ``end_call`` is exempt so the bot can always terminate —
+# e.g. on repeated verification failure or an abusive caller — without
+# being trapped by its own gate. Every other tool is gated: in
+# particular ``transfer_call`` is a WARM SIP transfer that bridges the
+# live caller (see transfer_call.py), not a cold PHI-free handoff, so it
+# stays gated until verification. A new cold-handoff tool could be added
+# here later if one is ever introduced.
+_IDENTITY_GATE_EXEMPT_TOOLS = frozenset({"end_call"})
+
+# ── Bounded-context summarization knobs (#22) ─────────────────────────────
+#
+# Tuning for Pipecat's built-in LLMContextSummarizer (sliding window +
+# running summary), enabled on the assistant aggregator behind
+# ``Settings.context_summarization_enabled`` via _build_assistant_params.
+# These live in code, not Settings — like the VAD / smart-turn / MinWords
+# constants above — because they are tuned pipeline behavior, not an
+# operator's per-deploy switch (the switch is the flag). The system prompt
+# is NOT in LLMContext.messages (it rides Settings.system_instruction; see
+# factory.build_llm), so these thresholds bound the *conversation* turns
+# only and summarization can never drop the system instruction.
+#
+# Summarization fires when EITHER threshold trips on a turn:
+#   * ~6000 estimated tokens of conversation (≈ a long call's transcript;
+#     Pipecat's estimator is ~4 chars/token over messages), OR
+#   * 24 new messages accumulated since the last summary.
+# On trip, older turns are folded into one running-summary message and the
+# last _CONTEXT_MIN_MESSAGES_AFTER_SUMMARY messages are kept verbatim — the
+# sliding window that keeps recent context exact while older context rides
+# forward as the summary.
+_CONTEXT_MAX_TOKENS = 6000
+_CONTEXT_MAX_UNSUMMARIZED_MESSAGES = 24
+_CONTEXT_MIN_MESSAGES_AFTER_SUMMARY = 8
+_CONTEXT_SUMMARY_TARGET_TOKENS = 1024
+
+# Drives the running summary. Medical-billing-call framing so the gist that
+# rides forward is the operationally useful state (claim, denial, what's
+# needed, deadlines, reference numbers) rather than chit-chat. Mirrors the
+# Flows per-step summary prompt (app.flows.steps.SUMMARY_PROMPT) so both
+# context-bounding paths summarize a call the same way. The summary stays in
+# the LLM context only and is never logged.
+_CONTEXT_SUMMARY_PROMPT = (
+    "You are summarizing a live medical-billing phone call so the assistant can "
+    "continue it without the full transcript. In a few factual sentences capture: "
+    "who is on the call and why, the claim / case and any denial details discussed, "
+    "what was asked for or agreed, confirmed submission methods (fax / portal) and "
+    "deadlines, and any reference or confirmation numbers obtained. Preserve facts "
+    "and open action items; omit greetings and small talk. Do not invent details "
+    "that were not stated."
+)
+_CONTEXT_SUMMARY_TEMPLATE = "Conversation summary so far: {summary}"
+
+
+def _build_assistant_params(settings: Settings) -> LLMAssistantAggregatorParams | None:
+    """Build assistant-aggregator params for bounded context (#22).
+
+    Returns ``None`` when ``Settings.context_summarization_enabled`` is off
+    (the default) — the caller then lets
+    :class:`LLMContextAggregatorPair` fall back to its stock
+    :class:`LLMAssistantAggregatorParams`, so the per-call context
+    accumulates exactly as it does today (behavior byte-identical to the
+    pre-#22 pipeline).
+
+    When on, returns params that enable Pipecat's
+    :class:`~pipecat.processors.aggregators.llm_context_summarizer.LLMContextSummarizer`
+    with the module's tuned thresholds + window. The summarizer uses the
+    pipeline's own (Bedrock) LLM to generate the running summary; routing
+    that to a cheaper model is #20's concern via
+    ``LLMContextSummaryConfig.llm`` and intentionally left unset here.
+    """
+    if not settings.context_summarization_enabled:
+        return None
+    return LLMAssistantAggregatorParams(
+        enable_auto_context_summarization=True,
+        auto_context_summarization_config=LLMAutoContextSummarizationConfig(
+            max_context_tokens=_CONTEXT_MAX_TOKENS,
+            max_unsummarized_messages=_CONTEXT_MAX_UNSUMMARIZED_MESSAGES,
+            summary_config=LLMContextSummaryConfig(
+                target_context_tokens=_CONTEXT_SUMMARY_TARGET_TOKENS,
+                min_messages_after_summary=_CONTEXT_MIN_MESSAGES_AFTER_SUMMARY,
+                summarization_prompt=_CONTEXT_SUMMARY_PROMPT,
+                summary_message_template=_CONTEXT_SUMMARY_TEMPLATE,
+            ),
+        ),
+    )
+
 
 async def run_bot(
     transport: BaseTransport,
@@ -192,10 +305,39 @@ async def run_bot(
     batch_row_index = body.get("batch_row_index")
     dialout_settings = body.get("dialout_settings")
 
+    # ── D2 pre-flight guard (#27) ──────────────────────────────────────
+    # Block an OUTBOUND call whose dispatcher-supplied case_data is
+    # missing a required field, rather than dialing with a blank patient
+    # name / claim id. Runs BEFORE the trace span, agent load, and
+    # transport join — so a blocked call never dials and leaves no
+    # half-built state. Inbound calls carry no dispatcher case_data and
+    # are never guarded. Empty required-set (the default) → no-op.
+    # No CallRecord is written (same pre-flight pattern as the missing-
+    # agent_id raise above); the distinct structured log + the raised
+    # error's message are the observable refusal reason for Layer 9 /
+    # the dispatcher.
+    if direction == "outbound":
+        required_keys = _parse_required_case_data_keys(settings)
+        missing_required = find_missing_required(case_data, required_keys)
+        if missing_required:
+            logger.error(
+                "outbound_call_blocked_missing_required",
+                agent_id=agent_id,
+                direction=direction,
+                # KEY NAMES only — never values (those are PHI).
+                missing_fields=missing_required,
+                required_fields=required_keys,
+            )
+            raise MissingRequiredCaseDataError(
+                "outbound call blocked: required case_data fields "
+                f"missing or blank: {missing_required}"
+            )
+
     call_id = str(uuid.uuid4())
     call_started_at = datetime.now(UTC)
     end_status = "completed"
     call_error: str | None = None
+    call_error_type: str | None = None
     session_id = _extract_session_id(runner_args)
 
     structlog.contextvars.bind_contextvars(call_id=call_id, session_id=session_id)
@@ -209,6 +351,21 @@ async def run_bot(
         case_data_keys=sorted(case_data.keys()),
     )
 
+    # ── Per-call root trace span (#13) ─────────────────────────────────
+    # ``voice.call`` is the trace root for this call. ``call_otel_span``
+    # is ``None`` when tracing is disabled (fail-open no-op). ``root_ctx``
+    # is the OTel context children parent to — propagated explicitly into
+    # ToolContext (tool spans) and finalize_call (post-call span), never
+    # via ambient contextvars. Closed in the finally block below with the
+    # terminal attributes. PHI-free: ids only.
+    call_otel_span = start_call_span(
+        call_id=call_id,
+        session_id=session_id,
+        agent_id=agent_id,
+        direction=direction,
+    )
+    root_ctx = context_of(call_otel_span)
+
     # ── Layer 1: load agent ────────────────────────────────────────────
     agent = await load_agent_config(agent_id, settings=settings)
 
@@ -217,8 +374,8 @@ async def run_bot(
     hydrated_first = hydrate_prompt(agent.first_message, case_data) if agent.first_message else ""
 
     # ── Layer 3: services (STT / TTS / LLM) ────────────────────────────
-    stt = build_stt(agent)
-    tts = build_tts(agent)
+    stt = build_stt(agent, settings)
+    tts = build_tts(agent, settings)
     llm = build_llm(agent, settings, system_instruction=hydrated_system)
 
     # ── Layer 4: tools ────────────────────────────────────────────────
@@ -237,6 +394,27 @@ async def run_bot(
     error_state = ErrorState()
     error_observer = ErrorObserver(error_state)
 
+    # Per-call usage tally (#28). Fed by the metrics observer (live LLM
+    # tokens + TTS chars) and the post-call extraction; read into the
+    # CallRecord at finalize for cost capture. Numeric only — no PHI.
+    usage_accumulator = UsageAccumulator()
+
+    # Metrics observer (#13) — folds Pipecat's numeric MetricsFrames
+    # (per-stage TTFB / processing time, LLM tokens, TTS chars, turn
+    # timing) onto the ``voice.call`` span at finalize. PHI-free; the
+    # stage map is keyed by each live service's processor name
+    # (``MetricsData.processor == FrameProcessor.name``), so attribution
+    # is exact rather than class-name-substring matching. Also feeds the
+    # usage tally above (#28).
+    metrics_observer = MetricsObserver(
+        processor_stage={
+            stt.name: "stt",
+            llm.name: "llm",
+            tts.name: "tts",
+        },
+        usage_accumulator=usage_accumulator,
+    )
+
     # ── Per-call mutable closure state ────────────────────────────────
     # ``sip_session_tracker`` carries the Daily SIP session id from
     # whichever connect event fires (dialin or dialout) over to the
@@ -247,6 +425,35 @@ async def run_bot(
     # ``on_dialout_connected`` route to the opener path. Only the
     # first to fire delivers the opener; the rest no-op.
     opener_state: dict[str, bool] = {"dispatched": False}
+    # ── Identity-gate state (16b, #42) — Layer A, the code-enforced wall ─
+    # The tool handler checks ``verified`` BEFORE executing any gated
+    # tool, independent of what the LLM was told. Inert when Flows is off
+    # (production default): ``verified`` starts True so the guard never
+    # fires and the flag-off path is byte-identical to the pre-gate
+    # pipeline. When Flows is on it starts False, and only the
+    # ``verify_identity`` flow function (Layer B) flips it True after a
+    # deterministic code check against ``case_data``.
+    verification_state: dict[str, bool] = {"verified": not settings.flows_enabled}
+
+    # ── Knowledge prefetch (#56) ──────────────────────────────────────
+    # Off by default. When enabled, every call gets an isolated in-memory cache
+    # and warmer. The live path only reads this cache; slow fixture lookups and
+    # async embedding run in background tasks.
+    knowledge_warmer: PrefetchWarmer | None = None
+    knowledge_context: PrefetchContext | None = None
+    if settings.knowledge_prefetch_enabled:
+        knowledge_warmer = PrefetchWarmer(
+            cache=SemanticCache(
+                ttl_secs=settings.knowledge_cache_ttl_secs,
+                max_entries=settings.knowledge_cache_max_entries,
+            ),
+            knowledge_source=DeidentifiedFixtureKnowledgeSource(),
+            embedding_provider=LocalHashEmbeddingProvider(),
+        )
+        knowledge_context = build_prefetch_context(
+            case_data=case_data,
+            payer_key=settings.payer_id_case_data_key,
+        )
 
     # ── LLMContext seeding (Layer 5 modes) ────────────────────────────
     # Three branches matching the three opener modes. The user-first
@@ -278,6 +485,11 @@ async def run_bot(
     vad_analyzer = SileroVADAnalyzer(
         params=VADParams(stop_secs=_VAD_STOP_SECS, confidence=_VAD_CONFIDENCE),
     )
+    # ``assistant_params`` carries the optional bounded-context summarizer
+    # (#22). It is None unless Settings.context_summarization_enabled is on;
+    # the pair then uses its stock assistant params, so the flag-off path is
+    # byte-identical to before. The user_params (VAD / MinWords / smart-turn)
+    # are the locked-in turn machinery and are unchanged.
     aggregator_pair = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
@@ -291,6 +503,7 @@ async def run_bot(
                 stop=[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=smart_turn)],
             ),
         ),
+        assistant_params=_build_assistant_params(settings),
     )
 
     # Wire Layer 7's transcript capture to the aggregator's canonical
@@ -299,6 +512,13 @@ async def run_bot(
     # flag — propagates to ``TranscriptTurn.interrupted`` so analysts
     # can see which assistant turns were cut off by user barge-in.
     wire_transcript_handlers(aggregator_pair, accumulator)
+    if knowledge_warmer is not None:
+        wire_knowledge_prefetch_handler(
+            aggregator_pair=aggregator_pair,
+            warmer=knowledge_warmer,
+            case_data=case_data,
+            payer_key=settings.payer_id_case_data_key,
+        )
 
     # ── Pipeline assembly ─────────────────────────────────────────────
     pipeline = Pipeline(
@@ -329,7 +549,7 @@ async def run_bot(
             enable_metrics=True,
             enable_usage_metrics=True,
         ),
-        observers=[error_observer],
+        observers=[error_observer, metrics_observer],
         idle_timeout_secs=idle_timeout,
     )
 
@@ -338,71 +558,114 @@ async def run_bot(
     # closure captures all per-call dependencies. Tool-turn
     # accumulation lives here (Layer 7) — synchronous with execution,
     # not via observer. Never raises out of the closure.
+    async def run_tool_to_payload(
+        tool_name: str, arguments: dict[str, Any]
+    ) -> tuple[dict[str, Any], bool]:
+        """Execute one tool, record its turn, return ``(payload, run_llm)``.
+
+        The execution core shared by the Pipecat tool handler below and
+        the Flows verified-node tool functions (so there is one source of
+        truth for execution + transcript capture). Never raises.
+        """
+        from app.tools.context import ToolContext
+
+        ctx = ToolContext(
+            call_id=call_id,
+            session_id=session_id,
+            sip_session_id=sip_session_tracker["session_id"],
+            transport=transport,
+            queue_frame=task.queue_frame,
+            tool_settings=registry.get_settings(tool_name),
+            otel_context=root_ctx,
+        )
+
+        try:
+            result = await executor.execute(tool_name, dict(arguments), ctx)
+        except Exception as exc:  # noqa: BLE001 — synthesize a failure
+            logger.error(
+                "tool_handler_unexpected_error",
+                tool=tool_name,
+                error=str(exc)[:500],
+                error_type=type(exc).__name__,
+            )
+            result = ToolResult(
+                status=ToolStatus.ERROR,
+                error=str(exc)[:500],
+                run_llm=True,
+            )
+
+        # Layer 7's tool-turn capture. Synchronous with execution, all
+        # data already in scope. Best-effort — a transcript append
+        # failure never breaks the call.
+        try:
+            await accumulator.append_tool_turn(
+                tool_name=tool_name,
+                arguments=dict(arguments),
+                status=result.status.value,
+                error=result.error,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "tool_turn_append_failed",
+                tool=tool_name,
+                error=str(exc)[:200],
+            )
+
+        logger.info(
+            "tool_call_completed",
+            tool=tool_name,
+            status=result.status.value,
+            arguments=dict(arguments),
+            error=result.error,
+            run_llm=result.run_llm,
+        )
+
+        if result.status.value == "success":
+            payload = result.data or {"status": "ok"}
+        else:
+            payload = {"error": result.error or "tool failed"}
+        return payload, result.run_llm
+
     def make_tool_handler(tool_name: str):
         async def tool_handler(params: FunctionCallParams) -> None:
-            tool_context = registry.get(tool_name)  # noqa: F841 — sanity
-            from app.tools.context import ToolContext
+            # Layer A — the code-enforced identity gate (16b, #42). Refuse
+            # a gated tool until the caller is verified, BEFORE executing
+            # anything. This is the compliance wall: it holds even if a
+            # non-advertised tool name reaches the handler, because it
+            # depends on ``verification_state``, not on what the LLM was
+            # shown. ``end_call`` is exempt (see _IDENTITY_GATE_EXEMPT_TOOLS).
+            if tool_name not in _IDENTITY_GATE_EXEMPT_TOOLS and not verification_state["verified"]:
+                logger.info("tool_blocked_unverified", tool=tool_name, call_id=call_id)
+                try:
+                    await accumulator.append_tool_turn(
+                        tool_name=tool_name,
+                        arguments=dict(params.arguments),
+                        status="blocked",
+                        error="identity_not_verified",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(
+                        "tool_turn_append_failed",
+                        tool=tool_name,
+                        error=str(exc)[:200],
+                    )
+                # Tell the LLM why, and let it run so it asks the caller
+                # to verify first.
+                await params.result_callback(
+                    {
+                        "error": (
+                            "Caller identity is not verified. Verify the "
+                            "caller's identity before using any tool."
+                        )
+                    },
+                    properties=FunctionCallResultProperties(run_llm=True),
+                )
+                return
 
-            ctx = ToolContext(
-                call_id=call_id,
-                session_id=session_id,
-                sip_session_id=sip_session_tracker["session_id"],
-                transport=transport,
-                queue_frame=task.queue_frame,
-                tool_settings=registry.get_settings(tool_name),
+            payload, run_llm = await run_tool_to_payload(tool_name, dict(params.arguments))
+            await params.result_callback(
+                payload, properties=FunctionCallResultProperties(run_llm=run_llm)
             )
-
-            try:
-                result = await executor.execute(
-                    tool_name,
-                    dict(params.arguments),
-                    ctx,
-                )
-            except Exception as exc:  # noqa: BLE001 — synthesize a failure
-                logger.error(
-                    "tool_handler_unexpected_error",
-                    tool=tool_name,
-                    error=str(exc)[:500],
-                    error_type=type(exc).__name__,
-                )
-                result = ToolResult(
-                    status=ToolStatus.ERROR,
-                    error=str(exc)[:500],
-                    run_llm=True,
-                )
-
-            # Layer 7's tool-turn capture. Synchronous with execution,
-            # all data already in scope. Best-effort — a transcript
-            # append failure never breaks the call.
-            try:
-                await accumulator.append_tool_turn(
-                    tool_name=tool_name,
-                    arguments=dict(params.arguments),
-                    status=result.status.value,
-                    error=result.error,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.error(
-                    "tool_turn_append_failed",
-                    tool=tool_name,
-                    error=str(exc)[:200],
-                )
-
-            logger.info(
-                "tool_call_completed",
-                tool=tool_name,
-                status=result.status.value,
-                arguments=dict(params.arguments),
-                error=result.error,
-                run_llm=result.run_llm,
-            )
-
-            props = FunctionCallResultProperties(run_llm=result.run_llm)
-            if result.status.value == "success":
-                payload = result.data or {"status": "ok"}
-            else:
-                payload = {"error": result.error or "tool failed"}
-            await params.result_callback(payload, properties=props)
 
         return tool_handler
 
@@ -414,6 +677,102 @@ async def run_bot(
             handler=make_tool_handler(tool_name),
             cancel_on_interruption=spec.cancel_on_interruption,
             timeout_secs=spec.timeout_secs,
+        )
+
+    # ── Flows identity gate (EPIC #16, 16b #42) ───────────────────────
+    # Construct the per-call FlowManager wired to the REAL collaborators
+    # (task, llm, aggregator pair, transport). Construction is
+    # side-effect-free: it queues no frames and never touches the
+    # opener-seeded LLMContext.messages above — so with the flag off
+    # (production default) call behavior is byte-identical to the
+    # pre-Flows pipeline. Node initialization (which WOULD mutate context
+    # / trigger generation) happens only behind ``flows_enabled``.
+    #
+    # Behind the flag we initialize the identity-gate flow (Layer B): the
+    # initial node advertises ONLY ``verify_identity`` (the LLM isn't even
+    # shown the real tools until it transitions), and on a successful,
+    # code-checked verification it transitions into the ordered,
+    # un-skippable post-verification step chain (16c) — whose first step
+    # re-advertises the call's real tools and loads the hydrated prompt.
+    # The identity node sets respond_immediately=False so it never races
+    # ``deliver_opener_if_needed``.
+    #
+    # ✅ Production-safe path completed by 16c (#43): the gate node now
+    # carries a PHI-free ``role_message`` (PRE_VERIFICATION_ROLE_MESSAGE)
+    # that REPLACES the hydrated, PHI-bearing system instruction for the
+    # whole pre-verification phase, and the post-verification step chain
+    # restores the hydrated prompt only after a successful code-checked
+    # verification. So the model is never given any ``case_data`` value
+    # before the caller is verified. ``flows_enabled`` stays OFF until this
+    # is validated on staging. See Settings.flows_enabled.
+    flow_manager = build_flow_manager(
+        task=task,
+        llm=llm,
+        context_aggregator=aggregator_pair,
+        transport=transport,
+    )
+
+    if settings.flows_enabled:
+        identity_keys = _parse_identity_keys(settings)
+        if not identity_keys:
+            # Loud, queryable signal: Flows is on but the gate has nothing
+            # to verify against, so it is fail-closed and blocks every
+            # gated tool. Operators MUST set identity_verification_keys.
+            logger.warning(
+                "flows_enabled_without_identity_keys",
+                call_id=call_id,
+                detail=(
+                    "identity_verification_keys is empty; identity gate is "
+                    "fail-closed and will block every gated tool"
+                ),
+            )
+        # ── Verified IVR path (#17) ───────────────────────────────────
+        # Best-effort: fetch the payer's verified claims IVR path and feed
+        # it into the navigate step so the agent follows the map via
+        # press_digit, falling back to listen-and-decide when no path
+        # resolves (no payer key, 404 on the name lookup, empty, error).
+        # Gated inside flows_enabled — the navigate step exists only on
+        # the Flows path — so the production (flag-off) path makes no new
+        # lambda call. ivr_goal (per-agent) is hydrated and wired in as
+        # the navigation goal.
+        ivr_path = ""
+        payer_id = _resolve_payer_id(case_data, settings)
+        if payer_id:
+            ivr_path = await load_payer_ivr_path(payer_id, settings) or ""
+        hydrated_ivr_goal = hydrate_prompt(agent.ivr_goal, case_data)
+        logger.info(
+            "ivr_path_resolved",
+            call_id=call_id,
+            has_payer_id=bool(payer_id),
+            has_ivr_path=bool(ivr_path),
+            has_ivr_goal=bool(hydrated_ivr_goal.strip()),
+        )
+        await flow_manager.initialize(
+            build_identity_gate_flow(
+                case_data=case_data,
+                identity_keys=identity_keys,
+                verification_state=verification_state,
+                # 16c (#43): the verified node is the head of the ordered,
+                # un-skippable post-verification step chain. Its first step
+                # loads the hydrated (PHI-bearing) prompt as role_message;
+                # the gate stays PHI-free via build_identity_gate_flow's
+                # safe_role_message default.
+                verified_node=build_step_chain(
+                    run_tool_core=run_tool_to_payload,
+                    registry=registry,
+                    hydrated_system=hydrated_system,
+                    ivr_path=ivr_path,
+                    ivr_goal=hydrated_ivr_goal,
+                    knowledge_warmer=knowledge_warmer,
+                    knowledge_context=knowledge_context,
+                ),
+            )
+        )
+        logger.info(
+            "flows_identity_gate_initialized",
+            call_id=call_id,
+            node=IDENTITY_GATE_NODE,
+            identity_key_count=len(identity_keys),
         )
 
     # ── Static-opener dispatch (idempotent) ───────────────────────────
@@ -691,13 +1050,20 @@ async def run_bot(
     except Exception as exc:  # noqa: BLE001 — capture for CallRecord.error
         end_status = "failed"
         call_error = str(exc)[:1000]
+        call_error_type = type(exc).__name__
         logger.error(
             "pipeline_run_failed",
             call_id=call_id,
             error=call_error,
-            error_type=type(exc).__name__,
+            error_type=call_error_type,
         )
     finally:
+        if knowledge_warmer is not None:
+            try:
+                await knowledge_warmer.aclose()
+            except Exception:  # noqa: BLE001 — knowledge cleanup is best-effort
+                logger.warning("knowledge_prefetch_cleanup_failed", call_id=call_id)
+
         try:
             await finalize_call(
                 call_id=call_id,
@@ -715,16 +1081,37 @@ async def run_bot(
                 batch_id=batch_id,
                 batch_row_index=batch_row_index,
                 settings=settings,
+                otel_parent_context=root_ctx,
+                usage_accumulator=usage_accumulator,
             )
         except Exception:  # noqa: BLE001 — never let finalize crash run_bot
             logger.exception(
                 "finalize_call_unexpected_error",
                 call_id=call_id,
             )
+
+        # Close the per-call trace span (#13). Fold in the metrics
+        # observer's per-stage timing, then set terminal attributes and
+        # end the span. All best-effort / fail-open — no-op when tracing
+        # is off (call_otel_span is None). PHI-free: counts + status +
+        # error *type* only (never the call_error message text).
+        try:
+            metrics_observer.write_to_span(call_otel_span)
+            duration_secs = max(0, int((datetime.now(UTC) - call_started_at).total_seconds()))
+            end_call_span(
+                call_otel_span,
+                end_status=end_status,
+                duration_secs=duration_secs,
+                transcript_turns=len(accumulator.to_list()),
+                error_type=call_error_type,
+            )
+        except Exception:  # noqa: BLE001 — telemetry never breaks teardown
+            logger.debug("call_span_finalize_failed", call_id=call_id)
+
         structlog.contextvars.unbind_contextvars("call_id", "session_id")
 
 
-async def bot(runner_args: RunnerArguments) -> None:
+async def bot(runner_args: RunnerArguments, settings: Settings | None = None) -> None:
     """Entry point. Builds the per-call transport, calls :func:`run_bot`.
 
     Layer 9 (or :func:`pipecat.runner.run.main` in dev) calls this
@@ -732,8 +1119,20 @@ async def bot(runner_args: RunnerArguments) -> None:
     function returns when the call completes, fails, or is
     cancelled — Layer 9's task tracking observes either the return
     or the :exc:`asyncio.CancelledError`.
+
+    Args:
+        runner_args: Pipecat runner arguments for this call.
+        settings: The process-wide :class:`Settings` built once at
+            boot (``app.main``) and threaded through Layer 9's
+            :class:`~app.runner.manager.PipelineManager`. When
+            ``None`` — the bare ``pipecat.runner.run.main`` dev path,
+            which only passes ``runner_args`` — a ``Settings`` is
+            constructed here as a fallback. Production never hits the
+            fallback: the manager always passes its boot singleton, so
+            no ``Settings`` is reconstructed per call.
     """
-    settings = Settings()  # env-driven, cheap, per-call construction is fine
+    if settings is None:
+        settings = Settings()  # dev-only fallback (pipecat runner entry point)
     body = runner_args.body or {}
 
     transport_params = {
@@ -759,6 +1158,52 @@ async def bot(runner_args: RunnerArguments) -> None:
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────
+
+
+def _parse_required_case_data_keys(settings: Settings) -> list[str]:
+    """Parse ``Settings.required_case_data_keys`` (CSV) into a key list.
+
+    Whitespace is stripped from each entry and empty entries dropped,
+    mirroring Layer 4's ``parse_disabled_tools``. Empty / unset CSV →
+    ``[]`` (the no-op default — no required-field guard). The D2 guard
+    in :func:`run_bot` feeds this to :func:`find_missing_required`.
+    """
+    raw = settings.required_case_data_keys
+    if not raw:
+        return []
+    return [key.strip() for key in raw.split(",") if key.strip()]
+
+
+def _parse_identity_keys(settings: Settings) -> list[str]:
+    """Parse ``Settings.identity_verification_keys`` (CSV) into a key list.
+
+    Mirrors :func:`_parse_required_case_data_keys`. Empty / unset → ``[]``
+    — the fail-closed default: the identity gate (16b, #42) then has
+    nothing to verify the caller against and blocks every gated tool.
+    Whitespace is stripped from each entry and empty entries dropped.
+    """
+    raw = settings.identity_verification_keys
+    if not raw:
+        return []
+    return [key.strip() for key in raw.split(",") if key.strip()]
+
+
+def _resolve_payer_id(case_data: dict[str, Any], settings: Settings) -> str | None:
+    """Resolve the payer identifier for the verified-IVR-path fetch (#17).
+
+    Reads ``Settings.payer_id_case_data_key`` (default ``payer_name``)
+    from the dispatcher-supplied ``case_data``. Returns the stripped
+    value, or ``None`` when the configured key is blank/unset or absent
+    from ``case_data`` (or its value is blank) — in which case the
+    caller skips the fetch and the agent navigates by ear. Inbound calls
+    (``case_data={}``) always resolve to ``None``.
+    """
+    key = settings.payer_id_case_data_key.strip()
+    if not key:
+        return None
+    value = str(case_data.get(key) or "").strip()
+    return value or None
+
 
 _DAILY_API_KEY_ENV = "DAILY_API_KEY"
 

@@ -6,7 +6,7 @@ import re
 from datetime import datetime
 from unittest.mock import patch
 
-from app.hydration.hydrator import hydrate_prompt
+from app.hydration.hydrator import find_missing_required, hydrate_prompt
 
 
 class TestEmptyOrNoneTemplate:
@@ -208,6 +208,76 @@ class TestNoVoiceWrapper:
             out = hydrate_prompt("{{current_time}}", {})
         # Just the timestamp — no v1 wrapper text.
         assert out == "Monday, May 04, 2026 02:22 PM"
+
+
+class TestFindMissingRequired:
+    """D2 (#27): pre-call required-field guard helper.
+
+    A presence check distinct from hydrate_prompt's substitution: a
+    missing/blank required field is flagged so an outbound call is
+    blocked rather than dialed with a blank patient name / claim id.
+    """
+
+    def test_missing_required_key_is_flagged(self):
+        # Required key entirely absent from case_data → flagged.
+        out = find_missing_required(
+            {"Patient_Name": "Jane Doe"},
+            ["Patient_Name", "Claim#"],
+        )
+        assert out == ["Claim#"]
+
+    def test_blank_required_value_is_flagged(self):
+        # Empty string and whitespace-only both count as blank.
+        out = find_missing_required(
+            {"Patient_Name": "", "Claim#": "   "},
+            ["Patient_Name", "Claim#"],
+        )
+        assert out == ["Claim#", "Patient_Name"]
+
+    def test_none_value_is_flagged(self):
+        out = find_missing_required({"Patient_Name": None}, ["Patient_Name"])
+        assert out == ["Patient_Name"]
+
+    def test_complete_case_data_unchanged(self):
+        # Every required key present + non-blank → nothing missing, AND
+        # hydrate_prompt fills them exactly as before (behavior preserved).
+        case_data = {"Patient_Name": "Jane Doe", "Claim#": "ABC123"}
+        assert find_missing_required(case_data, ["Patient_Name", "Claim#"]) == []
+        out = hydrate_prompt("{{Patient_Name}} / {{Claim#}}", case_data)
+        assert out == "Jane Doe / ABC123"
+
+    def test_optional_unfilled_placeholder_still_stripped(self):
+        # A placeholder that is NOT in the required set is irrelevant to
+        # the guard and still strips to empty in hydrate_prompt (today's
+        # behavior, unchanged).
+        case_data = {"Patient_Name": "Jane Doe"}
+        # Optional {{Service_Date}} is not required → guard passes.
+        assert find_missing_required(case_data, ["Patient_Name"]) == []
+        # And hydrate_prompt still strips the unfilled optional one.
+        out = hydrate_prompt("{{Patient_Name}} on {{Service_Date}}", case_data)
+        assert out == "Jane Doe on "
+
+    def test_no_required_keys_is_noop(self):
+        # Empty required set → never flags anything (the default path).
+        assert find_missing_required({}, []) == []
+        assert find_missing_required({"X": ""}, []) == []
+
+    def test_falsy_zero_counts_as_present(self):
+        # Presence != substitution: 0 / False are supplied values, not
+        # missing. (hydrate_prompt strips them to empty; the guard does
+        # not treat them as missing.)
+        assert find_missing_required({"N": 0, "F": False}, ["N", "F"]) == []
+
+    def test_non_string_value_counts_as_present(self):
+        assert find_missing_required({"N": 1024}, ["N"]) == []
+
+    def test_none_case_data_flags_all_required(self):
+        assert find_missing_required(None, ["A", "B"]) == ["A", "B"]
+
+    def test_result_is_sorted_and_deduped(self):
+        # Duplicate required keys collapse; output is sorted.
+        out = find_missing_required({}, ["B", "A", "B", "A"])
+        assert out == ["A", "B"]
 
 
 def test_chris_full_22_placeholders_smoke():

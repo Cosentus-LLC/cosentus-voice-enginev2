@@ -211,6 +211,63 @@ class TestAgentConfigParse:
         assert "recording" not in dumped
 
 
+class TestUnknownFieldLogging:
+    """Log-on-unknown guard (B2 / tech-debt Entry 1).
+
+    We keep ``extra='ignore'`` so valid configs still parse, but a
+    ``mode='before'`` validator on ``_RuntimeConfigModel`` logs a loud
+    ``agent_config_unknown_fields`` warning for any field that is
+    neither modeled nor on the per-model ``_known_extra_fields``
+    allowlist — so contract drift surfaces at parse time instead of a
+    default silently winning mid-call.
+    """
+
+    def _unknown_field_warnings(self, mock_logger) -> list:
+        return [
+            call
+            for call in mock_logger.warning.call_args_list
+            if call.args and call.args[0] == "agent_config_unknown_fields"
+        ]
+
+    def test_unknown_top_level_field_logged_loudly(self, mocker):
+        mock_logger = mocker.patch("app.config.agent_config.logger")
+
+        AgentConfig.model_validate({"name": "agent", "surprise_field": 1})
+
+        warnings = self._unknown_field_warnings(mock_logger)
+        assert len(warnings) == 1
+        assert warnings[0].kwargs["model"] == "AgentConfig"
+        assert "surprise_field" in warnings[0].kwargs["unknown_fields"]
+
+    def test_unknown_nested_field_logged_with_submodel_name(self, mocker):
+        mock_logger = mocker.patch("app.config.agent_config.logger")
+
+        AgentConfig.model_validate(
+            {"name": "agent", "llm": {"model": "claude-haiku-4-5", "frobnicate": True}}
+        )
+
+        warnings = self._unknown_field_warnings(mock_logger)
+        assert len(warnings) == 1
+        assert warnings[0].kwargs["model"] == "LLMConfig"
+        assert warnings[0].kwargs["unknown_fields"] == ["frobnicate"]
+
+    def test_known_extra_fields_not_logged(self, mocker):
+        # The realistic fixture carries every Entry-1 extra
+        # (llm.provider, tts.settings.style, recording, ...). None of
+        # them should produce a drift warning — they're allowlisted.
+        mock_logger = mocker.patch("app.config.agent_config.logger")
+
+        AgentConfig.model_validate(_runtime_config_json())
+
+        assert self._unknown_field_warnings(mock_logger) == []
+
+    def test_known_good_config_still_parses(self):
+        # Acceptance criterion: a currently-valid payload still parses
+        # cleanly — the guard only logs, never raises.
+        cfg = AgentConfig.model_validate(_runtime_config_json())
+        assert cfg.name == "chris-claim-status"
+
+
 class TestAgentConfigSpeakFirst:
     def test_default_is_true_when_field_missing_from_lambda(self):
         # Lambda hasn't deployed the speak_first column yet → field
@@ -261,6 +318,28 @@ class TestLLMConfigDefaults:
             }
         )
         assert cfg.llm.model == "claude-haiku-4-5"
+
+    def test_tts_model_default_is_empty(self):
+        """TTSConfig.model carries no Layer-1 default — the factory's
+        _ELEVENLABS_DEFAULT_MODEL is the single source of truth for the
+        platform TTS-model fallback (eleven_flash_v2_5). An empty value
+        here falls through to that fallback in build_tts, mirroring
+        voice_id. This test makes any reintroduction of a Layer-1
+        default visible (see tech-debt Entry 8 / B4)."""
+        from app.config.agent_config import TTSConfig
+
+        assert TTSConfig().model == ""
+
+    def test_post_call_model_default_is_sonnet(self):
+        """The offline post-call extraction defaults to the STRONGER model
+        (#20). It runs once per call, off the latency-critical live path,
+        so it trades cost/latency for accuracy — the inverse of the live
+        ``LLMConfig.model`` Haiku default. Fires only when the lambda omits
+        ``post_call_analyses.model``; an explicit value still wins. This
+        test makes any future default-flip visible."""
+        from app.config.agent_config import PostCallConfig
+
+        assert PostCallConfig().model == "claude-sonnet-4-6"
 
 
 class TestAgentConfigValidation:
@@ -521,9 +600,7 @@ class TestLambdaClientLazyInit:
         fake_session.client = MagicMock(side_effect=fake_client)
         original_session = agent_config_module.boto3.session.Session
         try:
-            agent_config_module.boto3.session.Session = MagicMock(
-                return_value=fake_session
-            )
+            agent_config_module.boto3.session.Session = MagicMock(return_value=fake_session)
             agent_config_module._get_lambda_client(settings)
         finally:
             agent_config_module.boto3.session.Session = original_session
@@ -550,9 +627,7 @@ class TestLambdaClientLazyInit:
         fake_session.client = MagicMock(side_effect=fake_client)
         original_session = agent_config_module.boto3.session.Session
         try:
-            agent_config_module.boto3.session.Session = MagicMock(
-                return_value=fake_session
-            )
+            agent_config_module.boto3.session.Session = MagicMock(return_value=fake_session)
             agent_config_module._get_lambda_client(None)
         finally:
             agent_config_module.boto3.session.Session = original_session
@@ -584,9 +659,7 @@ class TestLambdaClientLazyInit:
         )
 
         try:
-            agent_config_module.boto3.session.Session = MagicMock(
-                return_value=fake_session
-            )
+            agent_config_module.boto3.session.Session = MagicMock(return_value=fake_session)
             client_a = agent_config_module._get_lambda_client(settings)
             client_b = agent_config_module._get_lambda_client(settings)
         finally:
