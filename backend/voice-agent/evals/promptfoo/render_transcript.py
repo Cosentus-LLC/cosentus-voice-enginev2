@@ -3,9 +3,22 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+# PromptFoo's Python provider loads this module via importlib's ``exec_module``
+# WITHOUT registering it in ``sys.modules``. Combined with
+# ``from __future__ import annotations`` (every annotation is a string), the
+# ``@dataclass`` below makes the stdlib resolve annotations via
+# ``sys.modules.get(cls.__module__).__dict__`` — which is ``None`` under that
+# loader and raises ``AttributeError: 'NoneType' object has no attribute
+# '__dict__'``. Register a stand-in so the lookup succeeds. When imported
+# normally (e.g. pytest) ``__name__`` is already present and this is a no-op.
+if __name__ not in sys.modules:  # pragma: no cover - only under PromptFoo's loader
+    sys.modules[__name__] = types.ModuleType(__name__)
 
 _CASES_DIR = Path(__file__).resolve().parent / "cases"
 _REQUIRED_SCORING_DIMENSIONS = (
