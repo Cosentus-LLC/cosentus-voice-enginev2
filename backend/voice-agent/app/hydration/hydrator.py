@@ -26,7 +26,7 @@ rather than leaking literal ``{{name}}`` syntax to the LLM.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from datetime import datetime
 from typing import Any
 
@@ -39,6 +39,65 @@ _PLACEHOLDER_RE = re.compile(r"\{\{[^{}\s]*\}\}")
 
 # Format mirrors v1: "Wednesday, March 25, 2026 04:30 PM".
 _CURRENT_TIME_FORMAT = "%A, %B %d, %Y %I:%M %p"
+
+
+class MissingRequiredCaseDataError(ValueError):
+    """A required ``case_data`` field is missing/blank before a live call (D2).
+
+    Raised by the pre-call guard (``app.bot.bot.run_bot``) when an
+    OUTBOUND call's ``case_data`` is missing one or more keys an
+    operator has declared required (``Settings.required_case_data_keys``).
+    The call is blocked rather than dialed with a blank patient name /
+    claim id.
+
+    Subclasses :class:`ValueError` so it sits alongside ``run_bot``'s
+    existing pre-flight ``ValueError`` (missing ``agent_id``) — any
+    caller already catching ``ValueError`` keeps catching this. The
+    message lists the offending **key names** (never values, which
+    would be PHI).
+    """
+
+
+def find_missing_required(
+    case_data: Mapping[str, Any] | None,
+    required_keys: Iterable[str],
+) -> list[str]:
+    """Return the required keys that are absent or blank in ``case_data``.
+
+    A key counts as missing when it is not present in ``case_data``,
+    its value is ``None``, or ``str(value).strip()`` is empty
+    (whitespace-only counts as blank). The result is sorted and
+    de-duplicated so callers get a deterministic list for logging and
+    tests.
+
+    Note — this is a *presence* check, deliberately distinct from
+    :func:`hydrate_prompt`'s *substitution* semantics. ``hydrate_prompt``
+    strips any falsy value (``0``, ``False``) to empty when filling a
+    template; here ``0`` / ``False`` count as **present** (``str(0)``
+    is ``"0"``, not blank). A genuinely-supplied numeric/boolean field
+    is not a missing field — and no real required field (patient name,
+    claim id) is ever ``0``.
+
+    Args:
+        case_data: Mapping of placeholder name → value. ``None`` is
+            treated as ``{}`` (so every required key is flagged).
+        required_keys: The keys that must be present and non-blank.
+            Empty / no keys → always returns ``[]`` (the no-op case).
+
+    Returns:
+        Sorted, de-duplicated list of missing/blank required keys.
+        Empty list means every required key is satisfied.
+    """
+    data = case_data or {}
+    missing: set[str] = set()
+    for key in required_keys:
+        if key not in data:
+            missing.add(key)
+            continue
+        value = data[key]
+        if value is None or str(value).strip() == "":
+            missing.add(key)
+    return sorted(missing)
 
 
 def hydrate_prompt(

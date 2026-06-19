@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import structlog
 
@@ -44,7 +44,7 @@ REPLACEMENT_DEADLINE_SECS = 300  # we expect ~60s in practice
 
 
 async def run(paths: config.RunPaths) -> scenario_base.ScenarioResult:
-    started_dt = datetime.now(timezone.utc)
+    started_dt = datetime.now(UTC)
     started_ts = scenario_base.now_iso()
     started_perf = time.perf_counter()
 
@@ -62,7 +62,9 @@ async def run(paths: config.RunPaths) -> scenario_base.ScenarioResult:
 
     async with HttpCaller() as caller:
         # Phase 1: 2 minute warm-up.
-        warmup_task = asyncio.create_task(_fire_steady(caller, warmup_batch, CALLS_PER_SEC, WARMUP_SECS))
+        warmup_task = asyncio.create_task(
+            _fire_steady(caller, warmup_batch, CALLS_PER_SEC, WARMUP_SECS)
+        )
         await warmup_task
 
         # Phase 2: stop one task.
@@ -96,7 +98,7 @@ async def run(paths: config.RunPaths) -> scenario_base.ScenarioResult:
 
     await asyncio.sleep(60)
     post_state = await ecs.describe_service()
-    ended_dt = datetime.now(timezone.utc)
+    ended_dt = datetime.now(UTC)
     ended_ts = scenario_base.now_iso()
     duration_secs = round(time.perf_counter() - started_perf, 1)
 
@@ -161,7 +163,11 @@ async def run(paths: config.RunPaths) -> scenario_base.ScenarioResult:
         checks=checks,
     )
     result.write(paths.scenario_json("c"))
-    logger.info("scenario_c_complete", status=result.overall_status, time_to_recover=time_to_recover)
+    logger.info(
+        "scenario_c_complete",
+        status=result.overall_status,
+        time_to_recover=time_to_recover,
+    )
     return result
 
 
@@ -218,7 +224,8 @@ def _build_checks(
     else:
         checks.append(
             scenario_base.Check.failed(
-                "warmup_clean", "Warm-up phase saw 5xx/timeouts.",
+                "warmup_clean",
+                "Warm-up phase saw 5xx/timeouts.",
                 observed=warmup.other_counts,
             )
         )

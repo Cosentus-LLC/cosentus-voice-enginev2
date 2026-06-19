@@ -36,13 +36,13 @@ import asyncio
 import json
 import os
 import time
-from typing import Any
+from typing import Any, ClassVar
 
 import boto3
 import structlog
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from app.config.settings import Settings
 
@@ -66,19 +66,89 @@ class AgentConfigLoadError(Exception):
 # agent provider/recording fields the v1 engine ignored anyway). See
 # docs/v2-tech-debt-log.md entry 1 for the full list and the exit
 # condition that lets us tighten this back to ``extra='forbid'``.
+#
+# Until Entry 1 closes (the lambda still ships those fields), we keep
+# ``extra='ignore'`` so valid configs parse, but every model inherits
+# :class:`_RuntimeConfigModel` which logs a **loud warning** for any
+# field that is neither modeled nor on that model's
+# ``_known_extra_fields`` allowlist. That turns silent contract drift
+# — a renamed/added field the lambda starts sending — into a
+# queryable ``agent_config_unknown_fields`` log line at parse time,
+# instead of a default silently winning mid-call (the B2 failure
+# mode). The known v1-era extras stay silent via the allowlist so we
+# don't warn on every valid call.
 
 
-class LLMConfig(BaseModel):
+class _RuntimeConfigModel(BaseModel):
+    """Base for the runtime-config models: log-on-unknown-field guard.
+
+    Keeps ``extra='ignore'`` (subclasses may extend ``model_config``,
+    e.g. ``populate_by_name=True``; Pydantic merges it across
+    inheritance) so a currently-valid payload still parses. A
+    ``mode='before'`` validator inspects the raw incoming dict and
+    emits a ``logger.warning('agent_config_unknown_fields', ...)`` for
+    any key that is neither a modeled field/alias nor in this model's
+    ``_known_extra_fields``. The call still proceeds — the unknown
+    field is dropped as before — but the drift is now visible.
+
+    ``_known_extra_fields`` is the per-subclass allowlist of fields the
+    lambda is KNOWN to send but v2 deliberately doesn't model
+    (docs/v2-tech-debt-log.md Entry 1). Drop entries as the lambda
+    stops sending them; when every subclass's allowlist is empty and
+    Entry 1 closes, we can flip to ``extra='forbid'`` (tracked as a
+    follow-up to Entry 1 / B2).
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    _known_extra_fields: ClassVar[frozenset[str]] = frozenset()
+
+    @classmethod
+    def _allowed_field_names(cls) -> set[str]:
+        """Modeled field names plus their wire aliases.
+
+        Aliases (``_meta``, ``version``) must be included because the
+        ``mode='before'`` validator sees the raw dict before Pydantic
+        resolves aliases to attribute names.
+        """
+        names: set[str] = set()
+        for name, info in cls.model_fields.items():
+            names.add(name)
+            if info.alias:
+                names.add(info.alias)
+        return names
+
+    @model_validator(mode="before")
+    @classmethod
+    def _warn_on_unknown_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            allowed = cls._allowed_field_names()
+            unknown = sorted(
+                key for key in data if key not in allowed and key not in cls._known_extra_fields
+            )
+            if unknown:
+                logger.warning(
+                    "agent_config_unknown_fields",
+                    model=cls.__name__,
+                    unknown_fields=unknown,
+                )
+        return data
+
+
+class LLMConfig(_RuntimeConfigModel):
     """LLM-side per-agent config.
 
     NOTE: ``provider`` and ``enable_prompt_caching`` are intentionally
     not modeled. v2 uses Bedrock Claude for every agent, and prompt
     caching is hardcoded ON in the LLM service factory (Layer 3) —
     no production agent ever needs caching off, so the per-agent
-    toggle is dead. See docs/v2-tech-debt-log.md entry 1.
+    toggle is dead. Both are allowlisted in ``_known_extra_fields`` so
+    they're dropped silently; any *other* unknown field is logged. See
+    docs/v2-tech-debt-log.md entry 1.
     """
 
     model_config = ConfigDict(extra="ignore")
+    _known_extra_fields = frozenset({"provider", "enable_prompt_caching"})
 
     # Default Claude Haiku 4.5 for voice workloads (short turns, bounded
     # reasoning, tool-call-driven flows). Sonnet 4.6 is ~3x more
@@ -91,49 +161,60 @@ class LLMConfig(BaseModel):
     temperature: float = 0.7
 
 
-class TTSSettings(BaseModel):
+class TTSSettings(_RuntimeConfigModel):
     """ElevenLabs voice-tuning settings.
 
     Only ``stability`` and ``use_speaker_boost`` are modeled in v2.
     The lambda still sends ``similarity_boost``, ``style``, and
     ``speed``, but Cosentus's production fleet uses ElevenLabs
-    defaults for those three. They're dropped by ``extra='ignore'``.
+    defaults for those three. They're allowlisted in
+    ``_known_extra_fields`` so they're dropped silently by
+    ``extra='ignore'`` without a drift warning.
     """
 
     model_config = ConfigDict(extra="ignore")
+    _known_extra_fields = frozenset({"similarity_boost", "style", "speed"})
 
     stability: float | None = None
     use_speaker_boost: bool | None = None
 
 
-class TTSConfig(BaseModel):
+class TTSConfig(_RuntimeConfigModel):
     """ElevenLabs-side per-agent config.
 
-    NOTE: ``provider`` is intentionally not modeled. v2 uses
-    ElevenLabs for every agent.
+    NOTE: ``provider`` is intentionally not modeled (allowlisted in
+    ``_known_extra_fields``). v2 uses ElevenLabs for every agent.
     """
 
     model_config = ConfigDict(extra="ignore")
+    _known_extra_fields = frozenset({"provider"})
 
     voice_id: str = ""
-    model: str = "eleven_turbo_v2_5"
+    # No Layer-1 default: the factory's _ELEVENLABS_DEFAULT_MODEL is the
+    # single source of truth for the platform fallback (production value
+    # eleven_flash_v2_5), mirroring voice_id above. An empty value here
+    # falls through to that fallback in build_tts. Real agents always send
+    # tts.model, so this only governs the omitted-field path.
+    model: str = ""
     settings: TTSSettings = Field(default_factory=TTSSettings)
 
 
-class STTConfig(BaseModel):
+class STTConfig(_RuntimeConfigModel):
     """STT-side per-agent config.
 
     Only ``keywords`` is per-agent in v2. ``provider`` (always
     AssemblyAI) and ``language`` (always English) are platform-wide
-    and dropped by ``extra='ignore'``.
+    and allowlisted in ``_known_extra_fields`` so they're dropped
+    silently by ``extra='ignore'``.
     """
 
     model_config = ConfigDict(extra="ignore")
+    _known_extra_fields = frozenset({"provider", "language"})
 
     keywords: list[str] = Field(default_factory=list)
 
 
-class ToolConfig(BaseModel):
+class ToolConfig(_RuntimeConfigModel):
     """One row in the agent's enabled-tools list."""
 
     model_config = ConfigDict(extra="ignore")
@@ -143,7 +224,7 @@ class ToolConfig(BaseModel):
     settings: dict[str, Any] = Field(default_factory=dict)
 
 
-class PostCallField(BaseModel):
+class PostCallField(_RuntimeConfigModel):
     """One field in the per-agent post-call analysis schema."""
 
     model_config = ConfigDict(extra="ignore")
@@ -155,16 +236,25 @@ class PostCallField(BaseModel):
     choices: list[str] = Field(default_factory=list)
 
 
-class PostCallConfig(BaseModel):
+class PostCallConfig(_RuntimeConfigModel):
     """Per-agent post-call analysis schema."""
 
     model_config = ConfigDict(extra="ignore")
 
-    model: str = "claude-haiku-4-5-20251001"
+    # Default to the stronger model for the once-per-call OFFLINE
+    # extraction (#20 — per-turn model routing). Post-call analysis is
+    # structurally separate from the live pipeline, runs after the call
+    # ends, and trades latency/cost for accuracy — so it defaults to
+    # Sonnet, the inverse of the live LLMConfig.model default (Haiku).
+    # This is engine fallback policy for the *omitted-field* path; the
+    # runtime-config shape is unchanged and an explicit per-agent
+    # ``post_call_analyses.model`` still wins (resolved in
+    # ``run_post_call_analyses`` as ``pca_config.model or default``).
+    model: str = "claude-sonnet-4-6"
     fields: list[PostCallField] = Field(default_factory=list)
 
 
-class AgentConfigMeta(BaseModel):
+class AgentConfigMeta(_RuntimeConfigModel):
     """Server-provided metadata for observability.
 
     The lambda sends ``_meta`` underscore-prefixed on the wire (the
@@ -187,7 +277,7 @@ class AgentConfigMeta(BaseModel):
     updated_at_ms: int = Field(default=0, alias="version")
 
 
-class AgentConfig(BaseModel):
+class AgentConfig(_RuntimeConfigModel):
     """Top-level per-agent runtime config.
 
     Mirrors the lambda's ``GET /api/agents/:id/runtime-config``
@@ -196,12 +286,16 @@ class AgentConfig(BaseModel):
 
     ``extra='ignore'`` lets v2 silently drop fields the lambda sends
     but v2 doesn't model — without this we would hard-fail every
-    call on the v1-era fields the lambda still emits.
+    call on the v1-era fields the lambda still emits. The whole
+    ``recording`` object is the one such top-level field today, so
+    it's allowlisted in ``_known_extra_fields``; any other unmodeled
+    top-level key is logged by the ``_RuntimeConfigModel`` guard.
     ``populate_by_name=True`` lets the ``meta`` field accept either
     the wire alias ``_meta`` or the Python attribute name.
     """
 
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
+    _known_extra_fields = frozenset({"recording"})
 
     name: str
     display_name: str = ""
@@ -389,9 +483,7 @@ async def load_agent_config(
     payload = _build_proxy_event(agent_id_or_name)
 
     try:
-        resp = await asyncio.to_thread(
-            _invoke_lambda_sync, function_name, payload, settings
-        )
+        resp = await asyncio.to_thread(_invoke_lambda_sync, function_name, payload, settings)
     except (BotoCoreError, ClientError) as exc:
         load_time_ms = (time.perf_counter() - started) * 1000
         logger.error(

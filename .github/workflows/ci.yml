@@ -1,0 +1,50 @@
+name: CI
+
+# Runs the full local gate on every PR + every push to main:
+#   uv run ruff check .  ·  uv run ruff format --check .  ·  uv run pytest (full suite)
+# This is the required check for merging to main. Branch protection
+# (require this check + >=1 review) is a repo-admin GitHub setting, not
+# code — a human admin enables it in Settings -> Branches.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # uv provisions Python 3.12 — Pipecat 1.1.0 imports audioop, removed
+      # in 3.13+. --locked asserts uv.lock is consistent with pyproject.toml
+      # (fails on drift) and installs the exact locked versions the
+      # Dockerfile ships. CI's job is verification, so --locked, not --frozen.
+      - name: Install dependencies
+        run: uv sync --extra dev --locked --python 3.12
+
+      - name: ruff check
+        run: uv run ruff check .
+
+      - name: ruff format --check
+        run: uv run ruff format --check .
+
+      - name: pytest (full suite)
+        run: uv run pytest

@@ -54,6 +54,11 @@ class ToolContext:
         message_history: Recent conversation turns. Currently unused
             by v2's three tools; kept available for future
             deterministic responses that want context.
+        otel_context: The per-call ``voice.call`` root span's OpenTelemetry
+            ``Context`` (#13). Layer 8 captures it once per call and passes
+            it here so :class:`~app.tools.executor.ToolExecutor` parents each
+            ``voice.tool`` span under the call root. Typed ``Any`` to keep
+            OpenTelemetry symbols out of Layer 4; ``None`` when tracing is off.
     """
 
     call_id: str
@@ -63,6 +68,7 @@ class ToolContext:
     queue_frame: QueueFrameFn | None = None
     tool_settings: dict[str, Any] = field(default_factory=dict)
     message_history: list[dict[str, Any]] = field(default_factory=list)
+    otel_context: Any = None
 
 
 __all__ = ["FrameDirection", "QueueFrameFn", "ToolContext"]

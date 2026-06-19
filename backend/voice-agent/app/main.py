@@ -36,6 +36,7 @@ import structlog
 from aiohttp import web
 
 from app.config.settings import Settings
+from app.observability import init_tracing, shutdown_tracing
 from app.runner import (
     DailyRoomClient,
     MetricsEmitter,
@@ -78,6 +79,12 @@ async def amain() -> None:
         max_concurrent_calls=settings.max_concurrent_calls,
         service_port=settings.service_port,
     )
+
+    # Per-call tracing (#13). Fail-open: a False return (disabled / SDK
+    # missing / setup error) leaves every span helper a no-op and calls
+    # run identically. Initialized once here at boot.
+    tracing_enabled = init_tracing(settings)
+    logger.info("tracing_initialized", enabled=tracing_enabled)
 
     # ── Layer 9 components ────────────────────────────────────────
     protection = TaskProtection()
@@ -123,6 +130,9 @@ async def amain() -> None:
         await graceful_drain(manager, protection, metrics=metrics)
         await metrics.stop()
         await daily_client.close()
+        # Flush any buffered spans before exit (fail-open no-op when
+        # tracing is disabled). Last, so in-flight call spans are drained.
+        shutdown_tracing()
         shutdown_event.set()
 
     def _signal_handler(sig_name: str) -> None:

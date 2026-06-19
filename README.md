@@ -16,8 +16,8 @@ Postgres; recordings land in S3 with SSE-KMS.
 - **API** — A separate Lambda exposes CRUD over agents, batches, calls.
   Not in this repo.
 - **Engine** — *This repo.* The Pipecat pipeline that runs each call,
-  the HTTP entrypoint Fargate exposes, the bot-runner Lambda that
-  bridges Daily webhooks into Fargate, and the CDK that ships it all.
+  the HTTP entrypoint Fargate exposes behind an internet-facing ALB
+  (which Daily's webhooks hit directly), and the CDK that ships it all.
 - **Telephony** — Daily.co provides PSTN, SIP, recording, and the
   WebRTC transport into Pipecat.
 
@@ -34,12 +34,12 @@ For the layer-by-layer rebuild plan see [`docs/architecture/migration-from-v1.md
 
 ## Dev setup
 
-See `SETUP.md` (not yet written). Quick orientation:
+See [`SETUP.md`](SETUP.md). Quick orientation:
 
 - Python: ≥ 3.11 minimum, **3.12 recommended** (matches Pipecat's own
   guidance).
 - Package manager: **[uv](https://docs.astral.sh/uv/)** is the
   primary path — Pipecat's docs and CLI now recommend it for speed
   and lockfile semantics. `pip` still works as a fallback.
-- Once Layer 1 lands and the package is wired, install with:
-  `uv pip install -e ".[dev]"` (or `pip install -e ".[dev]"`).
+- Install with `uv sync --extra dev --python 3.12` (the full gate
+  lives in `SETUP.md`).

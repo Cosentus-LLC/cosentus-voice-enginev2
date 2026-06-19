@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import structlog
 
@@ -57,7 +57,7 @@ _TOTAL_DURATION_SECS = _PHASE_DURATION_SECS * len(_PHASES_CPM)  # 1800
 
 
 async def run(paths: config.RunPaths) -> scenario_base.ScenarioResult:
-    started_dt = datetime.now(timezone.utc)
+    started_dt = datetime.now(UTC)
     started_ts = scenario_base.now_iso()
     started_perf = time.perf_counter()
 
@@ -76,7 +76,7 @@ async def run(paths: config.RunPaths) -> scenario_base.ScenarioResult:
 
     await asyncio.sleep(120)  # let CloudWatch ingest the tail
     post_state = await ecs.describe_service()
-    ended_dt = datetime.now(timezone.utc)
+    ended_dt = datetime.now(UTC)
     ended_ts = scenario_base.now_iso()
     duration_secs = round(time.perf_counter() - started_perf, 1)
 
@@ -263,7 +263,10 @@ def _build_checks(
                 "DrainTimeouts fired during a non-shutdown scenario.",
                 observed=drain_timeouts.sum_,
                 expected="0",
-                note="Either an engine task crashed and drained slowly, or the alarm metric is misbehaving.",
+                note=(
+                    "Either an engine task crashed and drained slowly, or the alarm metric "
+                    "is misbehaving."
+                ),
             )
         )
 
@@ -319,14 +322,20 @@ def _build_checks(
             scenario_base.Check.inconclusive(
                 "autoscaler_added_task",
                 "Average per-task sessions hit the target but no scale-out within window.",
-                observed=f"avg max={sessions_avg.maximum}, target={config.SCALE_TARGET_SESSIONS_PER_TASK}",
+                observed=(
+                    f"avg max={sessions_avg.maximum}, "
+                    f"target={config.SCALE_TARGET_SESSIONS_PER_TASK}"
+                ),
             )
         )
     else:
         checks.append(
             scenario_base.Check.inconclusive(
                 "autoscaler_added_task",
-                "Concurrent average stayed below scale target; expected at 100 cpm × 1.7s lifetime.",
+                (
+                    "Concurrent average stayed below scale target; expected at 100 cpm × "
+                    "1.7s lifetime."
+                ),
                 observed=sessions_avg.maximum,
                 expected=f">= {config.SCALE_TARGET_SESSIONS_PER_TASK}",
                 note="Scenario B's sustained 3 cps phase is the proper autoscale-out test.",

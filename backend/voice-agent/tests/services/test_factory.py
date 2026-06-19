@@ -32,25 +32,36 @@ from pipecat.transcriptions.language import Language
 # ── Fixtures ────────────────────────────────────────────────────────────────
 
 
-@pytest.fixture
-def assemblyai_env(monkeypatch: pytest.MonkeyPatch) -> str:
-    monkeypatch.setenv("ASSEMBLYAI_API_KEY", "test-aa-key")
-    return "test-aa-key"
+def _settings(**overrides) -> Settings:
+    """Build a Layer 2 Settings without touching the process env.
+
+    ``_env_file=None`` keeps a developer's local ``.env`` out of the
+    test; required fields and any vendor keys are passed explicitly.
+    """
+    base = {
+        "voice_api_lambda_name": "test-lambda",
+        "api_key_secret_arn": "arn:test",
+    }
+    base.update(overrides)
+    return Settings(_env_file=None, **base)
 
 
 @pytest.fixture
-def elevenlabs_env(monkeypatch: pytest.MonkeyPatch) -> str:
-    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-el-key")
-    return "test-el-key"
+def assemblyai_settings() -> Settings:
+    """Settings carrying a known AssemblyAI key (Layer 2 secret source)."""
+    return _settings(assemblyai_api_key="test-aa-key")
 
 
 @pytest.fixture
-def settings_fixture(monkeypatch: pytest.MonkeyPatch) -> Settings:
+def elevenlabs_settings() -> Settings:
+    """Settings carrying a known ElevenLabs key (Layer 2 secret source)."""
+    return _settings(elevenlabs_api_key="test-el-key")
+
+
+@pytest.fixture
+def settings_fixture() -> Settings:
     """Layer 2 Settings instance with a known region."""
-    monkeypatch.setenv("VOICE_API_LAMBDA_NAME", "test-lambda")
-    monkeypatch.setenv("API_KEY_SECRET_ARN", "arn:test")
-    monkeypatch.setenv("AWS_REGION", "us-west-2")
-    return Settings(_env_file=None)
+    return _settings(aws_region="us-west-2")
 
 
 def _agent(
@@ -77,7 +88,7 @@ def _agent(
         ),
         tts=TTSConfig(
             voice_id=tts_voice_id,
-            model=tts_model or "eleven_turbo_v2_5",
+            model=tts_model,
             settings=TTSSettings(
                 stability=tts_stability,
                 use_speaker_boost=tts_use_speaker_boost,
@@ -175,18 +186,18 @@ class TestResolveBedrockModelId:
 
 class TestBuildStt:
     def test_returns_assemblyai_service_with_locked_in_constructor_args(
-        self, mocker, assemblyai_env: str
+        self, mocker, assemblyai_settings: Settings
     ):
         mock_cls = mocker.patch("app.services.factory.AssemblyAISTTService")
 
         agent = _agent()
-        result = build_stt(agent)
+        result = build_stt(agent, assemblyai_settings)
 
         assert result is mock_cls.return_value
         mock_cls.assert_called_once()
 
         kwargs = mock_cls.call_args.kwargs
-        assert kwargs["api_key"] == assemblyai_env
+        assert kwargs["api_key"] == "test-aa-key"
         assert kwargs["sample_rate"] == _STT_SAMPLE_RATE == 8000
         assert kwargs["encoding"] == _STT_ENCODING == "pcm_s16le"
         assert kwargs["vad_force_turn_endpoint"] is _STT_VAD_FORCE_TURN_ENDPOINT is False
@@ -194,20 +205,24 @@ class TestBuildStt:
         # settings was constructed via the patched Settings inner class
         assert kwargs["settings"] is mock_cls.Settings.return_value
 
-    def test_settings_has_locked_in_model_language_and_threshold(self, mocker, assemblyai_env: str):
+    def test_settings_has_locked_in_model_language_and_threshold(
+        self, mocker, assemblyai_settings: Settings
+    ):
         mock_cls = mocker.patch("app.services.factory.AssemblyAISTTService")
 
-        build_stt(_agent())
+        build_stt(_agent(), assemblyai_settings)
 
         settings_kwargs = mock_cls.Settings.call_args.kwargs
         assert settings_kwargs["model"] == _STT_MODEL == "u3-rt-pro"
         assert settings_kwargs["language"] == Language.EN
         assert settings_kwargs["vad_threshold"] == _STT_VAD_THRESHOLD == 0.3
 
-    def test_settings_has_keyterms_prompt_when_keywords_set(self, mocker, assemblyai_env: str):
+    def test_settings_has_keyterms_prompt_when_keywords_set(
+        self, mocker, assemblyai_settings: Settings
+    ):
         mock_cls = mocker.patch("app.services.factory.AssemblyAISTTService")
 
-        build_stt(_agent(stt_keywords=["claim", "patient", "deductible"]))
+        build_stt(_agent(stt_keywords=["claim", "patient", "deductible"]), assemblyai_settings)
 
         settings_kwargs = mock_cls.Settings.call_args.kwargs
         assert settings_kwargs["keyterms_prompt"] == [
@@ -216,109 +231,131 @@ class TestBuildStt:
             "deductible",
         ]
 
-    def test_settings_omits_keyterms_prompt_when_keywords_empty(self, mocker, assemblyai_env: str):
+    def test_settings_omits_keyterms_prompt_when_keywords_empty(
+        self, mocker, assemblyai_settings: Settings
+    ):
         # Pipecat's _NotGiven sentinel means "field unset" → vendor
         # default. Passing keyterms_prompt=[] would override that
         # with a literal empty list. Don't.
         mock_cls = mocker.patch("app.services.factory.AssemblyAISTTService")
 
-        build_stt(_agent(stt_keywords=[]))
+        build_stt(_agent(stt_keywords=[]), assemblyai_settings)
 
         settings_kwargs = mock_cls.Settings.call_args.kwargs
         assert "keyterms_prompt" not in settings_kwargs
 
-    def test_raises_when_assemblyai_api_key_missing(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.delenv("ASSEMBLYAI_API_KEY", raising=False)
+    def test_reads_key_from_settings_not_env(
+        self, mocker, monkeypatch: pytest.MonkeyPatch, assemblyai_settings: Settings
+    ):
+        # The env var must NOT be consulted — the key comes from the
+        # Settings boundary (F1). Set a decoy env value and assert the
+        # service still gets the Settings value.
+        monkeypatch.setenv("ASSEMBLYAI_API_KEY", "env-decoy-should-be-ignored")
+        mock_cls = mocker.patch("app.services.factory.AssemblyAISTTService")
 
+        build_stt(_agent(), assemblyai_settings)
+
+        assert mock_cls.call_args.kwargs["api_key"] == "test-aa-key"
+
+    def test_raises_when_assemblyai_api_key_missing(self):
+        # Empty key on Settings (the local/dev/test default) → clear
+        # ValueError at the use site, same contract as before.
         with pytest.raises(ValueError, match="ASSEMBLYAI_API_KEY"):
-            build_stt(_agent())
+            build_stt(_agent(), _settings(assemblyai_api_key=""))
 
 
 # ── build_tts ───────────────────────────────────────────────────────────────
 
 
 class TestBuildTts:
-    def test_returns_elevenlabs_service_with_settings(self, mocker, elevenlabs_env: str):
+    def test_returns_elevenlabs_service_with_settings(self, mocker, elevenlabs_settings: Settings):
         mock_cls = mocker.patch("app.services.factory.ElevenLabsTTSService")
 
-        result = build_tts(_agent(tts_voice_id="agent-voice"))
+        result = build_tts(_agent(tts_voice_id="agent-voice"), elevenlabs_settings)
 
         assert result is mock_cls.return_value
         kwargs = mock_cls.call_args.kwargs
-        assert kwargs["api_key"] == elevenlabs_env
+        assert kwargs["api_key"] == "test-el-key"
         assert kwargs["settings"] is mock_cls.Settings.return_value
 
-    def test_voice_falls_through_agent_then_default(self, mocker, elevenlabs_env: str):
+    def test_voice_falls_through_agent_then_default(self, mocker, elevenlabs_settings: Settings):
         mock_cls = mocker.patch("app.services.factory.ElevenLabsTTSService")
 
         # Per-agent voice_id is used.
-        build_tts(_agent(tts_voice_id="agent-voice-id"))
+        build_tts(_agent(tts_voice_id="agent-voice-id"), elevenlabs_settings)
         assert mock_cls.Settings.call_args.kwargs["voice"] == "agent-voice-id"
 
         # Empty per-agent voice_id falls back to the platform default.
         mock_cls.reset_mock()
-        build_tts(_agent(tts_voice_id=""))
+        build_tts(_agent(tts_voice_id=""), elevenlabs_settings)
         assert mock_cls.Settings.call_args.kwargs["voice"] == _ELEVENLABS_DEFAULT_VOICE_ID
         assert _ELEVENLABS_DEFAULT_VOICE_ID == "vW1NxlzqX8WROgpQAghR"
 
-    def test_model_falls_through_agent_then_default(self, mocker, elevenlabs_env: str):
+    def test_model_falls_through_agent_then_default(self, mocker, elevenlabs_settings: Settings):
         mock_cls = mocker.patch("app.services.factory.ElevenLabsTTSService")
 
         # Per-agent model is used.
-        build_tts(_agent(tts_model="eleven_multilingual_v2"))
+        build_tts(_agent(tts_model="eleven_multilingual_v2"), elevenlabs_settings)
         assert mock_cls.Settings.call_args.kwargs["model"] == "eleven_multilingual_v2"
 
         # Empty per-agent model falls back to the platform default.
-        # The AgentConfig default is "eleven_turbo_v2_5"; the factory's
-        # platform default is "eleven_flash_v2_5". Both get covered:
-        # AgentConfig produces "eleven_turbo_v2_5" by default → factory
-        # uses it directly.
+        # TTSConfig.model defaults to "" (single source of truth lives in
+        # the factory), so the omitted/empty path falls through to
+        # _ELEVENLABS_DEFAULT_MODEL == "eleven_flash_v2_5".
         mock_cls.reset_mock()
-        agent = _agent(tts_model="")
-        # _agent(tts_model="") falls through to "eleven_turbo_v2_5" in the
-        # AgentConfig default — exercise that path.
-        agent.tts.model = ""  # Force empty to test the factory's "or default" path.
-        build_tts(agent)
+        build_tts(_agent(tts_model=""), elevenlabs_settings)
         assert (
             mock_cls.Settings.call_args.kwargs["model"]
             == _ELEVENLABS_DEFAULT_MODEL
             == "eleven_flash_v2_5"
         )
 
-    def test_settings_includes_stability_when_set(self, mocker, elevenlabs_env: str):
+    def test_settings_includes_stability_when_set(self, mocker, elevenlabs_settings: Settings):
         mock_cls = mocker.patch("app.services.factory.ElevenLabsTTSService")
 
-        build_tts(_agent(tts_stability=0.7))
+        build_tts(_agent(tts_stability=0.7), elevenlabs_settings)
 
         settings_kwargs = mock_cls.Settings.call_args.kwargs
         assert settings_kwargs["stability"] == 0.7
 
-    def test_settings_includes_use_speaker_boost_when_set(self, mocker, elevenlabs_env: str):
+    def test_settings_includes_use_speaker_boost_when_set(
+        self, mocker, elevenlabs_settings: Settings
+    ):
         mock_cls = mocker.patch("app.services.factory.ElevenLabsTTSService")
 
-        build_tts(_agent(tts_use_speaker_boost=True))
+        build_tts(_agent(tts_use_speaker_boost=True), elevenlabs_settings)
 
         settings_kwargs = mock_cls.Settings.call_args.kwargs
         assert settings_kwargs["use_speaker_boost"] is True
 
-    def test_settings_omits_voice_tuning_when_unset(self, mocker, elevenlabs_env: str):
+    def test_settings_omits_voice_tuning_when_unset(self, mocker, elevenlabs_settings: Settings):
         # None values must NOT be forwarded — Pipecat's _NotGiven
         # sentinel preserves vendor defaults; None would clobber.
         mock_cls = mocker.patch("app.services.factory.ElevenLabsTTSService")
 
         build_tts(
             _agent(tts_stability=None, tts_use_speaker_boost=None),
+            elevenlabs_settings,
         )
 
         settings_kwargs = mock_cls.Settings.call_args.kwargs
         assert "stability" not in settings_kwargs
         assert "use_speaker_boost" not in settings_kwargs
 
-    def test_raises_when_elevenlabs_api_key_missing(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    def test_reads_key_from_settings_not_env(
+        self, mocker, monkeypatch: pytest.MonkeyPatch, elevenlabs_settings: Settings
+    ):
+        # The env var must NOT be consulted — key comes from Settings (F2).
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "env-decoy-should-be-ignored")
+        mock_cls = mocker.patch("app.services.factory.ElevenLabsTTSService")
 
+        build_tts(_agent(), elevenlabs_settings)
+
+        assert mock_cls.call_args.kwargs["api_key"] == "test-el-key"
+
+    def test_raises_when_elevenlabs_api_key_missing(self):
         with pytest.raises(ValueError, match="ELEVENLABS_API_KEY"):
-            build_tts(_agent())
+            build_tts(_agent(), _settings(elevenlabs_api_key=""))
 
 
 # ── build_llm ───────────────────────────────────────────────────────────────

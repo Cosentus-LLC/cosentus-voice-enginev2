@@ -4,10 +4,12 @@
 Usage::
 
     # Single scenario (smallest, validates harness end-to-end):
-    STAGING_API_KEY=<key> uv run python backend/voice-agent/scripts/staging_load_test.py --scenario b
+    STAGING_API_KEY=<key> uv run python \
+      backend/voice-agent/scripts/staging_load_test.py --scenario b
 
     # Sequential run of a → b → c → d (skip e for now):
-    STAGING_API_KEY=<key> uv run python backend/voice-agent/scripts/staging_load_test.py --scenarios a,b,c,d
+    STAGING_API_KEY=<key> uv run python \
+      backend/voice-agent/scripts/staging_load_test.py --scenarios a,b,c,d
 
     # Overnight soak:
     STAGING_API_KEY=<key> nohup uv run python \
@@ -15,7 +17,8 @@ Usage::
       > wave6_results/scenario_e.nohup 2>&1 &
 
     # Full run (everything in order — long):
-    STAGING_API_KEY=<key> uv run python backend/voice-agent/scripts/staging_load_test.py --scenarios all
+    STAGING_API_KEY=<key> uv run python \
+      backend/voice-agent/scripts/staging_load_test.py --scenarios all
 
 Output lands in ``wave6_results/<UTC-timestamp>/`` (gitignored). At the
 end of every invocation the entry point also re-renders
@@ -37,7 +40,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 # Bootstrap so ``from wave6 import ...`` works when the script is run
@@ -47,7 +50,6 @@ if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
 import structlog  # noqa: E402
-
 from wave6 import (  # noqa: E402
     config,
     report,
@@ -58,7 +60,6 @@ from wave6 import (  # noqa: E402
     scenario_e,
 )
 from wave6.scenario_base import ScenarioResult  # noqa: E402
-
 
 logger = structlog.get_logger(__name__)
 
@@ -73,9 +74,7 @@ _SCENARIO_RUNNERS = {
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Wave 6 staging load + concurrency validation."
-    )
+    parser = argparse.ArgumentParser(description="Wave 6 staging load + concurrency validation.")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument(
         "--scenario",
@@ -112,8 +111,7 @@ def resolve_scenarios(args: argparse.Namespace) -> list[str]:
             name = name.strip()
             if name not in _SCENARIO_RUNNERS:
                 raise SystemExit(
-                    f"Unknown scenario '{name}'. Choices: "
-                    f"{sorted(_SCENARIO_RUNNERS.keys())}"
+                    f"Unknown scenario '{name}'. Choices: {sorted(_SCENARIO_RUNNERS.keys())}"
                 )
             out.append(name)
         return out
@@ -123,7 +121,7 @@ def resolve_scenarios(args: argparse.Namespace) -> list[str]:
 def resolve_paths(args: argparse.Namespace) -> config.RunPaths:
     if args.run_dir is not None:
         return config.RunPaths(root=args.run_dir.resolve())
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     return config.fresh_run_dir(timestamp)
 
 
@@ -158,11 +156,16 @@ async def amain(args: argparse.Namespace) -> int:
 
     # Always regenerate the aggregate report at the end (covers partials).
     md_path = report.aggregate(paths)
-    logger.info("wave6_run_complete", run_dir=str(paths.root), report=str(md_path), failures=failures)
+    logger.info(
+        "wave6_run_complete",
+        run_dir=str(paths.root),
+        report=str(md_path),
+        failures=failures,
+    )
 
     print()
     print("=" * 72)
-    print(f"Wave 6 run complete.")
+    print("Wave 6 run complete.")
     print(f"  Run directory : {paths.root}")
     print(f"  Report        : {md_path}")
     print(f"  Scenarios     : {','.join(scenarios)}")

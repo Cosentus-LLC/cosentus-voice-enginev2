@@ -125,6 +125,22 @@ class CallRecord:
     batch_row_index: int | None = None
     """Outbound-only. Index within the parent batch."""
 
+    llm_tokens_in: int = 0
+    """Real Bedrock input (prompt) tokens for the whole call — live
+    pipeline turns + the post-call extraction (#28). Feeds the API's
+    ``voice_call_costs.llm_tokens_in``. Defaults to ``0`` when metrics
+    are unavailable, matching the API's estimate-fallback. **Emit half
+    only:** the API must be taught to consume it (``api-lambda-v2`` #64)
+    before cost capture is end-to-end live."""
+
+    llm_tokens_out: int = 0
+    """Real Bedrock output (completion) tokens for the whole call.
+    Feeds ``voice_call_costs.llm_tokens_out``. See :attr:`llm_tokens_in`."""
+
+    tts_chars: int = 0
+    """Real characters synthesized by TTS for the whole call. Feeds
+    ``voice_call_costs.tts_chars``. See :attr:`llm_tokens_in`."""
+
     def __post_init__(self) -> None:
         if self.status not in _VALID_STATUSES:
             raise ValueError(
@@ -163,6 +179,13 @@ class CallRecord:
             "batch_id": self.batch_id,
             "batch_row_index": self.batch_row_index,
             "session_id": self.session_id,
+            # Real usage for cost capture (#28). The lambda's call-upsert
+            # schema is ``.passthrough()`` so these are accepted today, but
+            # the API still estimates cost — it must add a raw-usage column
+            # + consume these (api #64) for end-to-end capture.
+            "llm_tokens_in": int(self.llm_tokens_in),
+            "llm_tokens_out": int(self.llm_tokens_out),
+            "tts_chars": int(self.tts_chars),
             "updated_at": datetime.now(UTC).isoformat(),
         }
 

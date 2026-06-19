@@ -13,8 +13,8 @@ Five routes, all per-process:
 * ``POST /start`` — outbound or browser call spawn. Auth required.
   ``body.direction`` switches between the two.
 * ``POST /daily-dialin-webhook`` — inbound PSTN call from Daily's
-  SIP gateway. NO auth (Daily-signed; signature verification is
-  TODO once SIP is configured).
+  SIP gateway. Verifies Daily's pinless dial-in HMAC signature
+  before any lookup or call spawn.
 
 :func:`graceful_drain` is the SIGTERM-driven shutdown coroutine.
 Sets the manager's draining flag, polls active sessions for up to
@@ -33,7 +33,11 @@ here.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import hmac
 import json
+import secrets
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -78,6 +82,13 @@ _DRAIN_POLL_SECS = 5
 # CallRecord). 2 s covers normal shutdown; longer would risk
 # Fargate killing us before the drain returns.
 _POST_CANCEL_GRACE_SECS = 2
+
+# Daily pinless dial-in signs the room_creation_api webhook with
+# HMAC-SHA256 over ``timestamp + "." + raw_json_body``.
+_DAILY_DIALIN_TIMESTAMP_HEADER = "X-Pinless-Timestamp"
+_DAILY_DIALIN_SIGNATURE_HEADER = "X-Pinless-Signature"
+_DAILY_DIALIN_SIGNATURE_TOLERANCE_SECS = 300
+_LOCAL_DIALIN_SIGNATURE_BYPASS_ENVS = {"local", "dev", "development", "test"}
 
 
 # ── App factory ────────────────────────────────────────────────────────────
@@ -218,12 +229,7 @@ async def handle_start(request: web.Request) -> web.Response:
 
 
 async def handle_dialin_webhook(request: web.Request) -> web.Response:
-    """Daily dial-in webhook. NO auth (Daily-signed).
-
-    TODO: verify Daily's webhook signature once SIP is configured
-    in production. Until then, the network-layer security
-    (Application Load Balancer source-IP allow-list to Daily's
-    egress range) is the defense.
+    """Daily dial-in webhook. Verifies Daily's pinless HMAC first.
 
     Returns the room URL and session ID Daily expects in its
     documented response shape — Daily's SIP gateway uses this to
@@ -231,10 +237,14 @@ async def handle_dialin_webhook(request: web.Request) -> web.Response:
     """
     manager: PipelineManager = request.app[APP_KEY_MANAGER]
     settings: Settings = request.app[APP_KEY_SETTINGS]
+    raw_body = await request.read()
+
+    if not _verify_daily_dialin_signature(request, raw_body, settings):
+        return web.json_response({"error": "forbidden"}, status=403)
 
     try:
-        body = await request.json()
-    except json.JSONDecodeError:
+        body = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
         return web.json_response({"error": "invalid_json"}, status=400)
 
     from_number = body.get("From", "")
@@ -284,18 +294,110 @@ async def handle_dialin_webhook(request: web.Request) -> web.Response:
 
 
 def _check_api_key(request: web.Request) -> bool:
-    """Constant-time-ish API key check. Returns ``False`` to short-circuit.
+    """Constant-time API key check. Returns ``False`` to short-circuit.
 
     Empty configured key (local dev) means no auth — return ``True``
     so dev environments don't have to set the header. Production
     sets ``api_key_secret_arn``, the resolved secret is non-empty,
-    and the header check fires.
+    and the header check uses ``secrets.compare_digest``.
     """
     expected = request.app.get(APP_KEY_API_KEY, "")
     if not expected:
         return True  # local dev — no auth
     provided = request.headers.get("X-API-Key", "")
-    return provided == expected
+    return secrets.compare_digest(provided, expected)
+
+
+def _verify_daily_dialin_signature(
+    request: web.Request,
+    raw_body: bytes,
+    settings: Settings,
+    *,
+    now: float | None = None,
+) -> bool:
+    """Verify Daily pinless dial-in HMAC before processing a call.
+
+    Daily provides a Base64-encoded ``pinless_dialin.hmac`` secret and
+    sends ``X-Pinless-Timestamp`` plus ``X-Pinless-Signature`` on each
+    room-creation webhook. Local/test environments can omit the secret
+    to keep unsigned development requests working; non-local
+    environments fail closed when the secret is missing.
+    """
+    secret = settings.daily_dialin_webhook_hmac
+    if not secret:
+        environment = settings.environment.lower()
+        if environment in _LOCAL_DIALIN_SIGNATURE_BYPASS_ENVS:
+            logger.warning(
+                "daily_dialin_signature_bypass_local",
+                environment=settings.environment,
+            )
+            return True
+        logger.error(
+            "daily_dialin_signature_secret_missing",
+            environment=settings.environment,
+        )
+        return False
+
+    timestamp = request.headers.get(_DAILY_DIALIN_TIMESTAMP_HEADER, "")
+    provided_signature = request.headers.get(_DAILY_DIALIN_SIGNATURE_HEADER, "")
+    if not timestamp or not provided_signature:
+        logger.warning(
+            "daily_dialin_signature_missing_headers",
+            has_timestamp=bool(timestamp),
+            has_signature=bool(provided_signature),
+        )
+        return False
+
+    if not _daily_dialin_timestamp_within_tolerance(timestamp, now=now):
+        logger.warning("daily_dialin_signature_timestamp_rejected")
+        return False
+
+    expected_signature = _compute_daily_dialin_signature(secret, timestamp, raw_body)
+    if expected_signature is None:
+        logger.error("daily_dialin_signature_secret_invalid")
+        return False
+
+    if not hmac.compare_digest(provided_signature, expected_signature):
+        logger.warning("daily_dialin_signature_mismatch")
+        return False
+
+    return True
+
+
+def _compute_daily_dialin_signature(
+    hmac_secret: str,
+    timestamp: str,
+    raw_body: bytes,
+) -> str | None:
+    """Return Daily's expected Base64 HMAC-SHA256 signature."""
+    try:
+        secret_bytes = base64.b64decode(hmac_secret, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+
+    signed_payload = timestamp.encode("utf-8") + b"." + raw_body
+    digest = hmac.new(secret_bytes, signed_payload, "sha256").digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
+def _daily_dialin_timestamp_within_tolerance(
+    timestamp: str,
+    *,
+    now: float | None = None,
+) -> bool:
+    """Return whether a Daily timestamp is inside the replay window."""
+    try:
+        timestamp_value = float(timestamp.strip())
+    except ValueError:
+        return False
+
+    # Be liberal on input: Daily docs name the header but do not state
+    # seconds vs milliseconds. Support both numeric epoch formats.
+    if timestamp_value > 10_000_000_000:
+        timestamp_value = timestamp_value / 1000
+
+    now_value = time.time() if now is None else now
+    return abs(now_value - timestamp_value) <= _DAILY_DIALIN_SIGNATURE_TOLERANCE_SECS
 
 
 async def _load_api_key(settings: Settings) -> str:
@@ -319,24 +421,31 @@ async def _load_api_key(settings: Settings) -> str:
             client.get_secret_value,
             SecretId=arn,
         )
-    except Exception as exc:  # noqa: BLE001 — log + continue (no-auth dev path)
+    except Exception as exc:  # noqa: BLE001 — fail closed on any secret-load error
         logger.error(
             "api_key_secret_load_failed",
             arn=arn,
             error=str(exc),
             error_type=type(exc).__name__,
         )
-        return ""
+        raise RuntimeError("API key secret load failed") from exc
 
     raw = response.get("SecretString", "") or ""
     # Try JSON first, fall back to raw string.
     try:
         parsed = json.loads(raw)
         if isinstance(parsed, dict):
-            return str(parsed.get("api_key") or parsed.get("apiKey") or "")
+            api_key = str(parsed.get("api_key") or parsed.get("apiKey") or "")
+            if api_key:
+                return api_key
+            logger.error("api_key_secret_empty", arn=arn, secret_format="json")
+            raise RuntimeError("API key secret resolved to an empty value")
     except (ValueError, json.JSONDecodeError):
         pass
-    return raw
+    if raw:
+        return raw
+    logger.error("api_key_secret_empty", arn=arn, secret_format="raw")
+    raise RuntimeError("API key secret resolved to an empty value")
 
 
 # ── Phone-number lookup (inbound agent_id resolution) ────────────────────
@@ -436,7 +545,7 @@ async def graceful_drain(
     protection: TaskProtection,
     *,
     budget_secs: int = DEFAULT_DRAIN_BUDGET_SECS,
-    metrics: "MetricsEmitter | None" = None,
+    metrics: MetricsEmitter | None = None,
 ) -> None:
     """SIGTERM-driven drain. Set draining flag, wait for active calls,
     cancel survivors, release protection.

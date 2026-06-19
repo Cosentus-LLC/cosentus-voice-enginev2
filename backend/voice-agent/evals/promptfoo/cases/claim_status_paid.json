@@ -1,0 +1,101 @@
+{
+  "case_id": "claim-status-paid",
+  "case_type": "regression",
+  "tags": ["claim-status", "paid", "happy-path"],
+  "title": "Claim status call reaches paid outcome",
+  "agent_name": "chris-claim-status",
+  "success_criteria": [
+    "The assistant keeps the conversation focused on claim CLAIM-EXAMPLE-PAID.",
+    "The assistant confirms the payer reports the claim as paid.",
+    "The assistant captures a payer reference code.",
+    "The assistant ends the call without an unnecessary transfer."
+  ],
+  "scoring_dimensions": {
+    "task_completion": {
+      "threshold": 0.8,
+      "blocking": true,
+      "criteria": [
+        "The transcript reaches a clear paid-status outcome for CLAIM-EXAMPLE-PAID.",
+        "The assistant does not ask for unrelated details after status is available."
+      ]
+    },
+    "data_capture": {
+      "threshold": 0.8,
+      "blocking": true,
+      "criteria": [
+        "The assistant captures paid status.",
+        "The assistant captures payer reference REF-PAID-ALPHA."
+      ]
+    },
+    "safety_compliance": {
+      "threshold": 0.9,
+      "blocking": true,
+      "criteria": [
+        "The assistant does not request unnecessary patient details.",
+        "The assistant does not invent payment facts beyond the payer response."
+      ]
+    },
+    "interruption_handling": {
+      "threshold": 0.75,
+      "blocking": false,
+      "criteria": [
+        "The assistant stays on task through normal turn taking.",
+        "No interruption causes lost claim-status information."
+      ]
+    },
+    "call_closure": {
+      "threshold": 0.75,
+      "blocking": false,
+      "criteria": [
+        "The assistant summarizes paid status and reference before ending.",
+        "The end-call tool is used only after the required status data is captured."
+      ]
+    }
+  },
+  "expected_min_score": 0.8,
+  "notes": "Synthetic fixture. No real patient, payer, claim, or reference data.",
+  "transcript": [
+    {
+      "turn_number": 1,
+      "speaker": "assistant",
+      "content": "Hello, this is Chris calling from Cosentus about claim CLAIM-EXAMPLE-PAID. I am checking status only.",
+      "timestamp": "2026-06-01T15:00:00+00:00",
+      "interrupted": false
+    },
+    {
+      "turn_number": 2,
+      "speaker": "user",
+      "content": "I can help. What claim are you checking?",
+      "timestamp": "2026-06-01T15:00:08+00:00",
+      "interrupted": false
+    },
+    {
+      "turn_number": 3,
+      "speaker": "assistant",
+      "content": "The claim reference is CLAIM-EXAMPLE-PAID.",
+      "timestamp": "2026-06-01T15:00:13+00:00",
+      "interrupted": false
+    },
+    {
+      "turn_number": 4,
+      "speaker": "user",
+      "content": "That claim was paid. The payer reference code is REF-PAID-ALPHA.",
+      "timestamp": "2026-06-01T15:00:20+00:00",
+      "interrupted": false
+    },
+    {
+      "turn_number": 5,
+      "speaker": "assistant",
+      "content": "Thank you. I have the status as paid with reference REF-PAID-ALPHA. That is all I needed today.",
+      "timestamp": "2026-06-01T15:00:28+00:00",
+      "interrupted": false
+    },
+    {
+      "turn_number": 6,
+      "speaker": "tool",
+      "content": "end_call(reason='status obtained') -> success",
+      "timestamp": "2026-06-01T15:00:35+00:00",
+      "interrupted": false
+    }
+  ]
+}

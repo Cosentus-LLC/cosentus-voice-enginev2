@@ -29,6 +29,14 @@ dependencies = [
     # end against the new version. The Dockerfile also installs from
     # uv.lock with --frozen so a stray range can't silently drift again.
     "pipecat-ai[daily,silero,elevenlabs,aws,webrtc,runner,assemblyai]==1.1.0",
+    # Pipecat Flows — structured-conversation layer over the pipeline
+    # (EPIC #16; scaffold #41). Pinned EXACTLY to 1.1.1: it requires
+    # pipecat-ai<2,>=1.0.0, so it's compatible with — and does NOT widen
+    # — the 1.1.0 pin above. The next release (1.2.0) requires
+    # pipecat-ai>=1.3.0, which would force-bump pipecat off 1.1.0 and
+    # re-break ElevenLabs TTS; the exact pin keeps that from drifting in
+    # via uv.lock. Re-validate before widening, same as pipecat-ai.
+    "pipecat-ai-flows==1.1.1",
     "boto3",
     "pydantic>=2",
     "pydantic-settings>=2.0",
@@ -36,6 +44,15 @@ dependencies = [
     "uvicorn",
     "structlog",
     "aiohttp",
+    # Per-call tracing (#13). Standalone OpenTelemetry — we deliberately
+    # do NOT use Pipecat's own tracer (its GenAI spans embed PHI:
+    # messages / transcript / system_instructions, with no suppression
+    # flag), so the pipecat-ai[tracing] extra is intentionally absent and
+    # the pin above is untouched. We emit our own PHI-free spans plus a
+    # metrics observer through this SDK and export OTLP/HTTP to
+    # self-hosted Langfuse. opentelemetry-api comes in transitively.
+    "opentelemetry-sdk",
+    "opentelemetry-exporter-otlp-proto-http",
 ]
 
 [project.optional-dependencies]
@@ -52,6 +69,7 @@ where = ["backend/voice-agent"]
 include = ["app*"]
 
 [tool.ruff]
+extend-exclude = ["infrastructure"]
 line-length = 100
 target-version = "py311"
 

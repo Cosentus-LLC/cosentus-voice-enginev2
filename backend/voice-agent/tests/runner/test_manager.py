@@ -139,7 +139,7 @@ async def test_concurrent_starts_cannot_overshoot_max_concurrent():
 
     bot_event = asyncio.Event()
 
-    async def slow_bot(runner_args):
+    async def slow_bot(runner_args, settings=None):
         await bot_event.wait()
 
     results = []
@@ -246,6 +246,30 @@ async def test_start_outbound_creates_room_and_spawns():
 
 
 @pytest.mark.asyncio
+async def test_wrapped_bot_passes_boot_settings_to_bot():
+    """The manager threads its boot-time Settings singleton into
+    ``bot`` (F3) so the call path doesn't reconstruct Settings."""
+    settings = _settings()
+    m = PipelineManager(settings, _daily_mock(), _protection_mock())
+
+    captured = {}
+
+    async def fake_bot(runner_args, bot_settings=None):
+        captured["settings"] = bot_settings
+
+    with patch("app.runner.manager.bot", fake_bot):
+        await m.start_outbound(
+            agent_id="agent-1",
+            target_number="+19494360836",
+            from_number="+12098075018",
+        )
+        await asyncio.sleep(0.05)
+
+    # bot received the exact Settings instance the manager holds.
+    assert captured["settings"] is settings
+
+
+@pytest.mark.asyncio
 async def test_start_outbound_resolves_caller_id_e164_to_uuid():
     """Empirically verified 2026-05-07: Daily's ``dialOut/start``
     rejects ``callerId`` in E.164 form (``+15559999999``) with
@@ -260,7 +284,7 @@ async def test_start_outbound_resolves_caller_id_e164_to_uuid():
 
     captured_args = []
 
-    async def fake_bot(runner_args):
+    async def fake_bot(runner_args, settings=None):
         captured_args.append(runner_args)
 
     with patch("app.runner.manager.bot", fake_bot):
@@ -298,7 +322,7 @@ async def test_start_outbound_falls_back_to_e164_on_unresolved_caller_id():
 
     captured_args = []
 
-    async def fake_bot(runner_args):
+    async def fake_bot(runner_args, settings=None):
         captured_args.append(runner_args)
 
     with patch("app.runner.manager.bot", fake_bot):
@@ -343,7 +367,7 @@ async def test_start_browser_sets_direction_browser():
 
     captured = []
 
-    async def fake_bot(runner_args):
+    async def fake_bot(runner_args, settings=None):
         captured.append(runner_args.body)
 
     with patch("app.runner.manager.bot", fake_bot):
@@ -363,7 +387,7 @@ async def test_start_inbound_creates_sip_room_and_spawns():
 
     captured = []
 
-    async def fake_bot(runner_args):
+    async def fake_bot(runner_args, settings=None):
         captured.append(runner_args.body)
 
     with patch("app.runner.manager.bot", fake_bot):
@@ -396,7 +420,7 @@ async def test_zero_to_one_acquires_protection():
     # check protection.set_protected was called.
     bot_event = asyncio.Event()
 
-    async def slow_bot(runner_args):
+    async def slow_bot(runner_args, settings=None):
         await bot_event.wait()
 
     with patch("app.runner.manager.bot", slow_bot):
@@ -442,7 +466,7 @@ async def test_second_concurrent_call_does_not_re_acquire():
 
     bot_event = asyncio.Event()
 
-    async def slow_bot(runner_args):
+    async def slow_bot(runner_args, settings=None):
         await bot_event.wait()
 
     with patch("app.runner.manager.bot", slow_bot):
@@ -459,7 +483,7 @@ async def test_wrapped_bot_pops_dict_on_exception():
     daily = _daily_mock()
     m = PipelineManager(_settings(), daily, _protection_mock())
 
-    async def crashing_bot(runner_args):
+    async def crashing_bot(runner_args, settings=None):
         raise RuntimeError("bot exploded")
 
     with patch("app.runner.manager.bot", crashing_bot):
@@ -476,7 +500,7 @@ async def test_wrapped_bot_pops_dict_on_cancellation():
 
     bot_event = asyncio.Event()
 
-    async def slow_bot(runner_args):
+    async def slow_bot(runner_args, settings=None):
         await bot_event.wait()
 
     with patch("app.runner.manager.bot", slow_bot):
