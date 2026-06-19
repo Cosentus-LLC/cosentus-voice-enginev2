@@ -9,6 +9,18 @@ providers:
   - id: echo
     label: replayed-transcript
 
+# The `echo` provider above just replays the rendered transcript; the
+# llm-rubric asserts below need a *grader* LLM. promptfoo defaults that grader
+# to OpenAI, which Cosentus does not use — so grade with Bedrock Claude (the
+# same vendor the engine runs on). Uses the ambient AWS credentials + region.
+# The transcript fixtures are synthetic and de-identified, so no PHI leaves.
+defaultTest:
+  options:
+    provider:
+      id: bedrock:us.anthropic.claude-sonnet-4-5-20250929-v1:0
+      config:
+        region: us-east-1
+
 tests:
   - description: claim status paid
     vars:
