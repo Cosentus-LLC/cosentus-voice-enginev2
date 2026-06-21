@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import Any
 
 import boto3
@@ -509,6 +510,40 @@ def _get_bedrock_client(settings: Settings) -> Any:
     return _BEDROCK_CLIENT
 
 
+# Bedrock's Converse API requires tool ``inputSchema`` property keys to
+# match ``^[a-zA-Z0-9_.-]{1,64}$``. A human field name like ``"call
+# summary"`` (with a space) is otherwise rejected with a ValidationException
+# that fails the WHOLE extraction (caught in staging on chris-claim-status).
+# We sanitize names into valid keys for the wire and map the model's
+# response back to the original ``field.name`` (in ``_coerce_to_schema``),
+# so the persisted analysis keeps the human-readable field name.
+_INVALID_KEY_CHARS = re.compile(r"[^a-zA-Z0-9_.-]")
+
+
+def _safe_property_keys(fields: list[PostCallField]) -> list[str]:
+    """Map each field to a Bedrock-valid tool property key, in field order.
+
+    Replaces any character outside ``[a-zA-Z0-9_.-]`` with ``_``, caps at
+    Bedrock's 64-char limit, and de-duplicates so two field names cannot
+    collide onto one key. The same ``pca_config.fields`` list drives both
+    the tool-schema build and the response parse, so the keys line up by
+    position — callers ``zip(fields, keys)``.
+    """
+    keys: list[str] = []
+    used: set[str] = set()
+    for f in fields:
+        base = _INVALID_KEY_CHARS.sub("_", f.name)[:64] or "field"
+        key = base
+        n = 2
+        while key in used:
+            suffix = f"_{n}"
+            key = f"{base[: 64 - len(suffix)]}{suffix}"
+            n += 1
+        used.add(key)
+        keys.append(key)
+    return keys
+
+
 def _build_tool_config(pca_config: PostCallConfig) -> dict[str, Any]:
     """Build the Converse ``toolConfig`` for one forced extraction tool.
 
@@ -527,11 +562,12 @@ def _build_tool_config(pca_config: PostCallConfig) -> dict[str, Any]:
     property — Bedrock rejects an empty tool list.
     """
     properties: dict[str, dict[str, Any]] = {}
-    for f in pca_config.fields:
+    keys = _safe_property_keys(pca_config.fields)
+    for f, key in zip(pca_config.fields, keys, strict=True):
         entry: dict[str, Any] = {"type": "string", "description": f.description or f.name}
         if f.type == "selector" and f.choices:
             entry["enum"] = list(f.choices)
-        properties[f.name] = entry
+        properties[key] = entry
     return {
         "tools": [
             {
@@ -599,9 +635,10 @@ class _ExtractionEnvelope(BaseModel):
         if not isinstance(data, dict):
             raise ValueError("tool input must be a JSON object")
         fields: list[PostCallField] = (info.context or {}).get("fields", [])
+        keys = _safe_property_keys(fields)
         result: dict[str, Any] = {}
-        for f in fields:
-            raw_value = data.get(f.name)
+        for f, key in zip(fields, keys, strict=True):
+            raw_value = data.get(key)
             if f.type == "selector":
                 value_str = str(raw_value) if raw_value is not None else ""
                 if not value_str:

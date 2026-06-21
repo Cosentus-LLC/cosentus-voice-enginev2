@@ -8,6 +8,7 @@ stays offline/deterministic; live field-accuracy is validated on staging.
 
 from __future__ import annotations
 
+import re
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -25,6 +26,7 @@ from app.persistence.post_call import (
     _build_tool_config,
     _is_retryable_failover_error,
     _resolve_model_chain,
+    _safe_property_keys,
     _validate_tool_input,
     run_post_call_analyses,
 )
@@ -716,3 +718,48 @@ async def test_bedrock_client_binds_region_from_settings_on_first_call():
     assert captured["region"] == "us-west-2"
     # Reset for subsequent tests so no module-level state leaks.
     post_call_module._BEDROCK_CLIENT = None
+
+
+# ── Bedrock property-key sanitization (field names with spaces, etc.) ─────────
+#
+# Regression for the staging finding: chris-claim-status's post-call field is
+# named "call summary" (with a space). Bedrock rejects tool property keys
+# outside ^[a-zA-Z0-9_.-]{1,64}$ with a ValidationException that fails the
+# entire extraction (so post_call_analyses persisted as {}).
+
+
+def test_build_tool_config_sanitizes_field_name_with_space():
+    """The wire key must be Bedrock-valid, not the raw human field name."""
+    cfg = _build_tool_config(
+        PostCallConfig(
+            model="claude-haiku-4-5",
+            fields=[PostCallField(name="call summary", type="text", description="Notes.")],
+        )
+    )
+    props = cfg["tools"][0]["toolSpec"]["inputSchema"]["json"]["properties"]
+    assert "call summary" not in props  # raw name (with space) would be rejected
+    assert "call_summary" in props
+
+
+def test_validate_tool_input_maps_sanitized_key_back_to_field_name():
+    """Model answers under the sanitized key → output keeps the original name."""
+    pca = PostCallConfig(
+        model="claude-haiku-4-5",
+        fields=[PostCallField(name="call summary", type="text", description="Notes.")],
+    )
+    out = _validate_tool_input({"call_summary": "Claim 12345 denied CO16."}, pca)
+    assert out == {"call summary": "Claim 12345 denied CO16."}
+
+
+def test_safe_property_keys_are_bedrock_valid_and_unique():
+    """Disallowed chars → '_', capped at 64, and de-duplicated."""
+    pattern = re.compile(r"^[a-zA-Z0-9_.-]{1,64}$")
+    fields = [
+        PostCallField(name="call summary", type="text"),
+        PostCallField(name="call/summary", type="text"),  # same base → must dedupe
+        PostCallField(name="résumé #", type="text"),
+        PostCallField(name="x" * 80, type="text"),  # over Bedrock's 64-char cap
+    ]
+    keys = _safe_property_keys(fields)
+    assert all(pattern.match(k) for k in keys), keys
+    assert len(set(keys)) == len(keys)  # all unique
