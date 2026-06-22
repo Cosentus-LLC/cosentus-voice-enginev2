@@ -118,11 +118,28 @@ export interface VoiceEngineConfig {
    *   on a real key — fail-fast at deploy time, not at synth time.
    */
   readonly recordingsKmsKeyArn: string;
+  /**
+   * v2 feature-flag env vars set on the engine task definition. Each key maps
+   * to a pydantic `Settings` flag; an absent flag means off. `TRACING_ENABLED`
+   * is intentionally excluded until self-hosted Langfuse exists — otherwise the
+   * engine would export OTLP spans to a dead endpoint.
+   */
+  readonly featureFlags: Record<string, string>;
 }
 
 const PROJECT_NAME = 'cosentus-voice-engine';
 const DEFAULT_ACCOUNT = '825269749545';
 const DEFAULT_REGION = 'us-east-1';
+
+// The modernized v2 behavior — ON in both staging and prod: Pipecat Flows,
+// the identity gate, payer-knowledge prefetch, and context summarization.
+// TRACING_ENABLED is deliberately omitted until Langfuse is stood up.
+const V2_FEATURE_FLAGS: Record<string, string> = {
+  FLOWS_ENABLED: 'true',
+  CONTEXT_SUMMARIZATION_ENABLED: 'true',
+  KNOWLEDGE_PREFETCH_ENABLED: 'true',
+  IDENTITY_VERIFICATION_KEYS: 'last_name',
+};
 
 const ENV_DEFAULTS: Record<Environment, Partial<VoiceEngineConfig>> = {
   staging: {
@@ -157,6 +174,7 @@ const ENV_DEFAULTS: Record<Environment, Partial<VoiceEngineConfig>> = {
     // returns canned runtime-config + accepts writes as no-ops.
     // Repoint at a real staging Lambda alias in Phase 6.
     voiceApiLambdaName: 'cosentus-voice-api-staging-stub',
+    featureFlags: V2_FEATURE_FLAGS,
   },
   prod: {
     vpcCidr: '10.30.0.0/16',
@@ -183,6 +201,7 @@ const ENV_DEFAULTS: Record<Environment, Partial<VoiceEngineConfig>> = {
     recordingsBucketOwnedByCdk: false,
     recordingsKmsKeyArn: '',
     voiceApiLambdaName: 'medcloud-voice-api:live',
+    featureFlags: V2_FEATURE_FLAGS,
   },
 };
 
@@ -365,6 +384,7 @@ export function loadConfig(app: App): VoiceEngineConfig {
     recordingsBucketOwnedByCdk,
     recordingsKmsKeyArn,
     voiceApiLambdaName,
+    featureFlags: defaults.featureFlags ?? {},
   };
 }
 
