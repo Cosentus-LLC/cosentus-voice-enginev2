@@ -206,6 +206,11 @@ export class EcsServiceConstruct extends Construct {
         // Required by Settings — engine refuses to boot without these.
         VOICE_API_LAMBDA_NAME: voiceApiLambdaName,
         API_KEY_SECRET_ARN: secretArns.apiKey,
+        // v2 feature flags, per-environment (see config.ts `featureFlags`).
+        // Spreads FLOWS_ENABLED / CONTEXT_SUMMARIZATION_ENABLED /
+        // KNOWLEDGE_PREFETCH_ENABLED / IDENTITY_VERIFICATION_KEYS as task env
+        // vars. TRACING_ENABLED is intentionally absent until Langfuse exists.
+        ...config.featureFlags,
       },
       secrets: {
         // Vendor SDK keys read directly via os.environ in Layer 3
