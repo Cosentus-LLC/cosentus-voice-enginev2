@@ -55,6 +55,7 @@ def _agent(
     first_message: str = "",
     tools: list | None = None,
     flow_definition: dict | None = None,
+    identity_verification_keys: list[str] | None = None,
 ) -> AgentConfig:
     return AgentConfig(
         name="test-agent",
@@ -64,6 +65,7 @@ def _agent(
         speak_first=speak_first,
         tools=tools or [],
         flow_definition=flow_definition,
+        identity_verification_keys=identity_verification_keys or [],
     )
 
 
@@ -758,6 +760,108 @@ async def test_run_bot_flag_on_initializes_identity_gate_node():
     assert node["name"] == "identity_gate"
     assert [f.name for f in node["functions"]] == ["verify_identity"]
     assert node["respond_immediately"] is False
+
+
+@pytest.mark.asyncio
+async def test_run_bot_uses_agent_identity_keys_when_present():
+    agent, mocks = _patch_run_bot_dependencies(agent=_agent(identity_verification_keys=["dob"]))
+    transport = _make_transport_mock()
+    fm = _flow_manager_mock()
+    capture: dict = {}
+    real_build = __import__(
+        "app.bot.bot", fromlist=["build_identity_gate_flow"]
+    ).build_identity_gate_flow
+
+    def _spy(**kwargs):
+        capture.update(kwargs)
+        return real_build(**kwargs)
+
+    patches = _start_run_bot_patches(agent, mocks, transport) + [
+        patch("app.bot.bot.build_flow_manager", MagicMock(return_value=fm)),
+        patch("app.bot.bot.build_identity_gate_flow", _spy),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        await run_bot(
+            transport,
+            _runner_args(),
+            _settings(flows_enabled=True, identity_verification_keys="patient_name"),
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert capture["identity_keys"] == ["dob"]
+
+
+@pytest.mark.asyncio
+async def test_run_bot_falls_back_to_global_identity_keys_when_agent_keys_absent():
+    agent, mocks = _patch_run_bot_dependencies(agent=_agent())
+    transport = _make_transport_mock()
+    fm = _flow_manager_mock()
+    capture: dict = {}
+    real_build = __import__(
+        "app.bot.bot", fromlist=["build_identity_gate_flow"]
+    ).build_identity_gate_flow
+
+    def _spy(**kwargs):
+        capture.update(kwargs)
+        return real_build(**kwargs)
+
+    patches = _start_run_bot_patches(agent, mocks, transport) + [
+        patch("app.bot.bot.build_flow_manager", MagicMock(return_value=fm)),
+        patch("app.bot.bot.build_identity_gate_flow", _spy),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        await run_bot(
+            transport,
+            _runner_args(),
+            _settings(
+                flows_enabled=True,
+                identity_verification_keys="patient_name, dob",
+            ),
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert capture["identity_keys"] == ["patient_name", "dob"]
+
+
+@pytest.mark.asyncio
+async def test_run_bot_blank_agent_identity_keys_fall_back_to_global():
+    agent, mocks = _patch_run_bot_dependencies(agent=_agent(identity_verification_keys=[" ", ""]))
+    transport = _make_transport_mock()
+    fm = _flow_manager_mock()
+    capture: dict = {}
+    real_build = __import__(
+        "app.bot.bot", fromlist=["build_identity_gate_flow"]
+    ).build_identity_gate_flow
+
+    def _spy(**kwargs):
+        capture.update(kwargs)
+        return real_build(**kwargs)
+
+    patches = _start_run_bot_patches(agent, mocks, transport) + [
+        patch("app.bot.bot.build_flow_manager", MagicMock(return_value=fm)),
+        patch("app.bot.bot.build_identity_gate_flow", _spy),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        await run_bot(
+            transport,
+            _runner_args(),
+            _settings(flows_enabled=True, identity_verification_keys="patient_name"),
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert capture["identity_keys"] == ["patient_name"]
 
 
 @pytest.mark.asyncio

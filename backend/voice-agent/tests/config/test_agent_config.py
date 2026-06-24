@@ -34,6 +34,7 @@ def _runtime_config_json() -> dict[str, Any]:
         "first_message": "Hi, I'm calling about a claim status.",
         "flow_definition": None,
         "ivr_goal": "Reach a claims rep",
+        "identity_verification_keys": ["patient_name", "dob"],
         "llm": {
             "provider": "anthropic",  # extra in v2
             "model": "claude-sonnet-4-6",
@@ -123,6 +124,7 @@ class TestAgentConfigParse:
         assert cfg.first_message == "Hi, I'm calling about a claim status."
         assert cfg.flow_definition is None
         assert cfg.ivr_goal == "Reach a claims rep"
+        assert cfg.identity_verification_keys == ["patient_name", "dob"]
 
         assert cfg.llm.model == "claude-sonnet-4-6"
         assert cfg.llm.max_tokens == 390
@@ -186,6 +188,24 @@ class TestAgentConfigParse:
         cfg = AgentConfig.model_validate({"name": "agent", "flow_definition": flow})
 
         assert cfg.model_dump()["flow_definition"] == flow
+
+    def test_identity_verification_keys_default_empty(self):
+        cfg = AgentConfig.model_validate({"name": "agent"})
+
+        assert cfg.identity_verification_keys == []
+
+    def test_identity_verification_keys_included_in_dump(self):
+        cfg = AgentConfig.model_validate(
+            {
+                "name": "agent",
+                "identity_verification_keys": ["patient_name", "dob"],
+            }
+        )
+
+        assert cfg.model_dump(by_alias=True)["identity_verification_keys"] == [
+            "patient_name",
+            "dob",
+        ]
 
     def test_meta_alias_underscore_meta_deserializes(self):
         # The lambda sends ``_meta`` (wire convention); the Python

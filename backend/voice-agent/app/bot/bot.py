@@ -98,7 +98,7 @@ from pipecat.utils.context.llm_context_summarization import (
 )
 
 from app.bot.lifecycle import finalize_call
-from app.config.agent_config import load_agent_config
+from app.config.agent_config import AgentConfig, load_agent_config
 from app.config.payer_knowledge import load_payer_ivr_path
 from app.config.settings import Settings
 from app.flows import (
@@ -713,7 +713,7 @@ async def run_bot(
     )
 
     if settings.flows_enabled:
-        identity_keys = _parse_identity_keys(settings)
+        identity_keys = _resolve_identity_keys(agent, settings)
         if not identity_keys:
             # Loud, queryable signal: Flows is on but the gate has nothing
             # to verify against, so it is fail-closed and blocks every
@@ -1176,6 +1176,13 @@ def _parse_required_case_data_keys(settings: Settings) -> list[str]:
     return [key.strip() for key in raw.split(",") if key.strip()]
 
 
+def _parse_identity_keys_csv(raw: str) -> list[str]:
+    """Parse a comma-separated identity-key string into normalized keys."""
+    if not raw:
+        return []
+    return [key.strip() for key in raw.split(",") if key.strip()]
+
+
 def _parse_identity_keys(settings: Settings) -> list[str]:
     """Parse ``Settings.identity_verification_keys`` (CSV) into a key list.
 
@@ -1184,10 +1191,21 @@ def _parse_identity_keys(settings: Settings) -> list[str]:
     nothing to verify the caller against and blocks every gated tool.
     Whitespace is stripped from each entry and empty entries dropped.
     """
-    raw = settings.identity_verification_keys
-    if not raw:
-        return []
-    return [key.strip() for key in raw.split(",") if key.strip()]
+    return _parse_identity_keys_csv(settings.identity_verification_keys)
+
+
+def _resolve_identity_keys(agent: AgentConfig, settings: Settings) -> list[str]:
+    """Resolve per-call identity keys, preferring the agent runtime config.
+
+    Runtime-config ``identity_verification_keys`` is the per-agent source
+    of truth when present. Empty / blank-only agent keys fall back to the
+    global ``Settings.identity_verification_keys`` CSV for backward
+    compatibility with agents whose runtime-config predates the field.
+    """
+    agent_keys = [key.strip() for key in agent.identity_verification_keys if key.strip()]
+    if agent_keys:
+        return agent_keys
+    return _parse_identity_keys(settings)
 
 
 def _resolve_payer_id(case_data: dict[str, Any], settings: Settings) -> str | None:
