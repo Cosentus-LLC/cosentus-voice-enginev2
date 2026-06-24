@@ -765,6 +765,7 @@ async def run_bot(
                     ivr_goal=hydrated_ivr_goal,
                     knowledge_warmer=knowledge_warmer,
                     knowledge_context=knowledge_context,
+                    flow_definition=agent.flow_definition,
                 ),
             )
         )
@@ -773,6 +774,7 @@ async def run_bot(
             call_id=call_id,
             node=IDENTITY_GATE_NODE,
             identity_key_count=len(identity_keys),
+            has_flow_definition=bool(agent.flow_definition),
         )
 
     # ── Static-opener dispatch (idempotent) ───────────────────────────

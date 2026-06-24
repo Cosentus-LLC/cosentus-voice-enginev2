@@ -302,6 +302,7 @@ class AgentConfig(_RuntimeConfigModel):
     description: str = ""
     system_prompt: str = ""
     first_message: str = ""
+    flow_definition: dict[str, Any] | None = None
     ivr_goal: str = ""
 
     speak_first: bool = True

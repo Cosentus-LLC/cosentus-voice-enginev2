@@ -21,6 +21,8 @@ from app.flows.identity_gate import (
 from app.flows.scaffold import build_flow_manager, build_scaffold_flow
 from app.flows.steps import (
     REFERENCE_NUMBER,
+    REQUIRED_REFERENCE_FIELD,
+    REQUIRED_REFERENCE_NODE_ID,
     STEPS,
     SUMMARY_PROMPT,
     build_step_chain,
@@ -30,6 +32,8 @@ __all__ = [
     "IDENTITY_GATE_NODE",
     "PRE_VERIFICATION_ROLE_MESSAGE",
     "REFERENCE_NUMBER",
+    "REQUIRED_REFERENCE_FIELD",
+    "REQUIRED_REFERENCE_NODE_ID",
     "STEPS",
     "SUMMARY_PROMPT",
     "build_flow_manager",

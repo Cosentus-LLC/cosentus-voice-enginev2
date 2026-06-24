@@ -54,6 +54,7 @@ def _agent(
     speak_first: bool = True,
     first_message: str = "",
     tools: list | None = None,
+    flow_definition: dict | None = None,
 ) -> AgentConfig:
     return AgentConfig(
         name="test-agent",
@@ -62,6 +63,7 @@ def _agent(
         first_message=first_message,
         speak_first=speak_first,
         tools=tools or [],
+        flow_definition=flow_definition,
     )
 
 
@@ -852,6 +854,48 @@ async def test_run_bot_passes_knowledge_warmer_to_step_chain_only_when_flag_enab
     step_chain.assert_called_once()
     assert step_chain.call_args.kwargs["knowledge_warmer"] is warmer
     assert step_chain.call_args.kwargs["knowledge_context"].payer == "Aetna"
+
+
+@pytest.mark.asyncio
+async def test_run_bot_passes_agent_flow_definition_to_step_chain():
+    flow_definition = {
+        "version": 1,
+        "start": "reference_number",
+        "nodes": [
+            {
+                "id": "reference_number",
+                "type": "ask",
+                "capture": ["call_reference"],
+                "required": True,
+                "next": "done",
+            },
+            {"id": "done", "type": "end"},
+        ],
+    }
+    agent, mocks = _patch_run_bot_dependencies(agent=_agent(flow_definition=flow_definition))
+    transport = _make_transport_mock()
+    fm = _flow_manager_mock()
+    step_chain = MagicMock(
+        return_value={"name": NAVIGATE, "task_messages": [], "functions": []},
+    )
+    patches = _start_run_bot_patches(agent, mocks, transport) + [
+        patch("app.bot.bot.build_flow_manager", MagicMock(return_value=fm)),
+        patch("app.bot.bot.build_step_chain", step_chain),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        await run_bot(
+            transport,
+            _runner_args(),
+            _settings(flows_enabled=True, identity_verification_keys="patient_name"),
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    step_chain.assert_called_once()
+    assert step_chain.call_args.kwargs["flow_definition"] == flow_definition
 
 
 @pytest.mark.asyncio
