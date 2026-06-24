@@ -60,6 +60,9 @@ def _kwargs(**overrides):
         "batch_id": None,
         "batch_row_index": None,
         "settings": _settings(),
+        "terminal_step": "greeting",
+        "transferred": False,
+        "latency_ms": None,
     }
     base.update(overrides)
     return base
@@ -331,6 +334,60 @@ async def test_second_write_picks_up_post_call_usage():
     # First write: live usage only. Second write: live + extraction.
     assert writes[0] == (1000, 200)
     assert writes[1] == (1500, 280)
+
+
+# ── Intelligence dashboard fields (#7) ────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_finalize_call_persists_intelligence_fields():
+    captured = {}
+
+    async def fake_write(record, settings):
+        captured["record"] = record
+        return True
+
+    with (
+        patch("app.bot.lifecycle.write_call_record", side_effect=fake_write),
+        patch("app.bot.lifecycle.trigger_auto_actions", return_value=None),
+    ):
+        await finalize_call(
+            **_kwargs(
+                terminal_step="reference_number",
+                transferred=True,
+                latency_ms=842,
+            )
+        )
+
+    rec = captured["record"]
+    assert rec.terminal_step == "reference_number"
+    assert rec.transferred is True
+    assert rec.latency_ms == 842
+
+
+@pytest.mark.asyncio
+async def test_second_write_preserves_intelligence_fields():
+    writes = []
+
+    async def fake_write(record, settings):
+        writes.append((record.terminal_step, record.transferred, record.latency_ms))
+        return True
+
+    with (
+        patch("app.bot.lifecycle.write_call_record", side_effect=fake_write),
+        patch("app.bot.lifecycle.run_post_call_analyses", return_value={"summary": "x"}),
+        patch("app.bot.lifecycle.trigger_auto_actions", return_value=None),
+    ):
+        await finalize_call(
+            **_kwargs(
+                agent=_agent_with_pca(),
+                terminal_step="wrap_up",
+                transferred=True,
+                latency_ms=900,
+            )
+        )
+
+    assert writes == [("wrap_up", True, 900), ("wrap_up", True, 900)]
 
 
 # ── auto-actions gating ───────────────────────────────────────────────────

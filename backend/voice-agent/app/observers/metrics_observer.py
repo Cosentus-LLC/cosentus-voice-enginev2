@@ -223,3 +223,10 @@ class MetricsObserver(BaseObserver):
             attrs["voice.turns.e2e_ms.max"] = m.turn_e2e.max_ms()
 
         set_span_attrs(span, attrs)
+
+    def average_llm_ttfb_ms(self) -> int | None:
+        """Return average live LLM time-to-first-byte in ms, if observed."""
+        ttfb = self._metrics.ttfb["llm"]
+        if not ttfb.count:
+            return None
+        return round(ttfb.avg_ms())

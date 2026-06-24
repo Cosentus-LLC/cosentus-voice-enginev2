@@ -59,6 +59,9 @@ def test_to_lambda_body_contains_every_voice_calls_column():
         "llm_tokens_in",
         "llm_tokens_out",
         "tts_chars",
+        "terminal_step",
+        "transferred",
+        "latency_ms",
         "updated_at",
     }
     assert set(body.keys()) == expected_keys
@@ -241,3 +244,25 @@ def test_usage_fields_serialized():
     assert body["llm_tokens_in"] == 1500
     assert body["llm_tokens_out"] == 320
     assert body["tts_chars"] == 842
+
+
+# ── Intelligence dashboard fields (#7) ────────────────────────────────────
+
+
+def test_intelligence_fields_default_to_safe_values():
+    body = _full_record().to_lambda_body()
+    assert body["terminal_step"] is None
+    assert body["transferred"] is False
+    assert body["latency_ms"] is None
+
+
+def test_intelligence_fields_serialized():
+    rec = _full_record(
+        terminal_step="reference_number",
+        transferred=True,
+        latency_ms=842,
+    )
+    body = rec.to_lambda_body()
+    assert body["terminal_step"] == "reference_number"
+    assert body["transferred"] is True
+    assert body["latency_ms"] == 842

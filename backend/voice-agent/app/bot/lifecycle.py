@@ -65,6 +65,9 @@ async def finalize_call(
     settings: Settings,
     otel_parent_context: Any = None,
     usage_accumulator: UsageAccumulator | None = None,
+    terminal_step: str | None = None,
+    transferred: bool = False,
+    latency_ms: int | None = None,
 ) -> None:
     """Build :class:`CallRecord`, fire Layer 6 writes, run PCA + auto-actions.
 
@@ -107,6 +110,9 @@ async def finalize_call(
         batch_id=batch_id,
         batch_row_index=batch_row_index,
         session_id=session_id,
+        terminal_step=terminal_step,
+        transferred=transferred,
+        latency_ms=latency_ms,
     )
 
     def _apply_usage() -> None:
@@ -132,6 +138,9 @@ async def finalize_call(
         transcript_turns=len(transcript),
         has_error=bool(final_error),
         agent_name=agent.name,
+        terminal_step=terminal_step,
+        transferred=transferred,
+        latency_ms=latency_ms,
     )
 
     first_ok = await write_call_record(record, settings)
