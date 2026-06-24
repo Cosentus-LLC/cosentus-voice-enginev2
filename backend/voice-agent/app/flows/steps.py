@@ -42,10 +42,12 @@ later steps inherit it without re-sending it each turn.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+import structlog
 from pipecat_flows import (
     ContextStrategy,
     ContextStrategyConfig,
@@ -57,6 +59,8 @@ from pipecat_flows.types import ConsolidatedFunctionResult, NodeConfig
 
 from app.knowledge.prefetch import PrefetchContext, PrefetchWarmer
 
+logger = structlog.get_logger(__name__)
+
 # Node identifiers — constants so bot.py wiring and tests reference them
 # without restating string literals.
 NAVIGATE = "navigate"
@@ -67,6 +71,10 @@ FAX_PORTAL = "fax_or_portal"
 DEADLINE = "deadline"
 REFERENCE_NUMBER = "reference_number"
 WRAP = "wrap"
+
+REQUIRED_REFERENCE_NODE_ID = REFERENCE_NUMBER
+REQUIRED_REFERENCE_FIELD = "call_reference"
+FLOW_NODE_TYPES = frozenset({"ask", "branch", "transfer", "end"})
 
 # The running-summary prompt used by RESET_WITH_SUMMARY on every step
 # after the first. Post-verification, so it may reference claim/case
@@ -99,6 +107,32 @@ class _Step:
     advance_description: str = ""
     required_field: str | None = None
     required_description: str = ""
+
+
+@dataclass(frozen=True)
+class _FlowBranch:
+    when: str
+    to: str
+
+
+@dataclass(frozen=True)
+class _FlowNode:
+    id: str
+    type: str
+    label: str
+    say: str
+    capture: tuple[str, ...]
+    required: bool
+    next: str | None
+    branches: tuple[_FlowBranch, ...]
+    fallback: str | None
+
+
+@dataclass(frozen=True)
+class _FlowDefinition:
+    version: int
+    start: str
+    nodes: tuple[_FlowNode, ...]
 
 
 # The ``navigate`` step's base task — used verbatim when no verified IVR
@@ -319,6 +353,365 @@ def _tool_functions(registry: Any, run_tool_core: RunToolCore) -> list[FlowsFunc
     return tools
 
 
+def _string_or_empty(value: Any) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def _string_or_none(value: Any) -> str | None:
+    text = value.strip() if isinstance(value, str) else ""
+    return text or None
+
+
+def _normalize_flow_definition(raw: Any) -> _FlowDefinition | None:
+    """Best-effort parse of the API's ``flow_definition`` contract.
+
+    Returns ``None`` for non-objects or obviously malformed definitions so the
+    caller can safely choose the default flow.
+    """
+    if not isinstance(raw, dict):
+        return None
+    version = raw.get("version")
+    start = _string_or_none(raw.get("start"))
+    raw_nodes = raw.get("nodes")
+    if version != 1 or start is None or not isinstance(raw_nodes, list) or not raw_nodes:
+        return None
+
+    nodes: list[_FlowNode] = []
+    for raw_node in raw_nodes:
+        if not isinstance(raw_node, dict):
+            return None
+        raw_capture = raw_node.get("capture")
+        raw_branches = raw_node.get("branches")
+        capture = (
+            tuple(field for field in raw_capture if isinstance(field, str))
+            if isinstance(raw_capture, list)
+            else ()
+        )
+        branches: tuple[_FlowBranch, ...] = ()
+        if isinstance(raw_branches, list):
+            parsed_branches: list[_FlowBranch] = []
+            for raw_branch in raw_branches:
+                if not isinstance(raw_branch, dict):
+                    return None
+                parsed_branches.append(
+                    _FlowBranch(
+                        when=_string_or_empty(raw_branch.get("when")),
+                        to=_string_or_empty(raw_branch.get("to")),
+                    )
+                )
+            branches = tuple(parsed_branches)
+        nodes.append(
+            _FlowNode(
+                id=_string_or_empty(raw_node.get("id")),
+                type=_string_or_empty(raw_node.get("type")),
+                label=_string_or_empty(raw_node.get("label")),
+                say=_string_or_empty(raw_node.get("say")),
+                capture=capture,
+                required=raw_node.get("required") is True,
+                next=_string_or_none(raw_node.get("next")),
+                branches=branches,
+                fallback=_string_or_none(raw_node.get("fallback")),
+            )
+        )
+    return _FlowDefinition(version=1, start=start, nodes=tuple(nodes))
+
+
+def _definition_node_map(definition: _FlowDefinition) -> dict[str, _FlowNode]:
+    nodes: dict[str, _FlowNode] = {}
+    for node in definition.nodes:
+        if node.id and node.id not in nodes:
+            nodes[node.id] = node
+    return nodes
+
+
+def _outgoing_targets(node: _FlowNode) -> list[str]:
+    targets: list[str] = []
+    if node.next:
+        targets.append(node.next)
+    if node.fallback:
+        targets.append(node.fallback)
+    targets.extend(branch.to for branch in node.branches if branch.to)
+    return targets
+
+
+def _has_cycle(definition: _FlowDefinition, nodes_by_id: dict[str, _FlowNode]) -> bool:
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(node_id: str) -> bool:
+        if node_id in visiting:
+            return True
+        if node_id in visited:
+            return False
+        node = nodes_by_id.get(node_id)
+        if node is None:
+            return False
+        visiting.add(node_id)
+        for target in _outgoing_targets(node):
+            if visit(target):
+                return True
+        visiting.remove(node_id)
+        visited.add(node_id)
+        return False
+
+    return visit(definition.start)
+
+
+def _can_end_without_reference(
+    definition: _FlowDefinition,
+    nodes_by_id: dict[str, _FlowNode],
+) -> bool:
+    """Return True when any path reaches an end node before reference capture."""
+
+    def visit(node_id: str, seen_reference: bool, path: frozenset[str]) -> bool:
+        node = nodes_by_id.get(node_id)
+        if node is None:
+            return False
+        next_seen_reference = seen_reference or node.id == REQUIRED_REFERENCE_NODE_ID
+        if node.type == "end":
+            return not next_seen_reference
+        if node_id in path:
+            return False
+        next_path = path | {node_id}
+        return any(
+            visit(target, next_seen_reference, next_path) for target in _outgoing_targets(node)
+        )
+
+    return visit(definition.start, False, frozenset())
+
+
+def _flow_definition_errors(definition: _FlowDefinition) -> list[str]:
+    errors: list[str] = []
+    nodes_by_id: dict[str, _FlowNode] = {}
+    duplicate_ids: set[str] = set()
+    for index, node in enumerate(definition.nodes):
+        if not node.id:
+            errors.append(f"nodes[{index}].id is required")
+        elif node.id in nodes_by_id:
+            duplicate_ids.add(node.id)
+            errors.append(f"nodes[{index}].id duplicate node id {node.id!r}")
+        else:
+            nodes_by_id[node.id] = node
+        if node.type not in FLOW_NODE_TYPES:
+            errors.append(f"nodes[{index}].type must be one of {sorted(FLOW_NODE_TYPES)}")
+
+    if definition.start not in nodes_by_id:
+        errors.append(f"start references missing node {definition.start!r}")
+
+    reference_node = nodes_by_id.get(REQUIRED_REFERENCE_NODE_ID)
+    if reference_node is None:
+        errors.append(f"nodes.{REQUIRED_REFERENCE_NODE_ID} is required")
+    else:
+        if reference_node.type != "ask":
+            errors.append(f"nodes.{REQUIRED_REFERENCE_NODE_ID}.type must be ask")
+        if reference_node.required is not True:
+            errors.append(f"nodes.{REQUIRED_REFERENCE_NODE_ID}.required must be true")
+        if REQUIRED_REFERENCE_FIELD not in reference_node.capture:
+            errors.append(
+                f"nodes.{REQUIRED_REFERENCE_NODE_ID}.capture must include "
+                f"{REQUIRED_REFERENCE_FIELD}"
+            )
+
+    reachable: set[str] = set()
+
+    def mark_reachable(node_id: str) -> None:
+        if node_id in reachable:
+            return
+        node = nodes_by_id.get(node_id)
+        if node is None:
+            return
+        reachable.add(node_id)
+        for target in _outgoing_targets(node):
+            mark_reachable(target)
+
+    mark_reachable(definition.start)
+
+    for node in definition.nodes:
+        if not node.id or node.id in duplicate_ids:
+            continue
+        node_path = f"nodes.{node.id}"
+        outgoing = _outgoing_targets(node)
+        for target in outgoing:
+            if target not in nodes_by_id:
+                errors.append(f"{node_path} references missing node {target!r}")
+
+        for branch_index, branch in enumerate(node.branches):
+            if not branch.when.strip():
+                errors.append(f"{node_path}.branches[{branch_index}].when is required")
+            if not branch.to.strip():
+                errors.append(f"{node_path}.branches[{branch_index}].to is required")
+
+        if node.type == "end":
+            if outgoing:
+                errors.append(f"{node_path} end nodes cannot have outgoing transitions")
+            continue
+
+        if node.type == "branch":
+            if not node.fallback:
+                errors.append(f"{node_path}.fallback is required for branch nodes")
+            if not node.branches:
+                errors.append(f"{node_path}.branches must contain at least one branch")
+
+        if not outgoing:
+            errors.append(f"{node_path} non-end nodes must have an outgoing transition")
+
+    for node in definition.nodes:
+        if node.id and node.id in nodes_by_id and node.id not in reachable:
+            errors.append(f"nodes.{node.id} is unreachable from start")
+
+    if definition.start in nodes_by_id and _has_cycle(definition, nodes_by_id):
+        errors.append("flow graph cannot contain cycles")
+    if definition.start in nodes_by_id and _can_end_without_reference(definition, nodes_by_id):
+        errors.append("every terminal path must pass through reference_number")
+
+    return errors
+
+
+def _usable_flow_definition(raw: Any) -> _FlowDefinition | None:
+    if raw is None:
+        return None
+    definition = _normalize_flow_definition(raw)
+    if definition is None:
+        logger.warning(
+            "flow_definition_invalid_default_flow",
+            reason="malformed",
+            error_count=1,
+            errors=["flow_definition must match version/start/nodes shape"],
+        )
+        return None
+    errors = _flow_definition_errors(definition)
+    if errors:
+        logger.warning(
+            "flow_definition_invalid_default_flow",
+            reason="validation_error",
+            error_count=len(errors),
+            errors=errors[:10],
+        )
+        return None
+    return definition
+
+
+_FUNCTION_NAME_RE = re.compile(r"[^a-zA-Z0-9_]+")
+
+
+def _advance_name_for_flow_node(node: _FlowNode) -> str:
+    if node.id == REQUIRED_REFERENCE_NODE_ID:
+        return "record_reference_number"
+    suffix = _FUNCTION_NAME_RE.sub("_", node.id.strip()).strip("_").lower()
+    return f"advance_{suffix or 'flow_step'}"
+
+
+def _task_for_flow_node(*, node: _FlowNode, ivr_path: str, ivr_goal: str) -> str:
+    if node.id == NAVIGATE:
+        parts = [build_navigate_task(ivr_path=ivr_path, ivr_goal=ivr_goal)]
+    else:
+        label = node.label.strip() or node.id.replace("_", " ")
+        prompt = node.say.strip() or f"Proceed with the {label} step."
+        parts = [prompt]
+
+    if node.capture:
+        fields = ", ".join(field.replace("_", " ") for field in node.capture)
+        parts.append(f"Capture these field(s) during this step when available: {fields}.")
+    if node.id == REQUIRED_REFERENCE_NODE_ID:
+        parts.append(
+            "You must ask for and capture the call reference or confirmation number. "
+            f"Once provided, call {_advance_name_for_flow_node(node)} with "
+            f"{REQUIRED_REFERENCE_FIELD} exactly as stated."
+        )
+    elif node.type == "branch":
+        branch_lines = [
+            f"- {branch.when}: {branch.to}" for branch in node.branches if branch.when and branch.to
+        ]
+        fallback = node.fallback or ""
+        parts.append(
+            "Choose the next step by calling the advance function with branch_to. "
+            "Use the fallback if none of the branch conditions match."
+        )
+        if branch_lines:
+            parts.append("Branch options:\n" + "\n".join(branch_lines))
+        if fallback:
+            parts.append(f"Fallback branch_to: {fallback}")
+    elif node.type == "transfer":
+        parts.append("Use the transfer_call tool if the call should be transferred at this step.")
+    elif node.type != "end":
+        parts.append(f"When this step is complete, call {_advance_name_for_flow_node(node)}.")
+    else:
+        parts.append("Use the end_call tool when the call is finished.")
+    return "\n\n".join(parts)
+
+
+def _advance_function_for_flow_node(
+    node: _FlowNode,
+    build_next: Callable[[str], NodeConfig | None],
+) -> FlowsFunctionSchema:
+    async def handler(args: FlowArgs, flow_manager: FlowManager) -> ConsolidatedFunctionResult:
+        captured: dict[str, str] = {}
+        for field in node.capture:
+            value = str(args.get(field) or "").strip()
+            if (
+                node.id == REQUIRED_REFERENCE_NODE_ID
+                and field == REQUIRED_REFERENCE_FIELD
+                and not value
+            ):
+                return {"status": "missing", "field": REQUIRED_REFERENCE_FIELD}, None
+            if value:
+                flow_manager.state[field] = value
+                captured[field] = value
+                if field == REQUIRED_REFERENCE_FIELD:
+                    flow_manager.state[REFERENCE_NUMBER] = value
+
+        target = node.next
+        if node.type == "branch":
+            allowed = {branch.to for branch in node.branches}
+            if node.fallback:
+                allowed.add(node.fallback)
+            requested = str(args.get("branch_to") or "").strip()
+            target = requested if requested in allowed else node.fallback
+        elif target is None:
+            target = node.fallback
+
+        next_node = build_next(target) if target else None
+        if target and next_node is None:
+            logger.warning(
+                "flow_definition_transition_missing_default_flow",
+                node_id=node.id,
+                target=target,
+            )
+        return {"status": "ok", **captured}, next_node
+
+    properties: dict[str, Any] = {}
+    required: list[str] = []
+    for field in node.capture:
+        properties[field] = {
+            "type": "string",
+            "description": f"The {field.replace('_', ' ')} captured during this step.",
+        }
+    if node.id == REQUIRED_REFERENCE_NODE_ID:
+        required.append(REQUIRED_REFERENCE_FIELD)
+        properties[REQUIRED_REFERENCE_FIELD] = {
+            "type": "string",
+            "description": "The call reference or confirmation number the representative provided.",
+        }
+    if node.type == "branch":
+        options = sorted(
+            {branch.to for branch in node.branches if branch.to}
+            | ({node.fallback} if node.fallback else set())
+        )
+        properties["branch_to"] = {
+            "type": "string",
+            "enum": options,
+            "description": "The next node id selected from the branch conditions, or the fallback.",
+        }
+
+    return FlowsFunctionSchema(
+        name=_advance_name_for_flow_node(node),
+        description=f"Advance from the {node.label or node.id} flow step.",
+        properties=properties,
+        required=required,
+        handler=handler,
+    )
+
+
 def _task_with_knowledge(
     *,
     step: _Step,
@@ -349,7 +742,7 @@ def _task_with_knowledge(
     return task + "\n\nKnown payer-level fact: " + hit.value
 
 
-def build_step_chain(
+def _build_default_step_chain(
     *,
     run_tool_core: RunToolCore,
     registry: Any,
@@ -360,7 +753,7 @@ def build_step_chain(
     knowledge_warmer: PrefetchWarmer | None = None,
     knowledge_context: PrefetchContext | None = None,
 ) -> NodeConfig:
-    """Build the post-verification step chain; return its first node.
+    """Build the default post-verification step chain; return its first node.
 
     Passed to :func:`app.flows.identity_gate.build_identity_gate_flow` as
     ``verified_node`` — so the gate transitions into ``navigate`` only
@@ -444,6 +837,116 @@ def build_step_chain(
     return build_node(0)
 
 
+def _build_data_driven_step_chain(
+    definition: _FlowDefinition,
+    *,
+    run_tool_core: RunToolCore,
+    registry: Any,
+    hydrated_system: str,
+    summary_prompt: str,
+    ivr_path: str,
+    ivr_goal: str,
+    knowledge_warmer: PrefetchWarmer | None,
+    knowledge_context: PrefetchContext | None,
+) -> NodeConfig:
+    nodes_by_id = _definition_node_map(definition)
+
+    def build_node(node_id: str, *, is_initial: bool = False) -> NodeConfig | None:
+        step = nodes_by_id.get(node_id)
+        if step is None:
+            return None
+
+        functions: list[FlowsFunctionSchema] = _tool_functions(registry, run_tool_core)
+        if step.type != "end":
+            functions.append(_advance_function_for_flow_node(step, build_node))
+
+        task = _task_for_flow_node(node=step, ivr_path=ivr_path, ivr_goal=ivr_goal)
+        task = _task_with_knowledge(
+            step=_Step(name=step.id, task=task),
+            task=task,
+            knowledge_warmer=knowledge_warmer,
+            knowledge_context=knowledge_context,
+        )
+
+        node: NodeConfig = {
+            "name": step.id,
+            "task_messages": [{"role": "system", "content": task}],
+            "functions": functions,
+            "respond_immediately": True,
+        }
+        if is_initial:
+            node["role_message"] = hydrated_system
+            node["context_strategy"] = ContextStrategyConfig(strategy=ContextStrategy.RESET)
+        else:
+            node["context_strategy"] = ContextStrategyConfig(
+                strategy=ContextStrategy.RESET_WITH_SUMMARY,
+                summary_prompt=summary_prompt,
+            )
+        return node
+
+    first = build_node(definition.start, is_initial=True)
+    if first is None:
+        logger.warning(
+            "flow_definition_transition_missing_default_flow",
+            node_id="__start__",
+            target=definition.start,
+        )
+        return _build_default_step_chain(
+            run_tool_core=run_tool_core,
+            registry=registry,
+            hydrated_system=hydrated_system,
+            summary_prompt=summary_prompt,
+            ivr_path=ivr_path,
+            ivr_goal=ivr_goal,
+            knowledge_warmer=knowledge_warmer,
+            knowledge_context=knowledge_context,
+        )
+    return first
+
+
+def build_step_chain(
+    *,
+    run_tool_core: RunToolCore,
+    registry: Any,
+    hydrated_system: str,
+    summary_prompt: str = SUMMARY_PROMPT,
+    ivr_path: str = "",
+    ivr_goal: str = "",
+    knowledge_warmer: PrefetchWarmer | None = None,
+    knowledge_context: PrefetchContext | None = None,
+    flow_definition: dict[str, Any] | None = None,
+) -> NodeConfig:
+    """Build the post-verification step chain; return its first node.
+
+    When runtime-config provides a valid data-driven ``flow_definition``, the
+    graph drives the nodes and transitions. Missing or invalid definitions
+    safely fall back to the original fixed 8-step flow.
+    """
+    definition = _usable_flow_definition(flow_definition)
+    if definition is None:
+        return _build_default_step_chain(
+            run_tool_core=run_tool_core,
+            registry=registry,
+            hydrated_system=hydrated_system,
+            summary_prompt=summary_prompt,
+            ivr_path=ivr_path,
+            ivr_goal=ivr_goal,
+            knowledge_warmer=knowledge_warmer,
+            knowledge_context=knowledge_context,
+        )
+    return _build_data_driven_step_chain(
+        definition,
+        run_tool_core=run_tool_core,
+        registry=registry,
+        hydrated_system=hydrated_system,
+        summary_prompt=summary_prompt,
+        ivr_path=ivr_path,
+        ivr_goal=ivr_goal,
+        knowledge_warmer=knowledge_warmer,
+        knowledge_context=knowledge_context,
+    )
+
+
 # Re-exported for tests / bot.py without restating the dataclass.
 __all__ = [
     "ASK_NEEDS",
@@ -454,6 +957,8 @@ __all__ = [
     "NAVIGATE",
     "NAVIGATE_BASE_TASK",
     "REFERENCE_NUMBER",
+    "REQUIRED_REFERENCE_FIELD",
+    "REQUIRED_REFERENCE_NODE_ID",
     "STEPS",
     "SUMMARY_PROMPT",
     "WRAP",

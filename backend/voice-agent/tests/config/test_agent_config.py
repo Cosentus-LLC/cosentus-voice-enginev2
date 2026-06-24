@@ -32,6 +32,7 @@ def _runtime_config_json() -> dict[str, Any]:
         "description": "Outbound claim-status agent",
         "system_prompt": "You are a Cosentus voice agent...",
         "first_message": "Hi, I'm calling about a claim status.",
+        "flow_definition": None,
         "ivr_goal": "Reach a claims rep",
         "llm": {
             "provider": "anthropic",  # extra in v2
@@ -120,6 +121,7 @@ class TestAgentConfigParse:
         assert cfg.display_name == "Chris (Claim Status)"
         assert cfg.system_prompt == "You are a Cosentus voice agent..."
         assert cfg.first_message == "Hi, I'm calling about a claim status."
+        assert cfg.flow_definition is None
         assert cfg.ivr_goal == "Reach a claims rep"
 
         assert cfg.llm.model == "claude-sonnet-4-6"
@@ -156,6 +158,34 @@ class TestAgentConfigParse:
         body["post_call_analyses"] = None
         cfg = AgentConfig.model_validate(body)
         assert cfg.post_call_analyses is None
+
+    def test_flow_definition_object_parses(self):
+        flow = {
+            "version": 1,
+            "start": "reference_number",
+            "nodes": [
+                {
+                    "id": "reference_number",
+                    "type": "ask",
+                    "capture": ["call_reference"],
+                    "required": True,
+                    "next": "done",
+                },
+                {"id": "done", "type": "end"},
+            ],
+        }
+        body = _runtime_config_json()
+        body["flow_definition"] = flow
+
+        cfg = AgentConfig.model_validate(body)
+
+        assert cfg.flow_definition == flow
+
+    def test_flow_definition_is_modeled_in_dump(self):
+        flow = {"version": 1, "start": "reference_number", "nodes": []}
+        cfg = AgentConfig.model_validate({"name": "agent", "flow_definition": flow})
+
+        assert cfg.model_dump()["flow_definition"] == flow
 
     def test_meta_alias_underscore_meta_deserializes(self):
         # The lambda sends ``_meta`` (wire convention); the Python
@@ -258,6 +288,18 @@ class TestUnknownFieldLogging:
         mock_logger = mocker.patch("app.config.agent_config.logger")
 
         AgentConfig.model_validate(_runtime_config_json())
+
+        assert self._unknown_field_warnings(mock_logger) == []
+
+    def test_flow_definition_is_not_logged_as_unknown(self, mocker):
+        mock_logger = mocker.patch("app.config.agent_config.logger")
+
+        AgentConfig.model_validate(
+            {
+                "name": "agent",
+                "flow_definition": {"version": 1, "start": "reference_number", "nodes": []},
+            }
+        )
 
         assert self._unknown_field_warnings(mock_logger) == []
 

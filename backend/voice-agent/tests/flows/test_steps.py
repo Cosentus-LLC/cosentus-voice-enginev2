@@ -19,7 +19,7 @@ so the ``RESET_WITH_SUMMARY`` ``DeprecationWarning`` is not triggered and
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 from app.flows.steps import (
@@ -27,6 +27,8 @@ from app.flows.steps import (
     NAVIGATE,
     NAVIGATE_BASE_TASK,
     REFERENCE_NUMBER,
+    REQUIRED_REFERENCE_FIELD,
+    REQUIRED_REFERENCE_NODE_ID,
     STEPS,
     WRAP,
     build_navigate_task,
@@ -67,17 +69,72 @@ def _registry(tool_names: list[str]) -> MagicMock:
     return reg
 
 
-def _chain(tool_names: list[str] | None = None, hydrated_system: str = "HYDRATED-SYSTEM-PROMPT"):
+def _chain(
+    tool_names: list[str] | None = None,
+    hydrated_system: str = "HYDRATED-SYSTEM-PROMPT",
+    flow_definition: dict | None = None,
+):
     return build_step_chain(
         run_tool_core=AsyncMock(return_value=({"status": "ok"}, False)),
         registry=_registry(tool_names or []),
         hydrated_system=hydrated_system,
+        flow_definition=flow_definition,
     )
 
 
 def _advance_fn(node):
     """The chain always appends the advance function last (after tools)."""
     return node["functions"][-1]
+
+
+def _custom_flow() -> dict:
+    return {
+        "version": 1,
+        "start": "intro",
+        "nodes": [
+            {
+                "id": "intro",
+                "type": "ask",
+                "label": "Intro",
+                "say": "Ask the representative to confirm the denial status.",
+                "next": "route_submission",
+            },
+            {
+                "id": "route_submission",
+                "type": "branch",
+                "label": "Route submission",
+                "say": "Decide whether the payer requires fax or portal submission.",
+                "branches": [
+                    {"when": "Representative says fax is required", "to": "fax_path"},
+                    {"when": "Representative says portal is required", "to": "portal_path"},
+                ],
+                "fallback": "fax_path",
+            },
+            {
+                "id": "fax_path",
+                "type": "ask",
+                "say": "Confirm the fax number.",
+                "capture": ["fax_number"],
+                "next": REQUIRED_REFERENCE_NODE_ID,
+            },
+            {
+                "id": "portal_path",
+                "type": "ask",
+                "say": "Confirm the portal name.",
+                "capture": ["portal_name"],
+                "next": REQUIRED_REFERENCE_NODE_ID,
+            },
+            {
+                "id": REQUIRED_REFERENCE_NODE_ID,
+                "type": "ask",
+                "say": "Ask for a call reference number.",
+                "capture": [REQUIRED_REFERENCE_FIELD],
+                "required": True,
+                "next": "done",
+            },
+            {"id": "done", "type": "end", "say": "Wrap up and end the call."},
+        ],
+    }
 
 
 async def _walk_to(node, target_name):
@@ -124,6 +181,162 @@ class TestOrdering:
         wrap = STEPS[-1]
         assert wrap.name == WRAP
         assert wrap.advance_name == ""
+
+
+# ── Data-driven flow definitions (#5) ────────────────────────────────────
+
+
+class TestDataDrivenFlow:
+    @pytest.mark.asyncio
+    async def test_custom_flow_builds_nodes_and_edges_from_runtime_definition(self):
+        node = _chain(flow_definition=_custom_flow())
+        fm = _fm()
+
+        assert node["name"] == "intro"
+        _result, node = await _advance_fn(node).handler({}, fm)
+        assert node["name"] == "route_submission"
+        _result, node = await _advance_fn(node).handler({"branch_to": "portal_path"}, fm)
+        assert node["name"] == "portal_path"
+        _result, node = await _advance_fn(node).handler({"portal_name": "Availity"}, fm)
+        assert node["name"] == REQUIRED_REFERENCE_NODE_ID
+        _result, node = await _advance_fn(node).handler({REQUIRED_REFERENCE_FIELD: "REF-1"}, fm)
+        assert node["name"] == "done"
+
+    @pytest.mark.asyncio
+    async def test_no_flow_definition_uses_default_step_order(self):
+        node = _chain(flow_definition=None)
+        fm = _fm()
+        names: list[str] = []
+        while True:
+            names.append(node["name"])
+            if not node["functions"]:
+                break
+            args = {"reference_number": "REF-1"} if node["name"] == REFERENCE_NUMBER else {}
+            _result, node = await _advance_fn(node).handler(args, fm)
+
+        assert names == [s.name for s in STEPS]
+
+    def test_malformed_flow_definition_falls_back_to_default_and_logs_warning(self, mocker):
+        mock_logger = mocker.patch("app.flows.steps.logger")
+        flow = {
+            "version": 1,
+            "start": "intro",
+            "nodes": [{"id": "intro", "type": "end"}],
+        }
+
+        chain = _chain(flow_definition=flow)
+
+        assert chain["name"] == NAVIGATE
+        mock_logger.warning.assert_called_with(
+            "flow_definition_invalid_default_flow",
+            reason="validation_error",
+            error_count=ANY,
+            errors=ANY,
+        )
+
+    @pytest.mark.asyncio
+    async def test_custom_reference_number_requires_call_reference(self):
+        node = await _walk_to(_chain(flow_definition=_custom_flow()), REQUIRED_REFERENCE_NODE_ID)
+
+        result, next_node = await _advance_fn(node).handler({REQUIRED_REFERENCE_FIELD: " "}, _fm())
+
+        assert next_node is None
+        assert result["status"] == "missing"
+        assert result["field"] == REQUIRED_REFERENCE_FIELD
+
+    @pytest.mark.asyncio
+    async def test_custom_reference_number_records_both_state_keys(self):
+        node = await _walk_to(_chain(flow_definition=_custom_flow()), REQUIRED_REFERENCE_NODE_ID)
+        fm = _fm()
+
+        result, next_node = await _advance_fn(node).handler(
+            {REQUIRED_REFERENCE_FIELD: "REF-123"},
+            fm,
+        )
+
+        assert next_node["name"] == "done"
+        assert result[REQUIRED_REFERENCE_FIELD] == "REF-123"
+        assert fm.state[REQUIRED_REFERENCE_FIELD] == "REF-123"
+        assert fm.state[REFERENCE_NUMBER] == "REF-123"
+
+    @pytest.mark.asyncio
+    async def test_custom_branch_uses_selected_branch_target(self):
+        flow = _custom_flow()
+        _result, branch = await _advance_fn(_chain(flow_definition=flow)).handler({}, _fm())
+
+        _result, next_node = await _advance_fn(branch).handler({"branch_to": "portal_path"}, _fm())
+
+        assert next_node["name"] == "portal_path"
+
+    @pytest.mark.asyncio
+    async def test_custom_branch_missing_or_invalid_selection_uses_fallback(self):
+        flow = _custom_flow()
+        _result, branch = await _advance_fn(_chain(flow_definition=flow)).handler({}, _fm())
+
+        _result, missing_next = await _advance_fn(branch).handler({}, _fm())
+        _result, invalid_next = await _advance_fn(branch).handler({"branch_to": "nope"}, _fm())
+
+        assert missing_next["name"] == "fax_path"
+        assert invalid_next["name"] == "fax_path"
+
+    @pytest.mark.asyncio
+    async def test_custom_first_node_resets_and_later_nodes_use_summary(self):
+        node = _chain(hydrated_system="HYDRATED-PHI-PROMPT", flow_definition=_custom_flow())
+
+        assert node["role_message"] == "HYDRATED-PHI-PROMPT"
+        assert node["context_strategy"].strategy == ContextStrategy.RESET
+        _result, node = await _advance_fn(node).handler({}, _fm())
+        assert "role_message" not in node
+        assert node["context_strategy"].strategy == ContextStrategy.RESET_WITH_SUMMARY
+
+    def test_custom_flow_advertises_tools_at_every_non_terminal_node(self):
+        node = _chain(tool_names=["end_call", "transfer_call"], flow_definition=_custom_flow())
+
+        names = [f.name for f in node["functions"]]
+
+        assert "end_call" in names
+        assert "transfer_call" in names
+        assert _advance_fn(node).name == "advance_intro"
+
+    @pytest.mark.asyncio
+    async def test_custom_deadline_node_keeps_cached_knowledge_hint(self):
+        flow = {
+            "version": 1,
+            "start": "deadline",
+            "nodes": [
+                {
+                    "id": "deadline",
+                    "type": "ask",
+                    "say": "Confirm the timely filing deadline.",
+                    "next": REQUIRED_REFERENCE_NODE_ID,
+                },
+                {
+                    "id": REQUIRED_REFERENCE_NODE_ID,
+                    "type": "ask",
+                    "capture": [REQUIRED_REFERENCE_FIELD],
+                    "required": True,
+                    "next": "done",
+                },
+                {"id": "done", "type": "end"},
+            ],
+        }
+        warmer = MagicMock()
+        warmer.live_read.return_value = CacheHit(
+            value="Aetna timely filing is 120 days.",
+            similarity=1.0,
+            query="timely filing limit for Aetna",
+        )
+
+        chain = build_step_chain(
+            run_tool_core=AsyncMock(return_value=({"status": "ok"}, False)),
+            registry=_registry([]),
+            hydrated_system="SYS",
+            knowledge_warmer=warmer,
+            knowledge_context=PrefetchContext(payer="Aetna"),
+            flow_definition=flow,
+        )
+
+        assert "Known payer-level fact: Aetna timely filing is 120 days." in _navigate_task(chain)
 
 
 # ── Un-skippable reference number ─────────────────────────────────────────
