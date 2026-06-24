@@ -417,6 +417,29 @@ class TestMetricsObserver:
             _pushed(_metrics_frame(TTSUsageMetricsData(processor="TTS#0", value=5)))
         )  # no exception, nowhere for the tally to go
 
+    @pytest.mark.asyncio
+    async def test_average_llm_ttfb_ms_returns_integer_average(self):
+        obs = MetricsObserver(processor_stage={"LLM#0": "llm"})
+        await obs.on_push_frame(
+            _pushed(
+                _metrics_frame(
+                    TTFBMetricsData(processor="LLM#0", value=0.5),
+                    TTFBMetricsData(processor="LLM#0", value=1.001),
+                )
+            )
+        )
+
+        assert obs.average_llm_ttfb_ms() == 750
+
+    @pytest.mark.asyncio
+    async def test_average_llm_ttfb_ms_returns_none_without_llm_sample(self):
+        obs = MetricsObserver(processor_stage={"STT#0": "stt"})
+        await obs.on_push_frame(
+            _pushed(_metrics_frame(TTFBMetricsData(processor="STT#0", value=0.1)))
+        )
+
+        assert obs.average_llm_ttfb_ms() is None
+
 
 # ── The hard PHI guarantee (acceptance) ────────────────────────────────────
 

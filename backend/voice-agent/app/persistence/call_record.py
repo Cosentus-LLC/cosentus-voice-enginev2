@@ -141,6 +141,15 @@ class CallRecord:
     """Real characters synthesized by TTS for the whole call. Feeds
     ``voice_call_costs.tts_chars``. See :attr:`llm_tokens_in`."""
 
+    terminal_step: str | None = None
+    """PHI-free dashboard bucket for where the call ended in the flow."""
+
+    transferred: bool = False
+    """Whether the call successfully initiated a human transfer."""
+
+    latency_ms: int | None = None
+    """Representative per-call latency in milliseconds; currently average LLM TTFB."""
+
     def __post_init__(self) -> None:
         if self.status not in _VALID_STATUSES:
             raise ValueError(
@@ -186,6 +195,9 @@ class CallRecord:
             "llm_tokens_in": int(self.llm_tokens_in),
             "llm_tokens_out": int(self.llm_tokens_out),
             "tts_chars": int(self.tts_chars),
+            "terminal_step": self.terminal_step,
+            "transferred": bool(self.transferred),
+            "latency_ms": int(self.latency_ms) if self.latency_ms is not None else None,
             "updated_at": datetime.now(UTC).isoformat(),
         }
 

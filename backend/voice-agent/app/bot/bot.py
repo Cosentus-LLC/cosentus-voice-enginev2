@@ -97,6 +97,7 @@ from pipecat.utils.context.llm_context_summarization import (
     LLMContextSummaryConfig,
 )
 
+from app.bot.intelligence import terminal_step_for_node
 from app.bot.lifecycle import finalize_call
 from app.config.agent_config import AgentConfig, load_agent_config
 from app.config.payer_knowledge import load_payer_ivr_path
@@ -434,6 +435,7 @@ async def run_bot(
     # ``verify_identity`` flow function (Layer B) flips it True after a
     # deterministic code check against ``case_data``.
     verification_state: dict[str, bool] = {"verified": not settings.flows_enabled}
+    call_intelligence: dict[str, bool] = {"transferred": False}
 
     # ── Knowledge prefetch (#56) ──────────────────────────────────────
     # Off by default. When enabled, every call gets an isolated in-memory cache
@@ -593,6 +595,14 @@ async def run_bot(
                 error=str(exc)[:500],
                 run_llm=True,
             )
+
+        if (
+            tool_name == "transfer_call"
+            and result.status is ToolStatus.SUCCESS
+            and isinstance(result.data, dict)
+            and result.data.get("transferred_to")
+        ):
+            call_intelligence["transferred"] = True
 
         # Layer 7's tool-turn capture. Synchronous with execution, all
         # data already in scope. Best-effort — a transcript append
@@ -1067,6 +1077,10 @@ async def run_bot(
                 logger.warning("knowledge_prefetch_cleanup_failed", call_id=call_id)
 
         try:
+            terminal_step = terminal_step_for_node(
+                flow_manager.current_node,
+                flows_enabled=settings.flows_enabled,
+            )
             await finalize_call(
                 call_id=call_id,
                 agent=agent,
@@ -1085,6 +1099,9 @@ async def run_bot(
                 settings=settings,
                 otel_parent_context=root_ctx,
                 usage_accumulator=usage_accumulator,
+                terminal_step=terminal_step,
+                transferred=call_intelligence["transferred"],
+                latency_ms=metrics_observer.average_llm_ttfb_ms(),
             )
         except Exception:  # noqa: BLE001 — never let finalize crash run_bot
             logger.exception(

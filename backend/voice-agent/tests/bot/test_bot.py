@@ -635,6 +635,135 @@ async def test_run_bot_calls_finalize_on_cancelled_error_too():
     assert fk["call_error"] is None
 
 
+@pytest.mark.asyncio
+async def test_run_bot_passes_terminal_step_and_latency_to_finalize():
+    agent, mocks = _patch_run_bot_dependencies()
+    transport = _make_transport_mock()
+    fm = _flow_manager_mock()
+    fm.current_node = "reference_number"
+    metrics = MagicMock()
+    metrics.average_llm_ttfb_ms.return_value = 842
+    patches = _start_run_bot_patches(agent, mocks, transport) + [
+        patch("app.bot.bot.build_flow_manager", MagicMock(return_value=fm)),
+        patch("app.bot.bot.MetricsObserver", MagicMock(return_value=metrics)),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        await run_bot(transport, _runner_args(), _settings())
+    finally:
+        for p in patches:
+            p.stop()
+
+    fk = mocks["finalize_kwargs"]
+    assert fk["terminal_step"] == "reference_number"
+    assert fk["latency_ms"] == 842
+    assert fk["transferred"] is False
+
+
+@pytest.mark.asyncio
+async def test_run_bot_maps_default_flow_node_to_dashboard_step():
+    agent, mocks = _patch_run_bot_dependencies()
+    transport = _make_transport_mock()
+    fm = _flow_manager_mock()
+    fm.current_node = "wrap"
+    metrics = MagicMock()
+    metrics.average_llm_ttfb_ms.return_value = None
+    patches = _start_run_bot_patches(agent, mocks, transport) + [
+        patch("app.bot.bot.build_flow_manager", MagicMock(return_value=fm)),
+        patch("app.bot.bot.MetricsObserver", MagicMock(return_value=metrics)),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        await run_bot(transport, _runner_args(), _settings())
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert mocks["finalize_kwargs"]["terminal_step"] == "wrap_up"
+
+
+@pytest.mark.asyncio
+async def test_successful_transfer_marks_call_transferred():
+    executor = _executor_mock(
+        ToolResult(
+            status=ToolStatus.SUCCESS,
+            data={"transferred_to": "billing"},
+            run_llm=False,
+        )
+    )
+    agent, mocks = _patch_run_bot_dependencies(
+        agent=_agent(tools=[ToolConfig(type="transfer_call", description="")])
+    )
+    transport = _make_transport_mock()
+    fm = _flow_manager_mock()
+
+    class _TransferRunner:
+        def __init__(self, *args, **kwargs):
+            mocks["runner_kwargs"] = kwargs
+
+        async def run(self, task):
+            handlers = {
+                c.kwargs["function_name"]: c.kwargs["handler"]
+                for c in mocks["llm"].register_function.call_args_list
+                if "function_name" in c.kwargs
+            }
+            await handlers["transfer_call"](_FakeParams({"target": "billing"}))
+
+    mocks["runner_class"] = _TransferRunner
+    patches = _start_run_bot_patches(agent, mocks, transport) + [
+        patch("app.bot.bot.ToolExecutor", MagicMock(return_value=executor)),
+        patch("app.bot.bot.build_flow_manager", MagicMock(return_value=fm)),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        await run_bot(transport, _runner_args(), _settings())
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert mocks["finalize_kwargs"]["transferred"] is True
+
+
+@pytest.mark.asyncio
+async def test_failed_transfer_does_not_mark_call_transferred():
+    executor = _executor_mock(ToolResult(status=ToolStatus.ERROR, error="boom"))
+    agent, mocks = _patch_run_bot_dependencies(
+        agent=_agent(tools=[ToolConfig(type="transfer_call", description="")])
+    )
+    transport = _make_transport_mock()
+    fm = _flow_manager_mock()
+
+    class _TransferRunner:
+        def __init__(self, *args, **kwargs):
+            mocks["runner_kwargs"] = kwargs
+
+        async def run(self, task):
+            handlers = {
+                c.kwargs["function_name"]: c.kwargs["handler"]
+                for c in mocks["llm"].register_function.call_args_list
+                if "function_name" in c.kwargs
+            }
+            await handlers["transfer_call"](_FakeParams({"target": "billing"}))
+
+    mocks["runner_class"] = _TransferRunner
+    patches = _start_run_bot_patches(agent, mocks, transport) + [
+        patch("app.bot.bot.ToolExecutor", MagicMock(return_value=executor)),
+        patch("app.bot.bot.build_flow_manager", MagicMock(return_value=fm)),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        await run_bot(transport, _runner_args(), _settings())
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert mocks["finalize_kwargs"]["transferred"] is False
+
+
 # ── Tool registration ────────────────────────────────────────────────────
 
 
@@ -671,6 +800,7 @@ async def test_run_bot_registers_each_tool_with_llm():
 def _flow_manager_mock() -> MagicMock:
     fm = MagicMock()
     fm.initialize = AsyncMock()
+    fm.current_node = None
     return fm
 
 
