@@ -304,6 +304,7 @@ class AgentConfig(_RuntimeConfigModel):
     first_message: str = ""
     flow_definition: dict[str, Any] | None = None
     ivr_goal: str = ""
+    identity_verification_keys: list[str] = Field(default_factory=list)
 
     speak_first: bool = True
     """Whether the agent speaks first when the call starts.
