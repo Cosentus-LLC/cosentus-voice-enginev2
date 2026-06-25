@@ -442,6 +442,7 @@ async def run_bot(
         "verified": not settings.flows_enabled or not gate_required
     }
     call_intelligence: dict[str, bool] = {"transferred": False}
+    ivr_navigation_state: dict[str, Any] = {}
 
     # ── Knowledge prefetch (#56) ──────────────────────────────────────
     # Off by default. When enabled, every call gets an isolated in-memory cache
@@ -584,6 +585,8 @@ async def run_bot(
             transport=transport,
             queue_frame=task.queue_frame,
             tool_settings=registry.get_settings(tool_name),
+            message_history=list(getattr(context, "messages", [])),
+            ivr_navigation_state=ivr_navigation_state,
             otel_context=root_ctx,
         )
 

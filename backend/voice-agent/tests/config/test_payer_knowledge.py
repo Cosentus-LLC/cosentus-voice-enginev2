@@ -105,6 +105,24 @@ class TestRendering:
         path = PayerIvrPath(ivr_path_claims=[step])
         assert path.as_navigation_text() == "1. press 2"
 
+    def test_renders_wait_ms_instruction(self):
+        path = PayerIvrPath.model_validate(
+            {"ivr_path_claims": [{"step": 1, "press": "3", "wait_ms": 2000}]}
+        )
+        assert path.as_navigation_text() == "1. press 3; wait 2.0s for the next IVR prompt"
+
+    def test_renders_wait_seconds_instruction(self):
+        path = PayerIvrPath.model_validate(
+            {"ivr_path_claims": [{"step": 1, "press": "3", "waitSeconds": 1.5}]}
+        )
+        assert path.as_navigation_text() == "1. press 3; wait 1.5s for the next IVR prompt"
+
+    def test_renders_wait_for_instruction(self):
+        path = PayerIvrPath.model_validate(
+            {"ivr_path_claims": [{"step": 1, "press": "3", "waitFor": "claims menu"}]}
+        )
+        assert path.as_navigation_text() == "1. press 3; wait for claims menu"
+
 
 # ── Loader: success ──────────────────────────────────────────────────────────
 

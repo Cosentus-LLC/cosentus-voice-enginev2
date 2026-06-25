@@ -507,6 +507,14 @@ class TestNavigateTask:
         task = build_navigate_task(ivr_path="1. press 3")
         assert "navigate by ear" in task.lower()
 
+    def test_navigate_task_instructs_wait_for_new_prompt_and_fallback(self):
+        task = build_navigate_task()
+        lower = task.lower()
+        assert "wait for the next ivr prompt" in lower
+        assert "never repeat the same digit" in lower
+        assert "press 0 once" in lower
+        assert "representative" in lower
+
     def test_includes_ivr_goal_when_present(self):
         task = build_navigate_task(ivr_goal="Reach a claims rep")
         assert NAVIGATE_BASE_TASK in task
@@ -533,6 +541,20 @@ class TestNavigateTask:
         # Later steps keep their fixed task verbatim (path not leaked).
         _result, greet_node = await _advance_fn(chain).handler({}, _fm())
         assert "press 1" not in _navigate_task(greet_node)
+
+    @pytest.mark.asyncio
+    async def test_verified_path_mentions_wait_instructions_when_present(self):
+        chain = build_step_chain(
+            run_tool_core=AsyncMock(return_value=({"status": "ok"}, False)),
+            registry=_registry([]),
+            hydrated_system="SYS",
+            ivr_path="1. Claims — press 1; wait 2.0s for the next IVR prompt",
+        )
+
+        assert "wait 2.0s for the next IVR prompt" in _navigate_task(chain)
+        assert "honor any wait instructions" in _navigate_task(chain)
+        _result, greet_node = await _advance_fn(chain).handler({}, _fm())
+        assert "wait 2.0s" not in _navigate_task(greet_node)
 
 
 class TestKnowledgeTaskHints:

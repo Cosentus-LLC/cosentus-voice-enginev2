@@ -81,12 +81,15 @@ class IvrStep(BaseModel):
       :data:`_ACTION_PHRASES`: a dynamic value the agent keys in.
     """
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
     step: int | None = None
     label: str = ""
     press: str = ""
     action: str = ""
+    wait_ms: int | None = Field(default=None, alias="waitMs")
+    wait_seconds: float | None = Field(default=None, alias="waitSeconds")
+    wait_for: str = Field(default="", alias="waitFor")
 
 
 class PayerIvrPath(BaseModel):
@@ -125,7 +128,9 @@ class PayerIvrPath(BaseModel):
             # gaps in the displayed sequence.
             number = step.step if isinstance(step.step, int) and step.step > 0 else len(lines) + 1
             label = step.label.strip()
-            lines.append(f"{number}. {label} — {verb}" if label else f"{number}. {verb}")
+            wait = _step_wait_instruction(step)
+            action = f"{verb}; {wait}" if wait else verb
+            lines.append(f"{number}. {label} — {action}" if label else f"{number}. {action}")
         return "\n".join(lines)
 
 
@@ -138,6 +143,18 @@ def _step_verb(step: IvrStep) -> str | None:
     if action:
         return _ACTION_PHRASES.get(action, _ACTION_FALLBACK_PHRASE)
     return None
+
+
+def _step_wait_instruction(step: IvrStep) -> str:
+    """Render optional per-step wait guidance, preserving blank-by-default rows."""
+    wait_for = step.wait_for.strip()
+    if wait_for:
+        return f"wait for {wait_for}"
+    if isinstance(step.wait_ms, int) and step.wait_ms > 0:
+        return f"wait {step.wait_ms / 1000:.1f}s for the next IVR prompt"
+    if isinstance(step.wait_seconds, (int, float)) and step.wait_seconds > 0:
+        return f"wait {float(step.wait_seconds):.1f}s for the next IVR prompt"
+    return ""
 
 
 def _build_proxy_event(payer_id: str) -> bytes:
