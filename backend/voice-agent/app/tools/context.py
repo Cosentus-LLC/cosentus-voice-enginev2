@@ -52,8 +52,12 @@ class ToolContext:
             for ``transfer_call``. Sourced from
             ``AgentConfig.tools[].settings`` at registry-build time.
         message_history: Recent conversation turns. Currently unused
-            by v2's three tools; kept available for future
-            deterministic responses that want context.
+            by most v2 tools; ``press_digit`` uses it to identify the
+            latest heard IVR prompt before deciding whether another
+            keypad press is allowed.
+        ivr_navigation_state: Mutable per-call IVR guard state shared
+            across ``press_digit`` invocations. Owned by ``run_bot`` and
+            passed by reference so it never leaks across live calls.
         otel_context: The per-call ``voice.call`` root span's OpenTelemetry
             ``Context`` (#13). Layer 8 captures it once per call and passes
             it here so :class:`~app.tools.executor.ToolExecutor` parents each
@@ -68,6 +72,7 @@ class ToolContext:
     queue_frame: QueueFrameFn | None = None
     tool_settings: dict[str, Any] = field(default_factory=dict)
     message_history: list[dict[str, Any]] = field(default_factory=list)
+    ivr_navigation_state: dict[str, Any] = field(default_factory=dict)
     otel_context: Any = None
 
 

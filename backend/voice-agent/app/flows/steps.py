@@ -148,9 +148,12 @@ class _FlowDefinition:
 NAVIGATE_BASE_TASK = (
     "You have dialed the payer and reached their phone system. Navigate "
     "the IVR menus to reach a live claims representative — use the keypad "
-    "tool to select menu options as needed, and stay on the line through "
-    "any hold. Once you are speaking with a live representative, call "
-    "representative_reached."
+    "tool only after the IVR asks for keypad input, then wait for the next "
+    "IVR prompt before pressing again. Never repeat the same digit for the "
+    "same prompt. If the same prompt repeats or navigation stalls, change "
+    'strategy: press 0 once, say "representative", escalate or transfer if '
+    "available, or gracefully give up. Stay on the line through any hold. "
+    "Once you are speaking with a live representative, call representative_reached."
 )
 
 
@@ -179,10 +182,11 @@ def build_navigate_task(ivr_path: str = "", ivr_goal: str = "") -> str:
     if path:
         parts.append(
             "A verified menu path for this payer is known. Follow it using the "
-            "keypad tool: press the indicated digits, and for steps that ask you "
-            "to key in a value (NPI, claim number, tax ID) enter that value from "
-            "the call details. If the live menu does not match this path, ignore "
-            "it and navigate by ear instead:\n" + path
+            "keypad tool in order: press the indicated digits, honor any wait "
+            "instructions before the next press, and for steps that ask you to "
+            "key in a value (NPI, claim number, tax ID) enter that value from the "
+            "call details. If the live menu does not match this path, ignore it "
+            "and navigate by ear instead:\n" + path
         )
     return "\n\n".join(parts)
 

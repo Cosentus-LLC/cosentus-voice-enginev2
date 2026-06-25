@@ -42,6 +42,7 @@ audio + a 50 ms gap. 120 ms is the safe default. Override via
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 
@@ -68,6 +69,8 @@ DESCRIPTION_DEFAULT = (
 _VALID_DTMF_RE = re.compile(r"^[0-9*#]+$")
 
 _DEFAULT_PACING_MS = 120
+_MAX_UNPRODUCTIVE_PRESSES = 3
+_FALLBACK_DIGITS = frozenset({"0"})
 
 
 def _read_pacing_ms() -> int:
@@ -99,6 +102,117 @@ def _read_pacing_ms() -> int:
     return val
 
 
+def _latest_user_prompt(messages: list[dict]) -> str:
+    """Return the latest heard user/IVR text from LLM context messages."""
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+    return ""
+
+
+def _normalize_ivr_prompt(text: str) -> str:
+    """Normalize prompt text for deterministic same-prompt checks."""
+    return " ".join(text.lower().split())
+
+
+def _prompt_hash(prompt_norm: str) -> str:
+    if not prompt_norm:
+        return ""
+    return hashlib.sha256(prompt_norm.encode("utf-8")).hexdigest()[:12]
+
+
+def _check_ivr_navigation_guard(
+    digits: str,
+    context: ToolContext,
+) -> ToolResult | None:
+    """Block DTMF loops before they reach Daily.
+
+    The guard is intentionally exact and local: a new IVR prompt is a changed
+    latest user message in the call's LLM context. This guarantees the agent
+    cannot press the same digit twice for the same prompt, while still allowing
+    the same digit after the IVR advances to a new prompt.
+    """
+    state = context.ivr_navigation_state
+    prompt = _latest_user_prompt(context.message_history)
+    prompt_norm = _normalize_ivr_prompt(prompt)
+    last_prompt_norm = str(state.get("last_prompt_norm") or "")
+    last_digits = str(state.get("last_digits") or "")
+    same_prompt = not prompt_norm or prompt_norm == last_prompt_norm
+    fallback_key = prompt_norm or last_prompt_norm
+
+    if same_prompt and digits in _FALLBACK_DIGITS:
+        if state.get("fallback_prompt_norm") == fallback_key:
+            logger.warning(
+                "press_digit_blocked_repeated_fallback",
+                digits=digits,
+                prompt_hash=_prompt_hash(fallback_key),
+                call_id=context.call_id,
+            )
+            return error_result(
+                "Blocked repeated fallback keypad input: 0 was already pressed "
+                "for this IVR prompt. Wait for a new prompt or use a voice/"
+                "transfer/escalation strategy."
+            )
+        return None
+
+    if last_digits == digits and same_prompt:
+        state["blocked_repeat_count"] = int(state.get("blocked_repeat_count") or 0) + 1
+        logger.warning(
+            "press_digit_blocked_repeated_digit",
+            digits=digits,
+            prompt_hash=_prompt_hash(fallback_key),
+            blocked_repeat_count=state["blocked_repeat_count"],
+            call_id=context.call_id,
+        )
+        return error_result(
+            "Blocked repeated keypad input: wait for a new IVR prompt before "
+            "pressing the same digit again. If the menu is stuck, change "
+            "strategy by pressing 0 once, saying 'representative', escalating, "
+            "or gracefully giving up."
+        )
+
+    unproductive_count = int(state.get("unproductive_press_count") or 0)
+    if same_prompt and unproductive_count >= _MAX_UNPRODUCTIVE_PRESSES:
+        logger.warning(
+            "press_digit_blocked_unproductive_ivr",
+            digits=digits,
+            prompt_hash=_prompt_hash(fallback_key),
+            unproductive_press_count=unproductive_count,
+            max_unproductive_presses=_MAX_UNPRODUCTIVE_PRESSES,
+            call_id=context.call_id,
+        )
+        return error_result(
+            "Blocked keypad input: the IVR prompt has not changed after "
+            f"{_MAX_UNPRODUCTIVE_PRESSES} unproductive press attempts. "
+            "Change strategy now: press 0 once, say 'representative', "
+            "transfer/escalate if available, or gracefully give up."
+        )
+
+    return None
+
+
+def _record_ivr_navigation_press(digits: str, context: ToolContext) -> None:
+    """Record a successful Daily-accepted press for future guard checks."""
+    state = context.ivr_navigation_state
+    prompt = _latest_user_prompt(context.message_history)
+    prompt_norm = _normalize_ivr_prompt(prompt)
+    last_prompt_norm = str(state.get("last_prompt_norm") or "")
+    same_prompt = bool(prompt_norm and prompt_norm == last_prompt_norm)
+    unproductive_count = int(state.get("unproductive_press_count") or 0)
+
+    state["last_digits"] = digits
+    state["last_prompt"] = prompt
+    state["last_prompt_norm"] = prompt_norm
+    state["last_prompt_hash"] = _prompt_hash(prompt_norm)
+    state["unproductive_press_count"] = unproductive_count + 1 if same_prompt else 1
+    state["blocked_repeat_count"] = 0
+    if digits in _FALLBACK_DIGITS:
+        state["fallback_prompt_norm"] = prompt_norm or last_prompt_norm
+
+
 async def press_digit_executor(
     arguments: dict,
     context: ToolContext,
@@ -124,6 +238,10 @@ async def press_digit_executor(
         return error_result("No SIP session available for DTMF")
     if context.transport is None:
         return error_result("No transport available for DTMF")
+
+    guard_result = _check_ivr_navigation_guard(digits, context)
+    if guard_result is not None:
+        return guard_result
 
     pacing_ms = _read_pacing_ms()
 
@@ -170,6 +288,7 @@ async def press_digit_executor(
         sip_session_id=context.sip_session_id,
         call_id=context.call_id,
     )
+    _record_ivr_navigation_press(digits, context)
 
     return success_result(
         data={"digits_pressed": digits, "digit_count": len(digits)},

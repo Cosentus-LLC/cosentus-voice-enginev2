@@ -1378,6 +1378,32 @@ async def test_gated_tool_allowed_when_flows_disabled():
 
 
 @pytest.mark.asyncio
+async def test_run_bot_passes_message_history_and_shared_ivr_state_to_tool_context():
+    contexts = []
+
+    async def _execute(tool_name, arguments, context):
+        contexts.append(context)
+        context.ivr_navigation_state["seen"] = True
+        return ToolResult(status=ToolStatus.SUCCESS, run_llm=True)
+
+    executor = MagicMock()
+    executor.execute = AsyncMock(side_effect=_execute)
+    handlers = await _run_bot_capturing_tool_handlers(
+        tools=[ToolConfig(type="press_digit", description="")],
+        settings=_settings(),
+        executor=executor,
+    )
+
+    await handlers["press_digit"](_FakeParams({"digits": "1"}))
+    await handlers["press_digit"](_FakeParams({"digits": "2"}))
+
+    assert len(contexts) == 2
+    assert contexts[0].message_history == [{"role": "user", "content": "Hi."}]
+    assert contexts[0].ivr_navigation_state is contexts[1].ivr_navigation_state
+    assert contexts[1].ivr_navigation_state["seen"] is True
+
+
+@pytest.mark.asyncio
 async def test_verified_caller_can_use_gated_tool():
     """Once the shared verification_state flips to verified, the same
     gated tool handler executes — proving the gate + flow share one dict."""

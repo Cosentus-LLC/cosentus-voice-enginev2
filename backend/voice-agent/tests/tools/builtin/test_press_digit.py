@@ -41,6 +41,8 @@ def _ctx(
     sip_session_id: str | None = "sip-leg-1",
     transport: MagicMock | None = None,
     queue_frame: AsyncMock | None = None,
+    message_history: list[dict] | None = None,
+    ivr_navigation_state: dict | None = None,
 ) -> tuple[ToolContext, MagicMock, AsyncMock]:
     if transport is None:
         transport = MagicMock()
@@ -53,6 +55,8 @@ def _ctx(
             sip_session_id=sip_session_id,
             transport=transport,
             queue_frame=qf,
+            message_history=message_history or [],
+            ivr_navigation_state=ivr_navigation_state if ivr_navigation_state is not None else {},
         ),
         transport,
         qf,
@@ -155,6 +159,75 @@ class TestPressDigitExecutor:
         assert result.data is not None
         assert result.data["digits_pressed"] == "456"
         assert result.data["digit_count"] == 3
+
+    async def test_blocks_same_digit_without_new_ivr_prompt(self):
+        state: dict = {}
+        prompt = [{"role": "user", "content": "For claims, press 1."}]
+        ctx, transport, _ = _ctx(message_history=prompt, ivr_navigation_state=state)
+
+        first = await press_digit_executor({"digits": "1"}, ctx)
+        second = await press_digit_executor({"digits": "1"}, ctx)
+
+        assert first.status is ToolStatus.SUCCESS
+        assert second.status is ToolStatus.ERROR
+        assert "new IVR prompt" in (second.error or "")
+        assert transport.send_dtmf.await_count == 1
+
+    async def test_allows_same_digit_after_new_ivr_prompt(self):
+        state: dict = {}
+        first_prompt = [{"role": "user", "content": "For claims, press 1."}]
+        ctx, transport, _ = _ctx(message_history=first_prompt, ivr_navigation_state=state)
+
+        first = await press_digit_executor({"digits": "1"}, ctx)
+        ctx.message_history = [{"role": "user", "content": "For eligibility, press 1."}]
+        second = await press_digit_executor({"digits": "1"}, ctx)
+
+        assert first.status is ToolStatus.SUCCESS
+        assert second.status is ToolStatus.SUCCESS
+        assert transport.send_dtmf.await_count == 2
+
+    async def test_blocks_repeated_fallback_until_new_prompt(self):
+        state: dict = {"last_digits": "1", "last_prompt_norm": "for claims, press 1."}
+        prompt = [{"role": "user", "content": "For claims, press 1."}]
+        ctx, transport, _ = _ctx(message_history=prompt, ivr_navigation_state=state)
+
+        first = await press_digit_executor({"digits": "0"}, ctx)
+        second = await press_digit_executor({"digits": "0"}, ctx)
+        ctx.message_history = [{"role": "user", "content": "Please hold while I transfer you."}]
+        third = await press_digit_executor({"digits": "0"}, ctx)
+
+        assert first.status is ToolStatus.SUCCESS
+        assert second.status is ToolStatus.ERROR
+        assert "already pressed" in (second.error or "")
+        assert third.status is ToolStatus.SUCCESS
+        assert transport.send_dtmf.await_count == 2
+
+    async def test_greenlund_replay_blocks_twelve_repeated_ones(self):
+        state: dict = {}
+        prompt = [{"role": "user", "content": "For claims status, press 1."}]
+        ctx, transport, _ = _ctx(message_history=prompt, ivr_navigation_state=state)
+
+        results = [await press_digit_executor({"digits": "1"}, ctx) for _ in range(12)]
+
+        assert results[0].status is ToolStatus.SUCCESS
+        assert [result.status for result in results[1:]] == [ToolStatus.ERROR] * 11
+        assert transport.send_dtmf.await_count == 1
+
+    async def test_guard_does_not_log_prompt_text(self, mocker):
+        mock_logger = mocker.patch("app.tools.builtin.press_digit.logger")
+        state: dict = {}
+        prompt_text = "For secret claim ABC123, press 1."
+        ctx, _, _ = _ctx(
+            message_history=[{"role": "user", "content": prompt_text}],
+            ivr_navigation_state=state,
+        )
+
+        await press_digit_executor({"digits": "1"}, ctx)
+        result = await press_digit_executor({"digits": "1"}, ctx)
+
+        assert result.status is ToolStatus.ERROR
+        assert mock_logger.warning.call_count == 1
+        assert prompt_text not in repr(mock_logger.warning.call_args)
 
     async def test_send_dtmf_exception_returns_error(self):
         transport = MagicMock()
