@@ -43,7 +43,7 @@ later steps inherit it without re-sending it each turn.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, MutableMapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -75,6 +75,13 @@ WRAP = "wrap"
 REQUIRED_REFERENCE_NODE_ID = REFERENCE_NUMBER
 REQUIRED_REFERENCE_FIELD = "call_reference"
 FLOW_NODE_TYPES = frozenset({"ask", "branch", "transfer", "end"})
+GREETING_STATE_KEY = "greeted"
+GREETING_ALREADY_DONE_NOTE = (
+    "Call state: the opener/greeting has already been delivered for this call. "
+    "Do not repeat the opener, say hello again, or re-introduce yourself; continue "
+    "with the current step's specific task."
+)
+GreetingState = MutableMapping[str, bool]
 
 
 def identity_gate_required_for_direction(direction: str) -> bool:
@@ -290,7 +297,38 @@ STEPS: tuple[_Step, ...] = (
 RunToolCore = Callable[[str, dict[str, Any]], "Any"]
 
 
-def _advance_function(step: _Step, next_builder: Callable[[], NodeConfig]) -> FlowsFunctionSchema:
+def _has_greeted(greeting_state: GreetingState | None) -> bool:
+    return bool(greeting_state and greeting_state.get(GREETING_STATE_KEY))
+
+
+def _mark_greeted(
+    greeting_state: GreetingState | None,
+    flow_manager: FlowManager | None = None,
+) -> None:
+    if greeting_state is not None:
+        greeting_state[GREETING_STATE_KEY] = True
+    if flow_manager is not None:
+        flow_manager.state[GREETING_STATE_KEY] = True
+
+
+def _task_messages(
+    task: str,
+    *,
+    greeting_state: GreetingState | None,
+    include_greeting_note: bool = True,
+) -> list[dict[str, str]]:
+    messages = [{"role": "system", "content": task}]
+    if include_greeting_note and _has_greeted(greeting_state):
+        messages.append({"role": "system", "content": GREETING_ALREADY_DONE_NOTE})
+    return messages
+
+
+def _advance_function(
+    step: _Step,
+    next_builder: Callable[[FlowManager], NodeConfig],
+    *,
+    on_advance: Callable[[FlowManager], None] | None = None,
+) -> FlowsFunctionSchema:
     """Build the single advance function for ``step``.
 
     The handler is a Flows consolidated function returning
@@ -308,8 +346,12 @@ def _advance_function(step: _Step, next_builder: Callable[[], NodeConfig]) -> Fl
                 # Deterministic refusal — not a prompt instruction.
                 return {"status": "missing", "field": step.required_field}, None
             flow_manager.state[step.required_field] = value
-            return {"status": "ok", step.required_field: value}, next_builder()
-        return {"status": "ok"}, next_builder()
+            if on_advance is not None:
+                on_advance(flow_manager)
+            return {"status": "ok", step.required_field: value}, next_builder(flow_manager)
+        if on_advance is not None:
+            on_advance(flow_manager)
+        return {"status": "ok"}, next_builder(flow_manager)
 
     properties: dict[str, Any] = {}
     required: list[str] = []
@@ -653,6 +695,8 @@ def _task_for_flow_node(*, node: _FlowNode, ivr_path: str, ivr_goal: str) -> str
 def _advance_function_for_flow_node(
     node: _FlowNode,
     build_next: Callable[[str], NodeConfig | None],
+    *,
+    greeting_state: GreetingState | None = None,
 ) -> FlowsFunctionSchema:
     async def handler(args: FlowArgs, flow_manager: FlowManager) -> ConsolidatedFunctionResult:
         captured: dict[str, str] = {}
@@ -679,6 +723,9 @@ def _advance_function_for_flow_node(
             target = requested if requested in allowed else node.fallback
         elif target is None:
             target = node.fallback
+
+        if node.id == GREET:
+            _mark_greeted(greeting_state, flow_manager)
 
         next_node = build_next(target) if target else None
         if target and next_node is None:
@@ -769,6 +816,7 @@ def _build_default_step_chain(
     ivr_goal: str = "",
     knowledge_warmer: PrefetchWarmer | None = None,
     knowledge_context: PrefetchContext | None = None,
+    greeting_state: GreetingState | None = None,
 ) -> NodeConfig:
     """Build the default post-verification step chain; return its first node.
 
@@ -801,19 +849,47 @@ def _build_default_step_chain(
         knowledge_warmer: Optional per-call warmer. When supplied, relevant
             step tasks may synchronously include cache hits.
         knowledge_context: PHI-minimized context for cache query construction.
+        greeting_state: Per-call state that records whether the opener/greeting
+            has already been delivered. When true, the default chain skips the
+            ``greet`` node and carries a no-regreeting note across resets.
 
     Returns:
         The ``navigate`` :class:`NodeConfig` — the head of the chain.
     """
 
-    def build_node(index: int) -> NodeConfig:
+    def build_node(index: int, *, include_greeting_note: bool = True) -> NodeConfig:
         step = STEPS[index]
         is_first = index == 0
         is_last = index == len(STEPS) - 1
 
         functions: list[FlowsFunctionSchema] = _tool_functions(registry, run_tool_core)
         if not is_last:
-            functions.append(_advance_function(step, lambda: build_node(index + 1)))
+            if step.name == NAVIGATE:
+                functions.append(
+                    _advance_function(
+                        step,
+                        lambda _flow_manager: (
+                            build_node(index + 2)
+                            if _has_greeted(greeting_state)
+                            else build_node(index + 1, include_greeting_note=False)
+                        ),
+                    )
+                )
+            elif step.name == GREET:
+                functions.append(
+                    _advance_function(
+                        step,
+                        lambda _flow_manager: build_node(index + 1),
+                        on_advance=lambda flow_manager: _mark_greeted(
+                            greeting_state,
+                            flow_manager,
+                        ),
+                    )
+                )
+            else:
+                functions.append(
+                    _advance_function(step, lambda _flow_manager: build_node(index + 1))
+                )
 
         # The navigate step (always index 0) optionally follows a verified
         # map; every other step uses its fixed task verbatim.
@@ -831,7 +907,11 @@ def _build_default_step_chain(
 
         node: NodeConfig = {
             "name": step.name,
-            "task_messages": [{"role": "system", "content": task}],
+            "task_messages": _task_messages(
+                task,
+                greeting_state=greeting_state,
+                include_greeting_note=include_greeting_note,
+            ),
             "functions": functions,
             # Post-verification: the opener already fired during the gate,
             # so it's safe (and wanted) to respond as each step is entered.
@@ -865,6 +945,7 @@ def _build_data_driven_step_chain(
     ivr_goal: str,
     knowledge_warmer: PrefetchWarmer | None,
     knowledge_context: PrefetchContext | None,
+    greeting_state: GreetingState | None,
 ) -> NodeConfig:
     nodes_by_id = _definition_node_map(definition)
 
@@ -875,7 +956,13 @@ def _build_data_driven_step_chain(
 
         functions: list[FlowsFunctionSchema] = _tool_functions(registry, run_tool_core)
         if step.type != "end":
-            functions.append(_advance_function_for_flow_node(step, build_node))
+            functions.append(
+                _advance_function_for_flow_node(
+                    step,
+                    build_node,
+                    greeting_state=greeting_state,
+                )
+            )
 
         task = _task_for_flow_node(node=step, ivr_path=ivr_path, ivr_goal=ivr_goal)
         task = _task_with_knowledge(
@@ -887,7 +974,7 @@ def _build_data_driven_step_chain(
 
         node: NodeConfig = {
             "name": step.id,
-            "task_messages": [{"role": "system", "content": task}],
+            "task_messages": _task_messages(task, greeting_state=greeting_state),
             "functions": functions,
             "respond_immediately": True,
         }
@@ -917,6 +1004,7 @@ def _build_data_driven_step_chain(
             ivr_goal=ivr_goal,
             knowledge_warmer=knowledge_warmer,
             knowledge_context=knowledge_context,
+            greeting_state=greeting_state,
         )
     return first
 
@@ -932,6 +1020,7 @@ def build_step_chain(
     knowledge_warmer: PrefetchWarmer | None = None,
     knowledge_context: PrefetchContext | None = None,
     flow_definition: dict[str, Any] | None = None,
+    greeting_state: GreetingState | None = None,
 ) -> NodeConfig:
     """Build the post-verification step chain; return its first node.
 
@@ -950,6 +1039,7 @@ def build_step_chain(
             ivr_goal=ivr_goal,
             knowledge_warmer=knowledge_warmer,
             knowledge_context=knowledge_context,
+            greeting_state=greeting_state,
         )
     return _build_data_driven_step_chain(
         definition,
@@ -961,6 +1051,7 @@ def build_step_chain(
         ivr_goal=ivr_goal,
         knowledge_warmer=knowledge_warmer,
         knowledge_context=knowledge_context,
+        greeting_state=greeting_state,
     )
 
 
@@ -971,6 +1062,8 @@ __all__ = [
     "DEADLINE",
     "FAX_PORTAL",
     "GREET",
+    "GREETING_ALREADY_DONE_NOTE",
+    "GREETING_STATE_KEY",
     "NAVIGATE",
     "NAVIGATE_BASE_TASK",
     "REFERENCE_NUMBER",

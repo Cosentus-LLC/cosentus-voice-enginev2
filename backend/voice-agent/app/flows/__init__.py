@@ -20,6 +20,8 @@ from app.flows.identity_gate import (
 )
 from app.flows.scaffold import build_flow_manager, build_scaffold_flow
 from app.flows.steps import (
+    GREETING_ALREADY_DONE_NOTE,
+    GREETING_STATE_KEY,
     REFERENCE_NUMBER,
     REQUIRED_REFERENCE_FIELD,
     REQUIRED_REFERENCE_NODE_ID,
@@ -31,6 +33,8 @@ from app.flows.steps import (
 
 __all__ = [
     "IDENTITY_GATE_NODE",
+    "GREETING_ALREADY_DONE_NOTE",
+    "GREETING_STATE_KEY",
     "PRE_VERIFICATION_ROLE_MESSAGE",
     "REFERENCE_NUMBER",
     "REQUIRED_REFERENCE_FIELD",

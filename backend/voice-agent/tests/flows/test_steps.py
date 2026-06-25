@@ -23,7 +23,13 @@ from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 from app.flows.steps import (
+    ASK_NEEDS,
+    CONFIRM_DENIAL,
     DEADLINE,
+    FAX_PORTAL,
+    GREET,
+    GREETING_ALREADY_DONE_NOTE,
+    GREETING_STATE_KEY,
     NAVIGATE,
     NAVIGATE_BASE_TASK,
     REFERENCE_NUMBER,
@@ -75,18 +81,24 @@ def _chain(
     tool_names: list[str] | None = None,
     hydrated_system: str = "HYDRATED-SYSTEM-PROMPT",
     flow_definition: dict | None = None,
+    greeting_state: dict[str, bool] | None = None,
 ):
     return build_step_chain(
         run_tool_core=AsyncMock(return_value=({"status": "ok"}, False)),
         registry=_registry(tool_names or []),
         hydrated_system=hydrated_system,
         flow_definition=flow_definition,
+        greeting_state=greeting_state,
     )
 
 
 def _advance_fn(node):
     """The chain always appends the advance function last (after tools)."""
     return node["functions"][-1]
+
+
+def _message_blob(node) -> str:
+    return " ".join(message["content"] for message in node["task_messages"])
 
 
 def _custom_flow() -> dict:
@@ -193,6 +205,76 @@ class TestOrdering:
         wrap = STEPS[-1]
         assert wrap.name == WRAP
         assert wrap.advance_name == ""
+
+
+# ── Greeting state ───────────────────────────────────────────────────────
+
+
+class TestGreetingState:
+    @pytest.mark.asyncio
+    async def test_speak_first_state_skips_greet_step_after_navigate(self):
+        greeting_state = {GREETING_STATE_KEY: True}
+        node = _chain(greeting_state=greeting_state)
+
+        _result, next_node = await _advance_fn(node).handler({}, _fm())
+
+        assert next_node["name"] == CONFIRM_DENIAL
+        task_blob = _message_blob(next_node)
+        assert GREETING_ALREADY_DONE_NOTE in task_blob
+        assert "Introduce yourself" not in task_blob
+
+    @pytest.mark.asyncio
+    async def test_user_first_state_enters_greet_once_then_marks_greeted(self):
+        greeting_state = {GREETING_STATE_KEY: False}
+        fm = _fm()
+        node = _chain(greeting_state=greeting_state)
+
+        _result, greet_node = await _advance_fn(node).handler({}, fm)
+
+        assert greet_node["name"] == GREET
+        assert GREETING_ALREADY_DONE_NOTE not in _message_blob(greet_node)
+
+        _result, next_node = await _advance_fn(greet_node).handler({}, fm)
+
+        assert next_node["name"] == CONFIRM_DENIAL
+        assert greeting_state[GREETING_STATE_KEY] is True
+        assert fm.state[GREETING_STATE_KEY] is True
+        assert GREETING_ALREADY_DONE_NOTE in _message_blob(next_node)
+
+    @pytest.mark.asyncio
+    async def test_no_regreeting_note_carries_across_later_default_steps(self):
+        greeting_state = {GREETING_STATE_KEY: True}
+        node = _chain(greeting_state=greeting_state)
+        fm = _fm()
+        visited: list[str] = []
+
+        while True:
+            visited.append(node["name"])
+            if node["name"] != NAVIGATE:
+                task_blob = _message_blob(node)
+                assert GREETING_ALREADY_DONE_NOTE in task_blob
+                assert "Introduce yourself" not in task_blob
+            if not node["functions"]:
+                break
+            args = {"reference_number": "R-1"} if node["name"] == REFERENCE_NUMBER else {}
+            _result, node = await _advance_fn(node).handler(args, fm)
+
+        assert GREET not in visited
+        assert visited == [
+            NAVIGATE,
+            CONFIRM_DENIAL,
+            ASK_NEEDS,
+            FAX_PORTAL,
+            DEADLINE,
+            REFERENCE_NUMBER,
+            WRAP,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_default_chain_without_greeting_state_preserves_existing_order(self):
+        _result, next_node = await _advance_fn(_chain()).handler({}, _fm())
+
+        assert next_node["name"] == GREET
 
 
 # ── Data-driven flow definitions (#5) ────────────────────────────────────
