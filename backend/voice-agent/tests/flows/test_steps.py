@@ -33,6 +33,7 @@ from app.flows.steps import (
     WRAP,
     build_navigate_task,
     build_step_chain,
+    identity_gate_required_for_direction,
 )
 from app.knowledge.prefetch import PrefetchContext
 from app.knowledge.semantic_cache import CacheHit
@@ -150,6 +151,16 @@ async def _walk_to(node, target_name):
 
 
 # ── Ordering ─────────────────────────────────────────────────────────────
+
+
+class TestDirectionAwareStart:
+    def test_identity_gate_required_only_for_inbound(self):
+        assert identity_gate_required_for_direction("inbound") is True
+        assert identity_gate_required_for_direction("outbound") is False
+        assert identity_gate_required_for_direction("browser") is False
+
+    def test_unknown_direction_is_not_gated_by_default(self):
+        assert identity_gate_required_for_direction("unknown") is False
 
 
 class TestOrdering:

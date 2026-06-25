@@ -21,15 +21,19 @@ Both layers are inert when ``settings.flows_enabled`` is ``False``
 (production default), so flag-off behavior is byte-identical to the
 pre-Flows pipeline.
 
-Verification is the **outbound** path
--------------------------------------
-Outbound calls carry dispatcher-supplied ``case_data`` (patient name /
-DOB / claim id) to verify the caller's claims against. Inbound calls
-carry ``case_data={}`` — nothing to verify against — so every key's
-expected value is blank and :func:`verify_against_case_data` returns
-``False``: the gate stays **fail-closed** rather than silently opening.
-A blank expected value never counts as a match (see the function), so a
-caller (or a model) supplying empty claims can never slip through.
+Verification is the **inbound** path
+------------------------------------
+The identity gate verifies who is calling in before any patient, claim,
+account, or case details are shared. Outbound and browser calls are
+initiated by the agent, so ``bot.py`` starts those flows directly at the
+post-gate step chain instead of asking the payer representative to
+verify their identity.
+
+For inbound calls, missing or blank expected values still fail closed:
+every configured identity key must have a non-blank expected value in
+``case_data`` and must match the caller's claimed value. A blank
+expected value never counts as a match (see the function), so a caller
+(or a model) supplying empty claims can never slip through.
 
 ⚠️ Scope boundary (16b vs 16c, #43)
 ------------------------------------
