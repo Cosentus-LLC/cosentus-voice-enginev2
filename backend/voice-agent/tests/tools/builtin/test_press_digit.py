@@ -285,6 +285,13 @@ class TestPressDigitDefinition:
     def test_name_matches_aurora(self):
         assert PRESS_DIGIT.name == "press_digit"
 
+    def test_description_affirms_keypad_capability_and_waiting_contract(self):
+        lower = PRESS_DIGIT.description.lower()
+        assert "use this tool to press dtmf digits on the phone keypad" in lower
+        assert "navigate ivr menus" in lower
+        assert "when the ivr has prompted for keypad input" in lower
+        assert "wait for the ivr's response before pressing again" in lower
+
     def test_digits_param_is_required_with_pattern(self):
         digits = next(p for p in PRESS_DIGIT.parameters if p.name == "digits")
         assert digits.required is True

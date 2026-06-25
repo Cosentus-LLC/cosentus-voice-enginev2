@@ -56,12 +56,12 @@ logger = structlog.get_logger(__name__)
 
 
 DESCRIPTION_DEFAULT = (
-    "Press DTMF digits on the phone keypad to navigate IVR menus. "
-    "Valid input: digits 0-9, *, and #. Multi-digit input is sent "
-    "as a sequence (e.g. '1234' presses four digits in order). "
-    "Use only when the IVR has prompted for keypad input. After "
-    "pressing, you will receive a tool result confirming the press; "
-    "wait for the IVR's response before pressing again."
+    "Use this tool to press DTMF digits on the phone keypad to navigate "
+    "IVR menus. Valid input: digits 0-9, *, and #. Multi-digit input "
+    "is sent as a sequence (e.g. '1234' presses four digits in order). "
+    "Use it when the IVR has prompted for keypad input. After pressing, "
+    "you will receive a tool result confirming the press; wait for the "
+    "IVR's response before pressing again."
 )
 
 
