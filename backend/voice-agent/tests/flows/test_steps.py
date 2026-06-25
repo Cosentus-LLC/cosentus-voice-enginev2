@@ -2,10 +2,10 @@
 
 Two guarantees under test:
 
-* **Ordered + un-skippable** — the chain advances ``navigate → … → wrap``
-  in order; ``wrap`` is only reachable through ``reference_number``, whose
-  advance handler refuses to transition until a non-blank reference number
-  is supplied (a deterministic code check, not a prompt).
+* **Ordered + un-skippable** — the default chain advances ``navigate → … →
+  wrap`` in order; required-capture advance handlers refuse to transition
+  until their required fields are supplied non-blank (a deterministic code
+  check, not a prompt).
 * **Bounded per-step context** — the first step RESETs and loads the
   hydrated prompt; every later step uses RESET_WITH_SUMMARY so per-turn
   input stays bounded with a running summary carried forward.
@@ -33,8 +33,6 @@ from app.flows.steps import (
     NAVIGATE,
     NAVIGATE_BASE_TASK,
     REFERENCE_NUMBER,
-    REQUIRED_REFERENCE_FIELD,
-    REQUIRED_REFERENCE_NODE_ID,
     STEP_COMPLETION_ROLE_RULE,
     STEPS,
     WRAP,
@@ -45,6 +43,8 @@ from app.flows.steps import (
 from app.knowledge.prefetch import PrefetchContext
 from app.knowledge.semantic_cache import CacheHit
 from pipecat_flows import ContextStrategy
+
+CALL_REFERENCE_FIELD = "call_reference"
 
 
 def _fm() -> SimpleNamespace:
@@ -131,20 +131,20 @@ def _custom_flow() -> dict:
                 "type": "ask",
                 "say": "Confirm the fax number.",
                 "capture": ["fax_number"],
-                "next": REQUIRED_REFERENCE_NODE_ID,
+                "next": REFERENCE_NUMBER,
             },
             {
                 "id": "portal_path",
                 "type": "ask",
                 "say": "Confirm the portal name.",
                 "capture": ["portal_name"],
-                "next": REQUIRED_REFERENCE_NODE_ID,
+                "next": REFERENCE_NUMBER,
             },
             {
-                "id": REQUIRED_REFERENCE_NODE_ID,
+                "id": REFERENCE_NUMBER,
                 "type": "ask",
                 "say": "Ask for a call reference number.",
-                "capture": [REQUIRED_REFERENCE_FIELD],
+                "capture": [CALL_REFERENCE_FIELD],
                 "required": True,
                 "next": "done",
             },
@@ -169,10 +169,54 @@ def _custom_flow_starting_at_navigate() -> dict:
     return flow
 
 
+def _patient_balance_flow() -> dict:
+    return {
+        "version": 1,
+        "start": "confirm_balance",
+        "nodes": [
+            {
+                "id": "confirm_balance",
+                "type": "ask",
+                "label": "Confirm balance",
+                "say": "Confirm the patient's current balance.",
+                "capture": ["balance_amount"],
+                "next": "payment_options",
+            },
+            {
+                "id": "payment_options",
+                "type": "ask",
+                "label": "Payment options",
+                "say": "Explain the available payment options.",
+                "next": "done",
+            },
+            {"id": "done", "type": "end", "say": "Close the call."},
+        ],
+    }
+
+
+def _required_balance_flow() -> dict:
+    return {
+        "version": 1,
+        "start": "collect_balance_details",
+        "nodes": [
+            {
+                "id": "collect_balance_details",
+                "type": "ask",
+                "label": "Collect balance details",
+                "say": "Collect the patient's balance amount and due date.",
+                "capture": ["balance_amount", "due_date"],
+                "required": True,
+                "next": "done",
+            },
+            {"id": "done", "type": "end", "say": "Close the call."},
+        ],
+    }
+
+
 async def _walk_to(node, target_name):
     """Advance from ``node`` to ``target_name`` supplying no extra args.
 
-    Works because every step before ``reference_number`` is un-gated.
+    Works when every step before ``target_name`` is un-gated.
     """
     fm = _fm()
     while node["name"] != target_name:
@@ -354,9 +398,21 @@ class TestDataDrivenFlow:
         _result, node = await _advance_fn(node).handler({"branch_to": "portal_path"}, fm)
         assert node["name"] == "portal_path"
         _result, node = await _advance_fn(node).handler({"portal_name": "Availity"}, fm)
-        assert node["name"] == REQUIRED_REFERENCE_NODE_ID
-        _result, node = await _advance_fn(node).handler({REQUIRED_REFERENCE_FIELD: "REF-1"}, fm)
+        assert node["name"] == REFERENCE_NUMBER
+        _result, node = await _advance_fn(node).handler({CALL_REFERENCE_FIELD: "REF-1"}, fm)
         assert node["name"] == "done"
+
+    @pytest.mark.asyncio
+    async def test_non_claim_flow_without_reference_number_builds_and_reaches_end(self):
+        node = _chain(flow_definition=_patient_balance_flow())
+        fm = _fm()
+
+        assert node["name"] == "confirm_balance"
+        _result, node = await _advance_fn(node).handler({"balance_amount": "$42.17"}, fm)
+        assert node["name"] == "payment_options"
+        _result, node = await _advance_fn(node).handler({}, fm)
+        assert node["name"] == "done"
+        assert node["functions"] == []
 
     @pytest.mark.asyncio
     async def test_no_flow_definition_uses_default_step_order(self):
@@ -377,7 +433,7 @@ class TestDataDrivenFlow:
         flow = {
             "version": 1,
             "start": "intro",
-            "nodes": [{"id": "intro", "type": "end"}],
+            "nodes": [{"id": "intro", "type": "ask"}],
         }
 
         chain = _chain(flow_definition=flow)
@@ -391,29 +447,80 @@ class TestDataDrivenFlow:
         )
 
     @pytest.mark.asyncio
-    async def test_custom_reference_number_requires_call_reference(self):
-        node = await _walk_to(_chain(flow_definition=_custom_flow()), REQUIRED_REFERENCE_NODE_ID)
+    async def test_required_call_reference_blocks_blank_capture(self):
+        node = await _walk_to(_chain(flow_definition=_custom_flow()), REFERENCE_NUMBER)
 
-        result, next_node = await _advance_fn(node).handler({REQUIRED_REFERENCE_FIELD: " "}, _fm())
+        result, next_node = await _advance_fn(node).handler({CALL_REFERENCE_FIELD: " "}, _fm())
 
         assert next_node is None
         assert result["status"] == "missing"
-        assert result["field"] == REQUIRED_REFERENCE_FIELD
+        assert result["field"] == CALL_REFERENCE_FIELD
 
     @pytest.mark.asyncio
-    async def test_custom_reference_number_records_both_state_keys(self):
-        node = await _walk_to(_chain(flow_definition=_custom_flow()), REQUIRED_REFERENCE_NODE_ID)
+    async def test_call_reference_records_legacy_reference_state_key(self):
+        node = await _walk_to(_chain(flow_definition=_custom_flow()), REFERENCE_NUMBER)
         fm = _fm()
 
         result, next_node = await _advance_fn(node).handler(
-            {REQUIRED_REFERENCE_FIELD: "REF-123"},
+            {CALL_REFERENCE_FIELD: "REF-123"},
             fm,
         )
 
         assert next_node["name"] == "done"
-        assert result[REQUIRED_REFERENCE_FIELD] == "REF-123"
-        assert fm.state[REQUIRED_REFERENCE_FIELD] == "REF-123"
+        assert result[CALL_REFERENCE_FIELD] == "REF-123"
+        assert fm.state[CALL_REFERENCE_FIELD] == "REF-123"
         assert fm.state[REFERENCE_NUMBER] == "REF-123"
+
+    @pytest.mark.asyncio
+    async def test_claim_flow_reference_node_keeps_legacy_advance_name(self):
+        node = await _walk_to(_chain(flow_definition=_custom_flow()), REFERENCE_NUMBER)
+
+        assert _advance_fn(node).name == "record_reference_number"
+
+    @pytest.mark.asyncio
+    async def test_required_capture_blocks_missing_or_blank_fields(self):
+        node = _chain(flow_definition=_required_balance_flow())
+
+        result, next_node = await _advance_fn(node).handler(
+            {"balance_amount": "100.00", "due_date": "   "},
+            _fm(),
+        )
+        assert next_node is None
+        assert result == {"status": "missing", "field": "due_date"}
+
+        result, next_node = await _advance_fn(node).handler(
+            {"due_date": "2026-07-01"},
+            _fm(),
+        )
+        assert next_node is None
+        assert result == {"status": "missing", "field": "balance_amount"}
+
+    @pytest.mark.asyncio
+    async def test_required_capture_records_all_present_fields_and_advances(self):
+        node = _chain(flow_definition=_required_balance_flow())
+        fm = _fm()
+
+        result, next_node = await _advance_fn(node).handler(
+            {"balance_amount": "100.00", "due_date": "2026-07-01"},
+            fm,
+        )
+
+        assert next_node["name"] == "done"
+        assert result == {
+            "status": "ok",
+            "balance_amount": "100.00",
+            "due_date": "2026-07-01",
+        }
+        assert fm.state["balance_amount"] == "100.00"
+        assert fm.state["due_date"] == "2026-07-01"
+
+    def test_required_capture_schema_marks_each_capture_field_required(self):
+        node = _chain(flow_definition=_required_balance_flow())
+        advance = _advance_fn(node)
+
+        assert advance.required == ["balance_amount", "due_date"]
+        assert "balance_amount" in advance.properties
+        assert "due_date" in advance.properties
 
     @pytest.mark.asyncio
     async def test_custom_branch_uses_selected_branch_target(self):
@@ -465,12 +572,12 @@ class TestDataDrivenFlow:
                     "id": "deadline",
                     "type": "ask",
                     "say": "Confirm the timely filing deadline.",
-                    "next": REQUIRED_REFERENCE_NODE_ID,
+                    "next": REFERENCE_NUMBER,
                 },
                 {
-                    "id": REQUIRED_REFERENCE_NODE_ID,
+                    "id": REFERENCE_NUMBER,
                     "type": "ask",
-                    "capture": [REQUIRED_REFERENCE_FIELD],
+                    "capture": [CALL_REFERENCE_FIELD],
                     "required": True,
                     "next": "done",
                 },
@@ -665,8 +772,8 @@ class TestInternalDirectiveLeakage:
                 break
             if node["name"] == "route_submission":
                 args = {"branch_to": "fax_path"}
-            elif node["name"] == REQUIRED_REFERENCE_NODE_ID:
-                args = {REQUIRED_REFERENCE_FIELD: "R-1"}
+            elif node["name"] == REFERENCE_NUMBER:
+                args = {CALL_REFERENCE_FIELD: "R-1"}
             else:
                 args = {}
             _result, node = await _advance_fn(node).handler(args, fm)
