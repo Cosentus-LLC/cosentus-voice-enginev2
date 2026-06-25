@@ -125,6 +125,12 @@ class _Step:
     advance_description: str = ""
     required_field: str | None = None
     required_description: str = ""
+    # Config-driven opt-ins (#20): ``ivr`` routes the step through
+    # :func:`build_navigate_task` (IVR-path injection); ``prefetch`` appends
+    # cached payer-level knowledge. Both default off so only flagged nodes
+    # get the special behavior, regardless of node name.
+    ivr: bool = False
+    prefetch: bool = False
 
 
 @dataclass(frozen=True)
@@ -144,6 +150,11 @@ class _FlowNode:
     next: str | None
     branches: tuple[_FlowBranch, ...]
     fallback: str | None
+    # Config-driven opt-ins (#20) — see :class:`_Step`. A data-driven node
+    # gets IVR-path injection only when ``ivr`` is true and knowledge
+    # prefetch only when ``prefetch`` is true, never by node id.
+    ivr: bool
+    prefetch: bool
 
 
 @dataclass(frozen=True)
@@ -214,6 +225,7 @@ STEPS: tuple[_Step, ...] = (
         task=NAVIGATE_BASE_TASK,
         advance_name="representative_reached",
         advance_description="Call once a live representative is on the line.",
+        ivr=True,
     ),
     _Step(
         name=GREET,
@@ -261,6 +273,7 @@ STEPS: tuple[_Step, ...] = (
         ),
         advance_name="deadline_confirmed",
         advance_description="Call once the submission deadline is confirmed.",
+        prefetch=True,
     ),
     _Step(
         name=REFERENCE_NUMBER,
@@ -463,6 +476,10 @@ def _normalize_flow_definition(raw: Any) -> _FlowDefinition | None:
                 next=_string_or_none(raw_node.get("next")),
                 branches=branches,
                 fallback=_string_or_none(raw_node.get("fallback")),
+                # Only literal JSON ``true`` opts in; missing/false/strings
+                # stay disabled so bad config can't widen live-call behavior.
+                ivr=raw_node.get("ivr") is True,
+                prefetch=raw_node.get("prefetch") is True,
             )
         )
     return _FlowDefinition(version=1, start=start, nodes=tuple(nodes))
@@ -626,8 +643,8 @@ def _record_captured_field(flow_manager: FlowManager, field: str, value: str) ->
         flow_manager.state[REFERENCE_NUMBER] = value
 
 
-def _task_for_flow_node(*, node: _FlowNode, ivr_path: str, ivr_goal: str) -> str:
-    if node.id == NAVIGATE:
+def _task_for_flow_node(*, node: _FlowNode, ivr_path: str, ivr_goal: str, include_ivr: bool) -> str:
+    if node.ivr and include_ivr:
         parts = [build_navigate_task(ivr_path=ivr_path, ivr_goal=ivr_goal)]
     else:
         label = node.label.strip() or node.id.replace("_", " ")
@@ -728,20 +745,22 @@ def _advance_function_for_flow_node(
 
 def _task_with_knowledge(
     *,
-    step: _Step,
+    prefetch: bool,
     task: str,
     knowledge_warmer: PrefetchWarmer | None,
     knowledge_context: PrefetchContext | None,
 ) -> str:
     """Append a cached payer-level fact when one is already warm.
 
+    Only runs for nodes that opt in via ``prefetch`` (#20) — the cached
+    payer facts are appended for any such node, regardless of its name.
     This is cache-only. A miss leaves the task text unchanged and the warmer
     fills in the background for a later turn.
     """
-    if knowledge_warmer is None or knowledge_context is None:
+    if not prefetch or knowledge_warmer is None or knowledge_context is None:
         return task
     payer = (knowledge_context.payer or "").strip()
-    if not payer or step.name != DEADLINE:
+    if not payer:
         return task
 
     query = f"timely filing limit for {payer}"
@@ -856,15 +875,11 @@ def _build_default_step_chain(
                     _advance_function(step, lambda _flow_manager: build_node(index + 1))
                 )
 
-        # The navigate step (always index 0) optionally follows a verified
-        # map; every other step uses its fixed task verbatim.
-        task = (
-            build_navigate_task(ivr_path=ivr_path, ivr_goal=ivr_goal)
-            if step.name == NAVIGATE
-            else step.task
-        )
+        # The IVR-flagged step (the navigate step, always index 0) optionally
+        # follows a verified map; every other step uses its fixed task verbatim.
+        task = build_navigate_task(ivr_path=ivr_path, ivr_goal=ivr_goal) if step.ivr else step.task
         task = _task_with_knowledge(
-            step=step,
+            prefetch=step.prefetch,
             task=task,
             knowledge_warmer=knowledge_warmer,
             knowledge_context=knowledge_context,
@@ -918,7 +933,7 @@ def _build_data_driven_step_chain(
 
     if not include_ivr:
         start_node = nodes_by_id.get(start_node_id)
-        if start_node is not None and start_node.id == NAVIGATE:
+        if start_node is not None and start_node.ivr:
             targets = _outgoing_targets(start_node)
             if len(targets) == 1:
                 start_node_id = targets[0]
@@ -961,9 +976,11 @@ def _build_data_driven_step_chain(
                 )
             )
 
-        task = _task_for_flow_node(node=step, ivr_path=ivr_path, ivr_goal=ivr_goal)
+        task = _task_for_flow_node(
+            node=step, ivr_path=ivr_path, ivr_goal=ivr_goal, include_ivr=include_ivr
+        )
         task = _task_with_knowledge(
-            step=_Step(name=step.id, task=task),
+            prefetch=step.prefetch,
             task=task,
             knowledge_warmer=knowledge_warmer,
             knowledge_context=knowledge_context,
