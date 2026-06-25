@@ -25,6 +25,7 @@ from app.bot.bot import (
     _build_dialin_settings,
     _extract_session_id,
     _get_daily_api_key,
+    _resolve_call_policy,
     _resolve_payer_id,
     bot,
     run_bot,
@@ -57,6 +58,7 @@ def _agent(
     tools: list | None = None,
     flow_definition: dict | None = None,
     identity_verification_keys: list[str] | None = None,
+    call_kind: str | None = None,
 ) -> AgentConfig:
     return AgentConfig(
         name="test-agent",
@@ -67,6 +69,7 @@ def _agent(
         tools=tools or [],
         flow_definition=flow_definition,
         identity_verification_keys=identity_verification_keys or [],
+        call_kind=call_kind,
     )
 
 
@@ -286,6 +289,49 @@ class TestGetDailyApiKey:
     def test_strips_whitespace(self, monkeypatch):
         monkeypatch.setenv("DAILY_API_KEY", "  test-key  ")
         assert _get_daily_api_key() == "test-key"
+
+
+class TestCallPolicy:
+    def test_resolve_call_policy_payer(self):
+        policy = _resolve_call_policy(_agent(call_kind="payer"), "outbound")
+
+        assert policy.identity_gate_required is False
+        assert policy.include_ivr is True
+        assert policy.source == "call_kind"
+        assert policy.call_kind == "payer"
+
+    def test_resolve_call_policy_patient(self):
+        policy = _resolve_call_policy(_agent(call_kind="patient"), "outbound")
+
+        assert policy.identity_gate_required is True
+        assert policy.include_ivr is False
+        assert policy.source == "call_kind"
+        assert policy.call_kind == "patient"
+
+    def test_resolve_call_policy_missing_uses_direction_default(self):
+        inbound = _resolve_call_policy(_agent(), "inbound")
+        outbound = _resolve_call_policy(_agent(), "outbound")
+
+        assert inbound.identity_gate_required is True
+        assert inbound.include_ivr is True
+        assert inbound.source == "direction_fallback"
+        assert inbound.call_kind is None
+        assert outbound.identity_gate_required is False
+        assert outbound.include_ivr is True
+        assert outbound.source == "direction_fallback"
+        assert outbound.call_kind is None
+
+    def test_resolve_call_policy_unknown_logs_and_uses_direction_default(self, mocker):
+        mock_logger = mocker.patch("app.bot.bot.logger")
+
+        policy = _resolve_call_policy(_agent(call_kind="facility"), "outbound")
+
+        assert policy.identity_gate_required is False
+        assert policy.include_ivr is True
+        assert policy.source == "direction_fallback"
+        assert policy.call_kind == "facility"
+        mock_logger.warning.assert_called_once()
+        assert mock_logger.warning.call_args.args[0] == "call_policy_unknown_call_kind"
 
 
 # ── run_bot guard rails ───────────────────────────────────────────────────
@@ -950,6 +996,85 @@ async def test_run_bot_flag_on_browser_initializes_step_chain_without_identity_g
 
 
 @pytest.mark.asyncio
+async def test_run_bot_flag_on_outbound_payer_policy_initializes_step_chain_with_ivr():
+    agent, mocks = _patch_run_bot_dependencies(agent=_agent(call_kind="payer"))
+    transport = _make_transport_mock()
+    fm = _flow_manager_mock()
+    step_chain = {"name": NAVIGATE, "task_messages": [], "functions": []}
+    build_identity_gate = MagicMock()
+    build_step_chain = MagicMock(return_value=step_chain)
+    load_ivr = AsyncMock(return_value="1. Claims - press 1")
+    patches = _start_run_bot_patches(agent, mocks, transport) + [
+        patch("app.bot.bot.build_flow_manager", MagicMock(return_value=fm)),
+        patch("app.bot.bot.build_step_chain", build_step_chain),
+        patch("app.bot.bot.build_identity_gate_flow", build_identity_gate),
+        patch("app.bot.bot.load_payer_ivr_path", load_ivr),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        await run_bot(
+            transport,
+            _runner_args(direction="outbound", case_data={"payer_name": "Aetna"}),
+            _settings(flows_enabled=True, identity_verification_keys="patient_name"),
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    fm.initialize.assert_awaited_once_with(step_chain)
+    build_identity_gate.assert_not_called()
+    load_ivr.assert_awaited_once()
+    assert build_step_chain.call_args.kwargs["include_ivr"] is True
+    assert build_step_chain.call_args.kwargs["ivr_path"] == "1. Claims - press 1"
+
+
+@pytest.mark.asyncio
+async def test_run_bot_flag_on_outbound_patient_policy_initializes_identity_gate_without_ivr():
+    agent, mocks = _patch_run_bot_dependencies(agent=_agent(call_kind="patient"))
+    transport = _make_transport_mock()
+    fm = _flow_manager_mock()
+    step_chain = {"name": "greet", "task_messages": [], "functions": []}
+    build_step_chain = MagicMock(return_value=step_chain)
+    load_ivr = AsyncMock(return_value="1. Claims - press 1")
+    capture: dict = {}
+    real_build = __import__(
+        "app.bot.bot", fromlist=["build_identity_gate_flow"]
+    ).build_identity_gate_flow
+
+    def _spy(**kwargs):
+        capture.update(kwargs)
+        return real_build(**kwargs)
+
+    patches = _start_run_bot_patches(agent, mocks, transport) + [
+        patch("app.bot.bot.build_flow_manager", MagicMock(return_value=fm)),
+        patch("app.bot.bot.build_step_chain", build_step_chain),
+        patch("app.bot.bot.build_identity_gate_flow", _spy),
+        patch("app.bot.bot.load_payer_ivr_path", load_ivr),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        await run_bot(
+            transport,
+            _runner_args(direction="outbound", case_data={"payer_name": "Aetna"}),
+            _settings(flows_enabled=True, identity_verification_keys="patient_name"),
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    fm.initialize.assert_awaited_once()
+    node = fm.initialize.await_args.args[0]
+    assert node["name"] == "identity_gate"
+    assert capture["verified_node"] is step_chain
+    load_ivr.assert_not_awaited()
+    assert build_step_chain.call_args.kwargs["include_ivr"] is False
+    assert build_step_chain.call_args.kwargs["ivr_path"] == ""
+    assert build_step_chain.call_args.kwargs["ivr_goal"] == ""
+
+
+@pytest.mark.asyncio
 async def test_run_bot_uses_agent_identity_keys_when_present():
     agent, mocks = _patch_run_bot_dependencies(agent=_agent(identity_verification_keys=["dob"]))
     transport = _make_transport_mock()
@@ -1326,6 +1451,7 @@ async def _run_bot_capturing_tool_handlers(
     settings: Settings,
     executor: MagicMock,
     direction: str = "inbound",
+    call_kind: str | None = None,
     capture: dict | None = None,
 ):
     """Run run_bot with the given tools + executor; return {name: handler}.
@@ -1335,7 +1461,7 @@ async def _run_bot_capturing_tool_handlers(
     ``verification_state`` dict.
     """
     agent, mocks = _patch_run_bot_dependencies(
-        agent=_agent(tools=tools),
+        agent=_agent(tools=tools, call_kind=call_kind),
     )
     mocks["registry"].names = MagicMock(return_value=[t.type for t in tools])
     transport = _make_transport_mock()
@@ -1395,9 +1521,8 @@ async def test_gated_tool_blocked_when_flows_enabled_and_unverified():
 
 
 @pytest.mark.asyncio
-async def test_outbound_tool_allowed_immediately_when_flows_enabled():
-    """Flag on + outbound skips identity verification, so gated tools are
-    executable as soon as the step chain starts."""
+async def test_outbound_tool_allowed_immediately_when_policy_absent():
+    """Flag on + absent policy preserves outbound's legacy no-gate default."""
     executor = _executor_mock(ToolResult(status=ToolStatus.SUCCESS, run_llm=False))
     handlers = await _run_bot_capturing_tool_handlers(
         tools=[ToolConfig(type="transfer_call", description="")],
@@ -1411,6 +1536,24 @@ async def test_outbound_tool_allowed_immediately_when_flows_enabled():
     executor.execute.assert_awaited_once()
     payload = params.result_callback.await_args.args[0]
     assert "not verified" not in str(payload).lower()
+
+
+@pytest.mark.asyncio
+async def test_outbound_patient_policy_blocks_gated_tool_until_verified():
+    executor = _executor_mock(ToolResult(status=ToolStatus.SUCCESS, run_llm=False))
+    handlers = await _run_bot_capturing_tool_handlers(
+        tools=[ToolConfig(type="transfer_call", description="")],
+        settings=_settings(flows_enabled=True, identity_verification_keys="patient_name"),
+        executor=executor,
+        direction="outbound",
+        call_kind="patient",
+    )
+    params = _FakeParams({"target": "billing"})
+    await handlers["transfer_call"](params)
+
+    executor.execute.assert_not_awaited()
+    payload = params.result_callback.await_args.args[0]
+    assert "not verified" in payload["error"].lower()
 
 
 @pytest.mark.asyncio

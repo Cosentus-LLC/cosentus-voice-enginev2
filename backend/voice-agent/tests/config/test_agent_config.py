@@ -207,6 +207,17 @@ class TestAgentConfigParse:
             "dob",
         ]
 
+    def test_call_kind_default_none(self):
+        cfg = AgentConfig.model_validate({"name": "agent"})
+
+        assert cfg.call_kind is None
+
+    def test_call_kind_parses_and_dumps(self):
+        cfg = AgentConfig.model_validate({"name": "agent", "call_kind": "patient"})
+
+        assert cfg.call_kind == "patient"
+        assert cfg.model_dump(by_alias=True)["call_kind"] == "patient"
+
     def test_meta_alias_underscore_meta_deserializes(self):
         # The lambda sends ``_meta`` (wire convention); the Python
         # attribute is ``meta``. populate_by_name=True + alias="_meta"

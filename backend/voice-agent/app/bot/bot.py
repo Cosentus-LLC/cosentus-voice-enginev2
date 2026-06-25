@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -306,7 +307,6 @@ async def run_bot(
         raise ValueError("runner_args.body.agent_id is required")
 
     direction = body.get("direction", "inbound")
-    gate_required = identity_gate_required_for_direction(direction)
     target_number = body.get("target_number") or ""
     from_number = body.get("from_number") or ""
     case_data: dict[str, Any] = body.get("case_data") or {}
@@ -377,6 +377,17 @@ async def run_bot(
 
     # ── Layer 1: load agent ────────────────────────────────────────────
     agent = await load_agent_config(agent_id, settings=settings)
+    call_policy = _resolve_call_policy(agent, direction)
+    gate_required = call_policy.identity_gate_required
+    logger.info(
+        "call_policy_resolved",
+        call_id=call_id,
+        direction=direction,
+        call_kind=call_policy.call_kind,
+        policy_source=call_policy.source,
+        identity_gate_required=call_policy.identity_gate_required,
+        include_ivr=call_policy.include_ivr,
+    )
 
     # ── Layer 5: hydrate prompts ───────────────────────────────────────
     hydrated_system = hydrate_prompt(agent.system_prompt, case_data)
@@ -445,9 +456,9 @@ async def run_bot(
     # fires and the flag-off path is byte-identical to the pre-gate
     # pipeline. When Flows is on it starts False, and only the
     # ``verify_identity`` flow function (Layer B) flips it True after a
-    # deterministic code check against ``case_data``. The gate is
-    # inbound-only; outbound/browser calls start at the post-gate step
-    # chain and therefore must have the code-level tool gate open.
+    # deterministic code check against ``case_data``. The per-agent call
+    # policy decides whether this call requires the gate; when policy is
+    # absent, direction-based behavior remains the safe default.
     verification_state: dict[str, bool] = {
         "verified": not settings.flows_enabled or not gate_required
     }
@@ -717,13 +728,14 @@ async def run_bot(
     # pre-Flows pipeline. Node initialization (which WOULD mutate context
     # / trigger generation) happens only behind ``flows_enabled``.
     #
-    # Behind the flag, inbound calls initialize the identity-gate flow
+    # Behind the flag, calls whose policy requires identity verification
+    # initialize the identity-gate flow
     # (Layer B): the initial node advertises ONLY ``verify_identity`` (the
     # LLM isn't even shown the real tools until it transitions), and on a
     # successful, code-checked verification it transitions into the ordered,
     # un-skippable post-verification step chain (16c) — whose first step
     # re-advertises the call's real tools and loads the hydrated prompt.
-    # Outbound/browser calls are initiated by the agent, so they initialize
+    # Calls whose policy does not require identity verification initialize
     # directly at that step-chain head. The identity node sets
     # respond_immediately=False so it never races ``deliver_opener_if_needed``.
     #
@@ -733,7 +745,7 @@ async def run_bot(
     # whole pre-verification phase, and the post-verification step chain
     # restores the hydrated prompt only after a successful code-checked
     # verification. So the model is never given any ``case_data`` value
-    # before the inbound caller is verified. ``flows_enabled`` stays OFF
+    # before a policy-gated caller is verified. ``flows_enabled`` stays OFF
     # until this is validated on staging. See Settings.flows_enabled.
     flow_manager = build_flow_manager(
         task=task,
@@ -744,22 +756,24 @@ async def run_bot(
 
     if settings.flows_enabled:
         # ── Verified IVR path (#17) ───────────────────────────────────
-        # Best-effort: fetch the payer's verified claims IVR path and feed
-        # it into the navigate step so the agent follows the map via
-        # press_digit, falling back to listen-and-decide when no path
-        # resolves (no payer key, 404 on the name lookup, empty, error).
-        # Gated inside flows_enabled — the navigate step exists only on
-        # the Flows path — so the production (flag-off) path makes no new
-        # lambda call. ivr_goal (per-agent) is hydrated and wired in as
-        # the navigation goal.
+        # Best-effort for payer/default calls: fetch the payer's verified
+        # claims IVR path and feed it into the navigate step so the agent
+        # follows the map via press_digit, falling back to listen-and-decide
+        # when no path resolves (no payer key, 404 on the name lookup, empty,
+        # error). Patient calls omit the IVR step and skip this lookup.
+        # Gated inside flows_enabled so the production (flag-off) path makes
+        # no new lambda call.
         ivr_path = ""
-        payer_id = _resolve_payer_id(case_data, settings)
+        payer_id = _resolve_payer_id(case_data, settings) if call_policy.include_ivr else None
         if payer_id:
             ivr_path = await load_payer_ivr_path(payer_id, settings) or ""
-        hydrated_ivr_goal = hydrate_prompt(agent.ivr_goal, case_data)
+        hydrated_ivr_goal = (
+            hydrate_prompt(agent.ivr_goal, case_data) if call_policy.include_ivr else ""
+        )
         logger.info(
             "ivr_path_resolved",
             call_id=call_id,
+            include_ivr=call_policy.include_ivr,
             has_payer_id=bool(payer_id),
             has_ivr_path=bool(ivr_path),
             has_ivr_goal=bool(hydrated_ivr_goal.strip()),
@@ -770,6 +784,7 @@ async def run_bot(
             hydrated_system=hydrated_system,
             ivr_path=ivr_path,
             ivr_goal=hydrated_ivr_goal,
+            include_ivr=call_policy.include_ivr,
             knowledge_warmer=knowledge_warmer,
             knowledge_context=knowledge_context,
             flow_definition=agent.flow_definition,
@@ -1211,6 +1226,71 @@ async def bot(runner_args: RunnerArguments, settings: Settings | None = None) ->
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class _CallPolicy:
+    """Resolved per-agent policy for identity verification and IVR."""
+
+    identity_gate_required: bool
+    include_ivr: bool
+    source: str
+    call_kind: str | None = None
+
+
+def _direction_fallback_policy(direction: str) -> _CallPolicy:
+    return _CallPolicy(
+        identity_gate_required=identity_gate_required_for_direction(direction),
+        include_ivr=True,
+        source="direction_fallback",
+    )
+
+
+def _resolve_call_policy(agent: AgentConfig, direction: str) -> _CallPolicy:
+    """Resolve call-kind policy, falling back to legacy direction behavior.
+
+    Runtime-config ``call_kind`` is the per-agent decision source:
+
+    * ``payer``: skip identity verification and include IVR navigation.
+    * ``patient``: require identity verification and omit IVR navigation.
+
+    Missing, blank, or unknown values preserve today's direction-based
+    behavior so the engine can ship before the API starts sending policy.
+    """
+    raw_kind = agent.call_kind
+    call_kind = raw_kind.strip().casefold() if isinstance(raw_kind, str) else ""
+    if call_kind == "payer":
+        return _CallPolicy(
+            identity_gate_required=False,
+            include_ivr=True,
+            source="call_kind",
+            call_kind=call_kind,
+        )
+    if call_kind == "patient":
+        return _CallPolicy(
+            identity_gate_required=True,
+            include_ivr=False,
+            source="call_kind",
+            call_kind=call_kind,
+        )
+
+    fallback = _direction_fallback_policy(direction)
+    if call_kind:
+        logger.warning(
+            "call_policy_unknown_call_kind",
+            call_kind=call_kind,
+            direction=direction,
+            identity_gate_required=fallback.identity_gate_required,
+            include_ivr=fallback.include_ivr,
+            policy_source=fallback.source,
+        )
+        return _CallPolicy(
+            identity_gate_required=fallback.identity_gate_required,
+            include_ivr=fallback.include_ivr,
+            source=fallback.source,
+            call_kind=call_kind,
+        )
+    return fallback
 
 
 def _parse_required_case_data_keys(settings: Settings) -> list[str]:
