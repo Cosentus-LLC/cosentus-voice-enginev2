@@ -15,11 +15,10 @@ Code owns the workflow (two guarantees)
   deadline → reference-number → wrap``. Each non-terminal node
   advertises exactly **one** advance function whose handler returns the
   *single* next node — Pipecat Flows narrows the LLM's tool schema per
-  node, so the model literally cannot jump ahead. To reach ``wrap`` the
-  call must pass through ``reference-number``, and that step's advance
-  handler **refuses to transition** (returns ``next_node=None``) until a
-  non-blank reference number is supplied. That refusal is a
-  deterministic code check, not a prompt instruction.
+  node, so the model literally cannot jump ahead. Steps may mark captured
+  fields required; their advance handlers **refuse to transition**
+  (returns ``next_node=None``) until those fields are supplied non-blank.
+  That refusal is a deterministic code check, not a prompt instruction.
 * **Bounded per-step context.** Every step resets context so only the
   current step's task + a carried-forward summary stay in the LLM
   window — per-turn input stays flat on a 20-30 min call instead of
@@ -73,8 +72,6 @@ DEADLINE = "deadline"
 REFERENCE_NUMBER = "reference_number"
 WRAP = "wrap"
 
-REQUIRED_REFERENCE_NODE_ID = REFERENCE_NUMBER
-REQUIRED_REFERENCE_FIELD = "call_reference"
 FLOW_NODE_TYPES = frozenset({"ask", "branch", "transfer", "end"})
 GREETING_STATE_KEY = "greeted"
 GREETING_ALREADY_DONE_NOTE = (
@@ -119,8 +116,7 @@ class _Step:
     ``advance_name`` is the (chain-unique) name of the single function
     this node advertises to move to the next step. ``required_field``,
     when set, makes that field a required string argument the handler
-    must receive non-blank before it will transition — the un-skippable
-    guarantee (used by ``reference_number``).
+    must receive non-blank before it will transition.
     """
 
     name: str
@@ -513,29 +509,6 @@ def _has_cycle(definition: _FlowDefinition, nodes_by_id: dict[str, _FlowNode]) -
     return visit(definition.start)
 
 
-def _can_end_without_reference(
-    definition: _FlowDefinition,
-    nodes_by_id: dict[str, _FlowNode],
-) -> bool:
-    """Return True when any path reaches an end node before reference capture."""
-
-    def visit(node_id: str, seen_reference: bool, path: frozenset[str]) -> bool:
-        node = nodes_by_id.get(node_id)
-        if node is None:
-            return False
-        next_seen_reference = seen_reference or node.id == REQUIRED_REFERENCE_NODE_ID
-        if node.type == "end":
-            return not next_seen_reference
-        if node_id in path:
-            return False
-        next_path = path | {node_id}
-        return any(
-            visit(target, next_seen_reference, next_path) for target in _outgoing_targets(node)
-        )
-
-    return visit(definition.start, False, frozenset())
-
-
 def _flow_definition_errors(definition: _FlowDefinition) -> list[str]:
     errors: list[str] = []
     nodes_by_id: dict[str, _FlowNode] = {}
@@ -553,20 +526,6 @@ def _flow_definition_errors(definition: _FlowDefinition) -> list[str]:
 
     if definition.start not in nodes_by_id:
         errors.append(f"start references missing node {definition.start!r}")
-
-    reference_node = nodes_by_id.get(REQUIRED_REFERENCE_NODE_ID)
-    if reference_node is None:
-        errors.append(f"nodes.{REQUIRED_REFERENCE_NODE_ID} is required")
-    else:
-        if reference_node.type != "ask":
-            errors.append(f"nodes.{REQUIRED_REFERENCE_NODE_ID}.type must be ask")
-        if reference_node.required is not True:
-            errors.append(f"nodes.{REQUIRED_REFERENCE_NODE_ID}.required must be true")
-        if REQUIRED_REFERENCE_FIELD not in reference_node.capture:
-            errors.append(
-                f"nodes.{REQUIRED_REFERENCE_NODE_ID}.capture must include "
-                f"{REQUIRED_REFERENCE_FIELD}"
-            )
 
     reachable: set[str] = set()
 
@@ -617,8 +576,6 @@ def _flow_definition_errors(definition: _FlowDefinition) -> list[str]:
 
     if definition.start in nodes_by_id and _has_cycle(definition, nodes_by_id):
         errors.append("flow graph cannot contain cycles")
-    if definition.start in nodes_by_id and _can_end_without_reference(definition, nodes_by_id):
-        errors.append("every terminal path must pass through reference_number")
 
     return errors
 
@@ -651,10 +608,22 @@ _FUNCTION_NAME_RE = re.compile(r"[^a-zA-Z0-9_]+")
 
 
 def _advance_name_for_flow_node(node: _FlowNode) -> str:
-    if node.id == REQUIRED_REFERENCE_NODE_ID:
+    if node.id == REFERENCE_NUMBER:
         return "record_reference_number"
     suffix = _FUNCTION_NAME_RE.sub("_", node.id.strip()).strip("_").lower()
     return f"advance_{suffix or 'flow_step'}"
+
+
+def _required_capture_fields(node: _FlowNode) -> tuple[str, ...]:
+    return node.capture if node.required else ()
+
+
+def _record_captured_field(flow_manager: FlowManager, field: str, value: str) -> None:
+    flow_manager.state[field] = value
+    # Compatibility for existing claim-flow data that captures call_reference
+    # while downstream code/tests also read the default-chain reference key.
+    if field == "call_reference":
+        flow_manager.state[REFERENCE_NUMBER] = value
 
 
 def _task_for_flow_node(*, node: _FlowNode, ivr_path: str, ivr_goal: str) -> str:
@@ -668,12 +637,9 @@ def _task_for_flow_node(*, node: _FlowNode, ivr_path: str, ivr_goal: str) -> str
     if node.capture:
         fields = ", ".join(field.replace("_", " ") for field in node.capture)
         parts.append(f"Capture these field(s) during this step when available: {fields}.")
-    if node.id == REQUIRED_REFERENCE_NODE_ID:
-        parts.append(
-            "You must ask for and capture the call reference or confirmation number. "
-            "Once provided, record it exactly as stated before moving on."
-        )
-    elif node.type == "branch":
+        if node.required:
+            parts.append("All captured field(s) for this step are required before moving on.")
+    if node.type == "branch":
         branch_lines = [f"- {branch.when}" for branch in node.branches if branch.when and branch.to]
         fallback = node.fallback or ""
         parts.append(
@@ -699,21 +665,18 @@ def _advance_function_for_flow_node(
     *,
     greeting_state: GreetingState | None = None,
 ) -> FlowsFunctionSchema:
+    required_fields = _required_capture_fields(node)
+    required_field_set = set(required_fields)
+
     async def handler(args: FlowArgs, flow_manager: FlowManager) -> ConsolidatedFunctionResult:
         captured: dict[str, str] = {}
         for field in node.capture:
             value = str(args.get(field) or "").strip()
-            if (
-                node.id == REQUIRED_REFERENCE_NODE_ID
-                and field == REQUIRED_REFERENCE_FIELD
-                and not value
-            ):
-                return {"status": "missing", "field": REQUIRED_REFERENCE_FIELD}, None
+            if field in required_field_set and not value:
+                return {"status": "missing", "field": field}, None
             if value:
-                flow_manager.state[field] = value
+                _record_captured_field(flow_manager, field, value)
                 captured[field] = value
-                if field == REQUIRED_REFERENCE_FIELD:
-                    flow_manager.state[REFERENCE_NUMBER] = value
 
         target = node.next
         if node.type == "branch":
@@ -738,17 +701,10 @@ def _advance_function_for_flow_node(
         return {"status": "ok", **captured}, next_node
 
     properties: dict[str, Any] = {}
-    required: list[str] = []
     for field in node.capture:
         properties[field] = {
             "type": "string",
             "description": f"The {field.replace('_', ' ')} captured during this step.",
-        }
-    if node.id == REQUIRED_REFERENCE_NODE_ID:
-        required.append(REQUIRED_REFERENCE_FIELD)
-        properties[REQUIRED_REFERENCE_FIELD] = {
-            "type": "string",
-            "description": "The call reference or confirmation number the representative provided.",
         }
     if node.type == "branch":
         options = sorted(
@@ -765,7 +721,7 @@ def _advance_function_for_flow_node(
         name=_advance_name_for_flow_node(node),
         description=f"Advance from the {node.label or node.id} flow step.",
         properties=properties,
-        required=required,
+        required=list(required_fields),
         handler=handler,
     )
 
@@ -1113,8 +1069,6 @@ __all__ = [
     "NAVIGATE",
     "NAVIGATE_BASE_TASK",
     "REFERENCE_NUMBER",
-    "REQUIRED_REFERENCE_FIELD",
-    "REQUIRED_REFERENCE_NODE_ID",
     "STEPS",
     "STEP_COMPLETION_ROLE_RULE",
     "SUMMARY_PROMPT",
