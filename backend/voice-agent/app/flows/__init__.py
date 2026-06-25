@@ -7,7 +7,7 @@
   (16c) replaces the pre-verification system instruction with a PHI-free
   one.
 * :mod:`app.flows.steps` — the 16c ordered, un-skippable post-verification
-  steps (#43) with per-step bounded context.
+  steps (#43) with per-step bounded context and policy-driven IVR inclusion.
 """
 
 from __future__ import annotations

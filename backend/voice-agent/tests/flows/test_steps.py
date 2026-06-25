@@ -82,6 +82,7 @@ def _chain(
     hydrated_system: str = "HYDRATED-SYSTEM-PROMPT",
     flow_definition: dict | None = None,
     greeting_state: dict[str, bool] | None = None,
+    include_ivr: bool = True,
 ):
     return build_step_chain(
         run_tool_core=AsyncMock(return_value=({"status": "ok"}, False)),
@@ -89,6 +90,7 @@ def _chain(
         hydrated_system=hydrated_system,
         flow_definition=flow_definition,
         greeting_state=greeting_state,
+        include_ivr=include_ivr,
     )
 
 
@@ -151,6 +153,22 @@ def _custom_flow() -> dict:
     }
 
 
+def _custom_flow_starting_at_navigate() -> dict:
+    flow = _custom_flow()
+    flow["start"] = NAVIGATE
+    flow["nodes"] = [
+        {
+            "id": NAVIGATE,
+            "type": "ask",
+            "label": "Navigate",
+            "say": "Navigate the payer IVR.",
+            "next": "intro",
+        },
+        *flow["nodes"],
+    ]
+    return flow
+
+
 async def _walk_to(node, target_name):
     """Advance from ``node`` to ``target_name`` supplying no extra args.
 
@@ -205,6 +223,50 @@ class TestOrdering:
         wrap = STEPS[-1]
         assert wrap.name == WRAP
         assert wrap.advance_name == ""
+
+
+class TestIvrApplicability:
+    def test_default_no_ivr_chain_starts_at_greet(self):
+        node = _chain(include_ivr=False, greeting_state={GREETING_STATE_KEY: False})
+
+        assert node["name"] == GREET
+        assert node["role_message"].endswith(STEP_COMPLETION_ROLE_RULE)
+        assert node["context_strategy"].strategy == ContextStrategy.RESET
+
+    @pytest.mark.asyncio
+    async def test_default_no_ivr_chain_omits_navigate_in_walk(self):
+        node = _chain(include_ivr=False, greeting_state={GREETING_STATE_KEY: False})
+        fm = _fm()
+        names: list[str] = []
+
+        while True:
+            names.append(node["name"])
+            if not node["functions"]:
+                break
+            args = {"reference_number": "REF-12345"} if node["name"] == REFERENCE_NUMBER else {}
+            _result, node = await _advance_fn(node).handler(args, fm)
+            assert node is not None
+
+        assert NAVIGATE not in names
+        assert names == [step.name for step in STEPS[1:]]
+
+    def test_default_no_ivr_chain_respects_existing_greeting_state(self):
+        node = _chain(include_ivr=False, greeting_state={GREETING_STATE_KEY: True})
+
+        assert node["name"] == CONFIRM_DENIAL
+        task_blob = _message_blob(node)
+        assert GREETING_ALREADY_DONE_NOTE in task_blob
+        assert "Introduce yourself" not in task_blob
+
+    def test_data_driven_no_ivr_skips_starting_navigate_when_unambiguous(self):
+        node = _chain(
+            flow_definition=_custom_flow_starting_at_navigate(),
+            include_ivr=False,
+            greeting_state={GREETING_STATE_KEY: False},
+        )
+
+        assert node["name"] == "intro"
+        assert NAVIGATE not in _message_blob(node)
 
 
 # ── Greeting state ───────────────────────────────────────────────────────

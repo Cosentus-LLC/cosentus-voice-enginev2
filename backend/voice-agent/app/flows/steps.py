@@ -10,7 +10,7 @@ from this point on (the gate keeps everything PHI-free *before* it; see
 
 Code owns the workflow (two guarantees)
 ---------------------------------------
-* **Ordered + un-skippable.** The steps are a *linear chain*:
+* **Ordered + un-skippable.** The payer/default steps are a *linear chain*:
   ``navigate → greet → confirm-denial → ask-needs → fax/portal →
   deadline → reference-number → wrap``. Each non-terminal node
   advertises exactly **one** advance function whose handler returns the
@@ -24,7 +24,8 @@ Code owns the workflow (two guarantees)
   current step's task + a carried-forward summary stay in the LLM
   window — per-turn input stays flat on a 20-30 min call instead of
   accumulating the whole transcript. The *first* post-verification step
-  (``navigate``) uses :attr:`ContextStrategy.RESET` to drop the
+  (``navigate`` for payer/default calls, or the first non-IVR step for
+  patient calls) uses :attr:`ContextStrategy.RESET` to drop the
   identity-gate chatter cleanly and load the hydrated system prompt
   (``role_message``); every later step uses
   :attr:`ContextStrategy.RESET_WITH_SUMMARY` so the gist of the prior
@@ -814,6 +815,7 @@ def _build_default_step_chain(
     summary_prompt: str = SUMMARY_PROMPT,
     ivr_path: str = "",
     ivr_goal: str = "",
+    include_ivr: bool = True,
     knowledge_warmer: PrefetchWarmer | None = None,
     knowledge_context: PrefetchContext | None = None,
     greeting_state: GreetingState | None = None,
@@ -821,8 +823,9 @@ def _build_default_step_chain(
     """Build the default post-verification step chain; return its first node.
 
     Passed to :func:`app.flows.identity_gate.build_identity_gate_flow` as
-    ``verified_node`` — so the gate transitions into ``navigate`` only
-    after a successful, code-checked verification.
+    ``verified_node`` — so the gate transitions into the first allowed
+    post-verification step only after a successful, code-checked
+    verification.
 
     Args:
         run_tool_core: ``run_bot``'s shared tool-execution core
@@ -846,6 +849,9 @@ def _build_default_step_chain(
         ivr_goal: Per-agent navigation goal (``AgentConfig.ivr_goal``),
             already hydrated. When non-blank it's stated as the goal in
             the ``navigate`` step. Blank → omitted.
+        include_ivr: Whether to include the payer IVR ``navigate`` step.
+            Patient calls set this false and begin at the first non-IVR
+            step, while preserving the no-regreeting state.
         knowledge_warmer: Optional per-call warmer. When supplied, relevant
             step tasks may synchronously include cache hits.
         knowledge_context: PHI-minimized context for cache query construction.
@@ -854,13 +860,16 @@ def _build_default_step_chain(
             ``greet`` node and carries a no-regreeting note across resets.
 
     Returns:
-        The ``navigate`` :class:`NodeConfig` — the head of the chain.
+        The first :class:`NodeConfig` in the policy-selected chain.
     """
+    steps = STEPS
+    if not include_ivr:
+        steps = STEPS[2:] if _has_greeted(greeting_state) else STEPS[1:]
 
     def build_node(index: int, *, include_greeting_note: bool = True) -> NodeConfig:
-        step = STEPS[index]
+        step = steps[index]
         is_first = index == 0
-        is_last = index == len(STEPS) - 1
+        is_last = index == len(steps) - 1
 
         functions: list[FlowsFunctionSchema] = _tool_functions(registry, run_tool_core)
         if not is_last:
@@ -943,11 +952,43 @@ def _build_data_driven_step_chain(
     summary_prompt: str,
     ivr_path: str,
     ivr_goal: str,
+    include_ivr: bool,
     knowledge_warmer: PrefetchWarmer | None,
     knowledge_context: PrefetchContext | None,
     greeting_state: GreetingState | None,
 ) -> NodeConfig:
     nodes_by_id = _definition_node_map(definition)
+    start_node_id = definition.start
+
+    if not include_ivr:
+        start_node = nodes_by_id.get(start_node_id)
+        if start_node is not None and start_node.id == NAVIGATE:
+            targets = _outgoing_targets(start_node)
+            if len(targets) == 1:
+                start_node_id = targets[0]
+            else:
+                logger.warning(
+                    "flow_definition_no_ivr_start_ambiguous_default_flow",
+                    node_id=start_node.id,
+                    target_count=len(targets),
+                )
+                return _build_default_step_chain(
+                    run_tool_core=run_tool_core,
+                    registry=registry,
+                    hydrated_system=hydrated_system,
+                    summary_prompt=summary_prompt,
+                    ivr_path="",
+                    ivr_goal="",
+                    include_ivr=False,
+                    knowledge_warmer=knowledge_warmer,
+                    knowledge_context=knowledge_context,
+                    greeting_state=greeting_state,
+                )
+
+        if _has_greeted(greeting_state):
+            start_node = nodes_by_id.get(start_node_id)
+            if start_node is not None and start_node.id == GREET and start_node.next:
+                start_node_id = start_node.next
 
     def build_node(node_id: str, *, is_initial: bool = False) -> NodeConfig | None:
         step = nodes_by_id.get(node_id)
@@ -988,12 +1029,12 @@ def _build_data_driven_step_chain(
             )
         return node
 
-    first = build_node(definition.start, is_initial=True)
+    first = build_node(start_node_id, is_initial=True)
     if first is None:
         logger.warning(
             "flow_definition_transition_missing_default_flow",
             node_id="__start__",
-            target=definition.start,
+            target=start_node_id,
         )
         return _build_default_step_chain(
             run_tool_core=run_tool_core,
@@ -1002,6 +1043,7 @@ def _build_data_driven_step_chain(
             summary_prompt=summary_prompt,
             ivr_path=ivr_path,
             ivr_goal=ivr_goal,
+            include_ivr=include_ivr,
             knowledge_warmer=knowledge_warmer,
             knowledge_context=knowledge_context,
             greeting_state=greeting_state,
@@ -1017,6 +1059,7 @@ def build_step_chain(
     summary_prompt: str = SUMMARY_PROMPT,
     ivr_path: str = "",
     ivr_goal: str = "",
+    include_ivr: bool = True,
     knowledge_warmer: PrefetchWarmer | None = None,
     knowledge_context: PrefetchContext | None = None,
     flow_definition: dict[str, Any] | None = None,
@@ -1026,7 +1069,8 @@ def build_step_chain(
 
     When runtime-config provides a valid data-driven ``flow_definition``, the
     graph drives the nodes and transitions. Missing or invalid definitions
-    safely fall back to the original fixed 8-step flow.
+    safely fall back to the original fixed 8-step flow. ``include_ivr=False``
+    omits the payer IVR navigation step for patient calls.
     """
     definition = _usable_flow_definition(flow_definition)
     if definition is None:
@@ -1037,6 +1081,7 @@ def build_step_chain(
             summary_prompt=summary_prompt,
             ivr_path=ivr_path,
             ivr_goal=ivr_goal,
+            include_ivr=include_ivr,
             knowledge_warmer=knowledge_warmer,
             knowledge_context=knowledge_context,
             greeting_state=greeting_state,
@@ -1049,6 +1094,7 @@ def build_step_chain(
         summary_prompt=summary_prompt,
         ivr_path=ivr_path,
         ivr_goal=ivr_goal,
+        include_ivr=include_ivr,
         knowledge_warmer=knowledge_warmer,
         knowledge_context=knowledge_context,
         greeting_state=greeting_state,

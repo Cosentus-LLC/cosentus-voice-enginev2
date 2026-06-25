@@ -305,6 +305,16 @@ class AgentConfig(_RuntimeConfigModel):
     flow_definition: dict[str, Any] | None = None
     ivr_goal: str = ""
     identity_verification_keys: list[str] = Field(default_factory=list)
+    call_kind: str | None = None
+    """Per-agent call policy selector.
+
+    ``payer`` means the bot is calling a payer phone system: skip patient
+    identity verification and include the IVR navigate step. ``patient`` means
+    the bot is calling a patient: verify identity before PHI/tool access and
+    omit payer IVR navigation. The field is intentionally permissive so a bad
+    runtime-config value falls back in ``bot.py`` instead of failing a call at
+    parse time.
+    """
 
     speak_first: bool = True
     """Whether the agent speaks first when the call starts.
