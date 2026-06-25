@@ -31,7 +31,7 @@ from app.bot.bot import (
 )
 from app.config.agent_config import AgentConfig, ToolConfig
 from app.config.settings import Settings
-from app.flows import PRE_VERIFICATION_ROLE_MESSAGE
+from app.flows import GREETING_STATE_KEY, PRE_VERIFICATION_ROLE_MESSAGE
 from app.flows.identity_gate import IDENTITY_VERIFICATION_ROLE_RULE
 from app.flows.steps import NAVIGATE, STEP_COMPLETION_ROLE_RULE
 from app.hydration.hydrator import MissingRequiredCaseDataError
@@ -1187,6 +1187,66 @@ async def test_run_bot_passes_agent_flow_definition_to_step_chain():
 
     step_chain.assert_called_once()
     assert step_chain.call_args.kwargs["flow_definition"] == flow_definition
+
+
+@pytest.mark.asyncio
+async def test_run_bot_passes_speak_first_greeting_state_to_step_chain():
+    agent, mocks = _patch_run_bot_dependencies(
+        agent=_agent(speak_first=True, first_message="Hi."),
+    )
+    transport = _make_transport_mock()
+    fm = _flow_manager_mock()
+    step_chain = MagicMock(
+        return_value={"name": NAVIGATE, "task_messages": [], "functions": []},
+    )
+    patches = _start_run_bot_patches(agent, mocks, transport) + [
+        patch("app.bot.bot.build_flow_manager", MagicMock(return_value=fm)),
+        patch("app.bot.bot.build_step_chain", step_chain),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        await run_bot(
+            transport,
+            _runner_args(),
+            _settings(flows_enabled=True, identity_verification_keys="patient_name"),
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    step_chain.assert_called_once()
+    assert step_chain.call_args.kwargs["greeting_state"][GREETING_STATE_KEY] is True
+
+
+@pytest.mark.asyncio
+async def test_run_bot_passes_user_first_greeting_state_to_step_chain():
+    agent, mocks = _patch_run_bot_dependencies(
+        agent=_agent(speak_first=False, first_message=""),
+    )
+    transport = _make_transport_mock()
+    fm = _flow_manager_mock()
+    step_chain = MagicMock(
+        return_value={"name": NAVIGATE, "task_messages": [], "functions": []},
+    )
+    patches = _start_run_bot_patches(agent, mocks, transport) + [
+        patch("app.bot.bot.build_flow_manager", MagicMock(return_value=fm)),
+        patch("app.bot.bot.build_step_chain", step_chain),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        await run_bot(
+            transport,
+            _runner_args(),
+            _settings(flows_enabled=True, identity_verification_keys="patient_name"),
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    step_chain.assert_called_once()
+    assert step_chain.call_args.kwargs["greeting_state"][GREETING_STATE_KEY] is False
 
 
 @pytest.mark.asyncio

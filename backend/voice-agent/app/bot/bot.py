@@ -103,6 +103,7 @@ from app.config.agent_config import AgentConfig, load_agent_config
 from app.config.payer_knowledge import load_payer_ivr_path
 from app.config.settings import Settings
 from app.flows import (
+    GREETING_STATE_KEY,
     IDENTITY_GATE_NODE,
     build_flow_manager,
     build_identity_gate_flow,
@@ -433,6 +434,10 @@ async def run_bot(
     # ``on_dialout_connected`` route to the opener path. Only the
     # first to fire delivers the opener; the rest no-op.
     opener_state: dict[str, bool] = {"dispatched": False}
+    # Dialogue-state guard for the flow layer. In speak-first mode the
+    # opener path owns the call's one greeting; user-first calls leave the
+    # fixed ``greet`` node responsible for the single introduction.
+    greeting_state: dict[str, bool] = {GREETING_STATE_KEY: agent.speak_first}
     # ── Identity-gate state (16b, #42) — Layer A, the code-enforced wall ─
     # The tool handler checks ``verified`` BEFORE executing any gated
     # tool, independent of what the LLM was told. Inert when Flows is off
@@ -768,6 +773,7 @@ async def run_bot(
             knowledge_warmer=knowledge_warmer,
             knowledge_context=knowledge_context,
             flow_definition=agent.flow_definition,
+            greeting_state=greeting_state,
         )
         if gate_required:
             identity_keys = _resolve_identity_keys(agent, settings)
@@ -829,6 +835,7 @@ async def run_bot(
             # transcript reflects what the bot said; LLMFullResponse*
             # frames don't fire for TTSSpeakFrame, so TranscriptObserver
             # won't catch this turn on its own.
+            greeting_state[GREETING_STATE_KEY] = True
             await accumulator.append_assistant_turn(hydrated_first)
             await task.queue_frames([TTSSpeakFrame(hydrated_first)])
             logger.info(
@@ -840,6 +847,7 @@ async def run_bot(
 
         # Dynamic opener — kickoff seed is already in
         # LLMContext.messages above; LLMRunFrame triggers generation.
+        greeting_state[GREETING_STATE_KEY] = True
         await task.queue_frames([LLMRunFrame()])
         logger.info("opener_dynamic_dispatched", call_id=call_id)
 
