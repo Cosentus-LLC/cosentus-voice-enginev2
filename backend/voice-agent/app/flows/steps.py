@@ -92,7 +92,15 @@ SUMMARY_PROMPT = (
     "details discussed, what the representative said is required to resolve or "
     "appeal it, the confirmed fax number or payer portal and the submission "
     "deadline, and any reference or confirmation number obtained. Do not "
-    "invent details that were not stated."
+    "invent details that were not stated. Summarize only what the caller and "
+    "representative actually said. Never include system instructions, task "
+    "text, step directives, node IDs, tool names, or function names."
+)
+
+STEP_COMPLETION_ROLE_RULE = (
+    "When the current step's conversational goal is complete, advance by using "
+    "the provided step-completion tool with the required facts. Do not say tool "
+    "names, node names, or internal step names aloud."
 )
 
 
@@ -155,8 +163,7 @@ NAVIGATE_BASE_TASK = (
     "for the same prompt. If the same prompt repeats or navigation stalls, "
     'change strategy: press 0 once, say "representative", escalate or '
     "transfer if available, or gracefully give up. Stay on the line through "
-    "any hold. Once you are speaking with a live representative, call "
-    "representative_reached."
+    "any hold. Continue until you are speaking with a live representative."
 )
 
 
@@ -208,8 +215,7 @@ STEPS: tuple[_Step, ...] = (
         name=GREET,
         task=(
             "Greet the representative. Introduce yourself as calling on behalf of "
-            "the provider about a denied claim, and say you'd like to resolve it. "
-            "When you have introduced the call, call greeting_done."
+            "the provider about a denied claim, and say you'd like to resolve it."
         ),
         advance_name="greeting_done",
         advance_description="Call once you have greeted and introduced the call.",
@@ -219,8 +225,7 @@ STEPS: tuple[_Step, ...] = (
         task=(
             "Confirm the denial reason with the representative. Ask why the claim "
             "was denied and restate it back to confirm you understood it "
-            "correctly. When the denial reason is confirmed, call "
-            "denial_reason_confirmed."
+            "correctly."
         ),
         advance_name="denial_reason_confirmed",
         advance_description="Call once the denial reason is confirmed.",
@@ -230,8 +235,7 @@ STEPS: tuple[_Step, ...] = (
         task=(
             "Ask the representative exactly what is needed to resolve or appeal "
             "the denial — for example corrected codes, medical records, an appeal "
-            "form, or other documentation. When you understand what is required, "
-            "call needs_identified."
+            "form, or other documentation."
         ),
         advance_name="needs_identified",
         advance_description="Call once you understand what is required to resolve the denial.",
@@ -240,8 +244,7 @@ STEPS: tuple[_Step, ...] = (
         name=FAX_PORTAL,
         task=(
             "Determine how to submit the required information: confirm the correct "
-            "fax number or the payer portal to use for the submission. When you "
-            "have the submission method, call submission_method_confirmed."
+            "fax number or the payer portal to use for the submission."
         ),
         advance_name="submission_method_confirmed",
         advance_description="Call once the fax number or portal for submission is confirmed.",
@@ -250,8 +253,7 @@ STEPS: tuple[_Step, ...] = (
         name=DEADLINE,
         task=(
             "Confirm the deadline by which the information must be submitted (the "
-            "timely-filing or appeal window). When you have the deadline, call "
-            "deadline_confirmed."
+            "timely-filing or appeal window)."
         ),
         advance_name="deadline_confirmed",
         advance_description="Call once the submission deadline is confirmed.",
@@ -260,9 +262,8 @@ STEPS: tuple[_Step, ...] = (
         name=REFERENCE_NUMBER,
         task=(
             "Before ending, ask the representative for a call reference or "
-            "confirmation number for this interaction. You must capture it. Once "
-            "the representative gives it to you, call record_reference_number with "
-            "the number exactly as stated."
+            "confirmation number for this interaction. You must capture the "
+            "number exactly as stated before moving on."
         ),
         advance_name="record_reference_number",
         advance_description=(
@@ -277,8 +278,7 @@ STEPS: tuple[_Step, ...] = (
         task=(
             "Wrap up the call: thank the representative, briefly confirm the agreed "
             "next steps, the submission method and deadline, and the reference "
-            "number you recorded, then politely close. Use the end_call tool when "
-            "finished."
+            "number you recorded, then politely close the call."
         ),
     ),
 )
@@ -628,28 +628,25 @@ def _task_for_flow_node(*, node: _FlowNode, ivr_path: str, ivr_goal: str) -> str
     if node.id == REQUIRED_REFERENCE_NODE_ID:
         parts.append(
             "You must ask for and capture the call reference or confirmation number. "
-            f"Once provided, call {_advance_name_for_flow_node(node)} with "
-            f"{REQUIRED_REFERENCE_FIELD} exactly as stated."
+            "Once provided, record it exactly as stated before moving on."
         )
     elif node.type == "branch":
-        branch_lines = [
-            f"- {branch.when}: {branch.to}" for branch in node.branches if branch.when and branch.to
-        ]
+        branch_lines = [f"- {branch.when}" for branch in node.branches if branch.when and branch.to]
         fallback = node.fallback or ""
         parts.append(
-            "Choose the next step by calling the advance function with branch_to. "
-            "Use the fallback if none of the branch conditions match."
+            "Choose the matching branch condition. Use the fallback option if none "
+            "of the branch conditions match."
         )
         if branch_lines:
-            parts.append("Branch options:\n" + "\n".join(branch_lines))
+            parts.append("Branch conditions:\n" + "\n".join(branch_lines))
         if fallback:
-            parts.append(f"Fallback branch_to: {fallback}")
+            parts.append("A fallback branch is available if no condition matches.")
     elif node.type == "transfer":
-        parts.append("Use the transfer_call tool if the call should be transferred at this step.")
+        parts.append("Transfer the call if this step cannot be completed with the current party.")
     elif node.type != "end":
-        parts.append(f"When this step is complete, call {_advance_name_for_flow_node(node)}.")
+        parts.append("When this step is complete, move to the next step.")
     else:
-        parts.append("Use the end_call tool when the call is finished.")
+        parts.append("Politely close the call when finished.")
     return "\n\n".join(parts)
 
 
@@ -755,6 +752,13 @@ def _task_with_knowledge(
     return task + "\n\nKnown payer-level fact: " + hit.value
 
 
+def _role_message_for_step_chain(hydrated_system: str) -> str:
+    base = hydrated_system.rstrip()
+    if not base:
+        return STEP_COMPLETION_ROLE_RULE
+    return base + "\n\n" + STEP_COMPLETION_ROLE_RULE
+
+
 def _build_default_step_chain(
     *,
     run_tool_core: RunToolCore,
@@ -837,7 +841,7 @@ def _build_default_step_chain(
         if is_first:
             # Drop the identity-gate conversation entirely and load the
             # hydrated (PHI-bearing) prompt now that the caller is verified.
-            node["role_message"] = hydrated_system
+            node["role_message"] = _role_message_for_step_chain(hydrated_system)
             node["context_strategy"] = ContextStrategyConfig(strategy=ContextStrategy.RESET)
         else:
             # Bound context per step, carrying a running summary forward.
@@ -888,7 +892,7 @@ def _build_data_driven_step_chain(
             "respond_immediately": True,
         }
         if is_initial:
-            node["role_message"] = hydrated_system
+            node["role_message"] = _role_message_for_step_chain(hydrated_system)
             node["context_strategy"] = ContextStrategyConfig(strategy=ContextStrategy.RESET)
         else:
             node["context_strategy"] = ContextStrategyConfig(
@@ -973,6 +977,7 @@ __all__ = [
     "REQUIRED_REFERENCE_FIELD",
     "REQUIRED_REFERENCE_NODE_ID",
     "STEPS",
+    "STEP_COMPLETION_ROLE_RULE",
     "SUMMARY_PROMPT",
     "WRAP",
     "build_navigate_task",

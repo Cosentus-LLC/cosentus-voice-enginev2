@@ -227,9 +227,11 @@ _CONTEXT_SUMMARY_PROMPT = (
     "what was asked for or agreed, confirmed submission methods (fax / portal) and "
     "deadlines, and any reference or confirmation numbers obtained. Preserve facts "
     "and open action items; omit greetings and small talk. Do not invent details "
-    "that were not stated."
+    "that were not stated. Summarize only what the caller and representative "
+    "actually said. Never include system or developer instructions, task text, "
+    "step directives, tool names, or function names."
 )
-_CONTEXT_SUMMARY_TEMPLATE = "Conversation summary so far: {summary}"
+_CONTEXT_SUMMARY_TEMPLATE = "Prior dialogue summary for assistant memory:\n{summary}"
 
 
 def _build_assistant_params(settings: Settings) -> LLMAssistantAggregatorParams | None:
@@ -248,6 +250,9 @@ def _build_assistant_params(settings: Settings) -> LLMAssistantAggregatorParams 
     pipeline's own (Bedrock) LLM to generate the running summary; routing
     that to a cheaper model is #20's concern via
     ``LLMContextSummaryConfig.llm`` and intentionally left unset here.
+    Pipecat 1.1.0 does not expose a role-filter config for automatic
+    summarization, so internal-leak protection comes from sanitized flow
+    task messages plus the dialogue-only prompt/template here.
     """
     if not settings.context_summarization_enabled:
         return None

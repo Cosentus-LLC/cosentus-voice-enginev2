@@ -32,7 +32,8 @@ from app.bot.bot import (
 from app.config.agent_config import AgentConfig, ToolConfig
 from app.config.settings import Settings
 from app.flows import PRE_VERIFICATION_ROLE_MESSAGE
-from app.flows.steps import NAVIGATE
+from app.flows.identity_gate import IDENTITY_VERIFICATION_ROLE_RULE
+from app.flows.steps import NAVIGATE, STEP_COMPLETION_ROLE_RULE
 from app.hydration.hydrator import MissingRequiredCaseDataError
 from app.tools.result import ToolResult, ToolStatus
 from pipecat.frames.frames import LLMRunFrame, TTSSpeakFrame
@@ -1229,12 +1230,14 @@ async def test_flag_on_gate_is_phi_free_and_verified_node_is_step_chain(monkeypa
 
     # Gate node (what initialize received) is PHI-free.
     gate_node = fm.initialize.await_args.args[0]
-    assert gate_node["role_message"] == PRE_VERIFICATION_ROLE_MESSAGE
+    assert PRE_VERIFICATION_ROLE_MESSAGE in gate_node["role_message"]
+    assert IDENTITY_VERIFICATION_ROLE_RULE in gate_node["role_message"]
 
     # Verified node = the step-chain head; it restores the hydrated prompt.
     verified = capture["verified_node"]
     assert verified["name"] == NAVIGATE
-    assert verified["role_message"] == "You are a test agent."  # hydrated system prompt
+    assert "You are a test agent." in verified["role_message"]  # hydrated system prompt
+    assert STEP_COMPLETION_ROLE_RULE in verified["role_message"]
     # And the two are distinct — PHI is not present pre-verification.
     assert verified["role_message"] != gate_node["role_message"]
 
@@ -2137,9 +2140,14 @@ class TestBuildAssistantParams:
         assert sc.min_messages_after_summary == _CONTEXT_MIN_MESSAGES_AFTER_SUMMARY
         assert sc.target_context_tokens == _CONTEXT_SUMMARY_TARGET_TOKENS
         assert sc.summary_message_template == _CONTEXT_SUMMARY_TEMPLATE
+        assert "Conversation summary so far" not in sc.summary_message_template
         # Domain-specific prompt is wired (not the generic Pipecat default).
         assert sc.summarization_prompt is not None
         assert "medical-billing" in sc.summarization_prompt
+        assert "Summarize only what the caller and representative actually said" in (
+            sc.summarization_prompt
+        )
+        assert "function names" in sc.summarization_prompt
         # Summarizer LLM left unset — routing to a cheaper model is #20's job.
         assert sc.llm is None
 
@@ -2259,6 +2267,8 @@ async def test_long_conversation_bounded_to_window_plus_summary():
     assert len(out) == keep + 1  # one summary message + the window
     assert out[0]["role"] == "user"
     assert "running summary of the call" in out[0]["content"]
+    assert "Prior dialogue summary for assistant memory" in out[0]["content"]
+    assert "Conversation summary so far" not in out[0]["content"]
     # Recent turns kept verbatim, including the very last one.
     assert out[-keep:] == messages[-keep:]
 

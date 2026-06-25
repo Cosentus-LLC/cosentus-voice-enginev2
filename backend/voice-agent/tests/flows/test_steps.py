@@ -29,6 +29,7 @@ from app.flows.steps import (
     REFERENCE_NUMBER,
     REQUIRED_REFERENCE_FIELD,
     REQUIRED_REFERENCE_NODE_ID,
+    STEP_COMPLETION_ROLE_RULE,
     STEPS,
     WRAP,
     build_navigate_task,
@@ -294,7 +295,8 @@ class TestDataDrivenFlow:
     async def test_custom_first_node_resets_and_later_nodes_use_summary(self):
         node = _chain(hydrated_system="HYDRATED-PHI-PROMPT", flow_definition=_custom_flow())
 
-        assert node["role_message"] == "HYDRATED-PHI-PROMPT"
+        assert "HYDRATED-PHI-PROMPT" in node["role_message"]
+        assert STEP_COMPLETION_ROLE_RULE in node["role_message"]
         assert node["context_strategy"].strategy == ContextStrategy.RESET
         _result, node = await _advance_fn(node).handler({}, _fm())
         assert "role_message" not in node
@@ -412,7 +414,8 @@ class TestReferenceNumberRequired:
 class TestPerStepContext:
     def test_first_step_resets_and_loads_hydrated_prompt(self):
         chain = _chain(hydrated_system="HYDRATED-PHI-PROMPT")
-        assert chain["role_message"] == "HYDRATED-PHI-PROMPT"
+        assert "HYDRATED-PHI-PROMPT" in chain["role_message"]
+        assert STEP_COMPLETION_ROLE_RULE in chain["role_message"]
         assert chain["context_strategy"].strategy == ContextStrategy.RESET
         # RESET (not summary) so identity-gate chatter is dropped cleanly.
         assert chain["context_strategy"].summary_prompt is None
@@ -450,6 +453,78 @@ class TestPerStepContext:
             if not fns:
                 break
             args = {"reference_number": "R-1"} if node["name"] == REFERENCE_NUMBER else {}
+            _result, node = await _advance_fn(node).handler(args, fm)
+
+
+class TestInternalDirectiveLeakage:
+    @pytest.mark.asyncio
+    async def test_default_step_task_messages_do_not_name_internal_functions(self):
+        forbidden = {
+            "representative_reached",
+            "greeting_done",
+            "denial_reason_confirmed",
+            "needs_identified",
+            "submission_method_confirmed",
+            "deadline_confirmed",
+            "record_reference_number",
+            "end_call",
+            "transfer_call",
+            "Conversation summary so far",
+            "Here's a summary of the conversation",
+        }
+        node = _chain()
+        fm = _fm()
+
+        while True:
+            task_blob = " ".join(message["content"] for message in node["task_messages"])
+            for internal_name in forbidden:
+                assert internal_name not in task_blob
+            fns = node["functions"]
+            if not fns:
+                break
+            args = {"reference_number": "R-1"} if node["name"] == REFERENCE_NUMBER else {}
+            _result, node = await _advance_fn(node).handler(args, fm)
+
+    def test_step_role_message_preserves_prompt_and_uses_generic_rule(self):
+        chain = _chain(hydrated_system="HYDRATED")
+        role_message = chain["role_message"]
+
+        assert "HYDRATED" in role_message
+        assert STEP_COMPLETION_ROLE_RULE in role_message
+        for step in STEPS:
+            if step.advance_name:
+                assert step.advance_name not in role_message
+
+    @pytest.mark.asyncio
+    async def test_data_driven_task_messages_do_not_name_generated_advance_functions(self):
+        forbidden = {
+            "advance_intro",
+            "advance_route_submission",
+            "advance_fax_path",
+            "advance_portal_path",
+            "record_reference_number",
+            "branch_to",
+            "fax_path",
+            "portal_path",
+            "Conversation summary so far",
+            "Here's a summary of the conversation",
+        }
+        node = _chain(flow_definition=_custom_flow())
+        fm = _fm()
+
+        while True:
+            task_blob = " ".join(message["content"] for message in node["task_messages"])
+            for internal_name in forbidden:
+                assert internal_name not in task_blob
+            fns = node["functions"]
+            if not fns:
+                break
+            if node["name"] == "route_submission":
+                args = {"branch_to": "fax_path"}
+            elif node["name"] == REQUIRED_REFERENCE_NODE_ID:
+                args = {REQUIRED_REFERENCE_FIELD: "R-1"}
+            else:
+                args = {}
             _result, node = await _advance_fn(node).handler(args, fm)
 
 
