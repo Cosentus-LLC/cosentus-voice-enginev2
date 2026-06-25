@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from app.flows import build_flow_manager, build_scaffold_flow
 from app.flows.scaffold import END_NODE, START_NODE, _advance, _end_node
+from app.flows.summary import DialogueOnlyFlowAdapter
 from pipecat_flows import FlowManager
 
 
@@ -60,6 +61,10 @@ class TestConstruction:
         task.queue_frame.assert_not_called()
         task.queue_frames.assert_not_called()
 
+    def test_build_flow_manager_uses_dialogue_only_summary_adapter(self):
+        fm, _ = _build()
+        assert isinstance(fm._adapter, DialogueOnlyFlowAdapter)
+
 
 class TestScaffoldFlow:
     def test_build_scaffold_flow_is_start_node(self):
@@ -68,6 +73,8 @@ class TestScaffoldFlow:
         # Nodes never auto-respond, so the flow never queues a competing
         # LLMRunFrame against the opener.
         assert node["respond_immediately"] is False
+        task_blob = " ".join(message["content"] for message in node["task_messages"])
+        assert "Call advance" not in task_blob
 
     async def test_initialize_sets_start_node(self):
         fm, _ = _build()

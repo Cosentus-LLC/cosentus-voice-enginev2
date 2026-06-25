@@ -42,6 +42,8 @@ from pipecat_flows import (
 )
 from pipecat_flows.types import ConsolidatedFunctionResult, NodeConfig
 
+from app.flows.summary import DialogueOnlyFlowAdapter
+
 # Node identifiers — kept as constants so tests and bot.py logging can
 # reference them without restating string literals.
 START_NODE = "start"
@@ -74,7 +76,7 @@ def _start_node() -> NodeConfig:
         "task_messages": [
             {
                 "role": "system",
-                "content": "Scaffold start node (no-op). Call advance to continue.",
+                "content": "Scaffold start node (no-op). Continue to the next scaffold node.",
             }
         ],
         "functions": [
@@ -146,9 +148,13 @@ def build_flow_manager(
         An uninitialized :class:`~pipecat_flows.FlowManager`. Call
         :meth:`FlowManager.initialize` to start a node.
     """
-    return FlowManager(
+    manager = FlowManager(
         task=task,
         llm=llm,
         context_aggregator=context_aggregator,
         transport=transport,
     )
+    # Pipecat-Flows 1.1.1 has no public adapter injection hook; keep the
+    # scoped private assignment here so summaries exclude internal machinery.
+    manager._adapter = DialogueOnlyFlowAdapter()
+    return manager

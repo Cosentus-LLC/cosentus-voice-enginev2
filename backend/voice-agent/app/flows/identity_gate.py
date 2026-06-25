@@ -78,6 +78,12 @@ PRE_VERIFICATION_ROLE_MESSAGE = (
     "you are given, speak naturally and politely, and take no other action."
 )
 
+IDENTITY_VERIFICATION_ROLE_RULE = (
+    "After the caller provides all requested verification values, use the "
+    "available identity-verification tool with those exact values. Do not say "
+    "tool names, node names, or internal step names aloud."
+)
+
 # Collapse runs of whitespace so "John  Doe" == "John Doe", strip ends,
 # casefold for case-insensitive comparison.
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -135,6 +141,13 @@ def verify_against_case_data(
         if expected != _normalize(claimed.get(key)):
             return False
     return True
+
+
+def _role_message_for_identity_gate(safe_role_message: str) -> str:
+    base = safe_role_message.rstrip()
+    if not base:
+        return IDENTITY_VERIFICATION_ROLE_RULE
+    return base + "\n\n" + IDENTITY_VERIFICATION_ROLE_RULE
 
 
 def build_identity_gate_flow(
@@ -214,11 +227,9 @@ def build_identity_gate_flow(
             "You are at the identity-verification step. Before sharing ANY "
             "patient information or using any tool, you must verify the "
             f"caller's identity. Politely ask the caller to confirm their "
-            f"{fields_phrase}. When they have provided all of these, call "
-            "verify_identity with the values exactly as the caller stated "
-            "them. Do not reveal any patient details and do not take any "
-            "action until verification succeeds. If verification fails, "
-            "apologize and ask them to confirm the information again."
+            f"{fields_phrase}. Do not reveal any patient details and do not "
+            "take any action until verification succeeds. If verification "
+            "fails, apologize and ask them to confirm the information again."
         )
     else:
         # No keys configured: fail-closed. The gate cannot open; the AI
@@ -232,7 +243,7 @@ def build_identity_gate_flow(
 
     return {
         "name": IDENTITY_GATE_NODE,
-        "role_message": safe_role_message,
+        "role_message": _role_message_for_identity_gate(safe_role_message),
         "task_messages": [{"role": "system", "content": task}],
         "functions": [
             FlowsFunctionSchema(

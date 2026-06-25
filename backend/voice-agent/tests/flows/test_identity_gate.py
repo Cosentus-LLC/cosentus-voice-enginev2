@@ -18,7 +18,11 @@ from types import SimpleNamespace
 
 import pytest
 from app.flows import build_identity_gate_flow, verify_against_case_data
-from app.flows.identity_gate import IDENTITY_GATE_NODE, PRE_VERIFICATION_ROLE_MESSAGE
+from app.flows.identity_gate import (
+    IDENTITY_GATE_NODE,
+    IDENTITY_VERIFICATION_ROLE_RULE,
+    PRE_VERIFICATION_ROLE_MESSAGE,
+)
 
 _VERIFIED_NODE = {"name": "verified"}
 
@@ -97,7 +101,9 @@ class TestBuildIdentityGateFlow:
     def test_role_message_defaults_to_phi_free_prompt(self):
         # 16c: the gate replaces the hydrated system instruction with a
         # PHI-free one for the whole pre-verification phase.
-        assert self._node()["role_message"] == PRE_VERIFICATION_ROLE_MESSAGE
+        role_message = self._node()["role_message"]
+        assert PRE_VERIFICATION_ROLE_MESSAGE in role_message
+        assert IDENTITY_VERIFICATION_ROLE_RULE in role_message
 
     def test_gate_node_contains_no_case_data_values(self):
         # Safety: with sentinel PHI in case_data, none of those values may
@@ -118,7 +124,18 @@ class TestBuildIdentityGateFlow:
 
     def test_custom_safe_role_message_is_used(self):
         node = self._node(safe_role_message="CUSTOM-SAFE")
-        assert node["role_message"] == "CUSTOM-SAFE"
+        assert "CUSTOM-SAFE" in node["role_message"]
+        assert IDENTITY_VERIFICATION_ROLE_RULE in node["role_message"]
+
+    def test_gate_task_messages_do_not_name_verify_identity(self):
+        node = self._node(identity_keys=["patient_name", "dob"])
+        task_blob = " ".join(message["content"] for message in node["task_messages"])
+
+        assert "call verify_identity" not in task_blob
+        assert "verify_identity" not in task_blob
+        fn = node["functions"][0]
+        assert fn.name == "verify_identity"
+        assert sorted(fn.required) == ["dob", "patient_name"]
 
     def test_properties_track_identity_keys(self):
         node = self._node(identity_keys=["patient_name", "dob"])
