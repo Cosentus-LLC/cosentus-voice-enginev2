@@ -515,6 +515,12 @@ class TestNavigateTask:
         assert "press 0 once" in lower
         assert "representative" in lower
 
+    def test_navigate_task_affirms_keypad_capability_and_bans_inability_claims(self):
+        lower = build_navigate_task().lower()
+        assert "you can and should press keypad digits via the keypad tool" in lower
+        assert "never tell the caller you cannot use the keypad" in lower
+        assert "cannot process keypad menu options" in lower
+
     def test_includes_ivr_goal_when_present(self):
         task = build_navigate_task(ivr_goal="Reach a claims rep")
         assert NAVIGATE_BASE_TASK in task

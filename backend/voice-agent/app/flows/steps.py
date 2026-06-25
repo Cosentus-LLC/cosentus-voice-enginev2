@@ -147,13 +147,16 @@ class _FlowDefinition:
 # is present.
 NAVIGATE_BASE_TASK = (
     "You have dialed the payer and reached their phone system. Navigate "
-    "the IVR menus to reach a live claims representative — use the keypad "
-    "tool only after the IVR asks for keypad input, then wait for the next "
-    "IVR prompt before pressing again. Never repeat the same digit for the "
-    "same prompt. If the same prompt repeats or navigation stalls, change "
-    'strategy: press 0 once, say "representative", escalate or transfer if '
-    "available, or gracefully give up. Stay on the line through any hold. "
-    "Once you are speaking with a live representative, call representative_reached."
+    "the IVR menus to reach a live claims representative. You can and should "
+    "press keypad digits via the keypad tool to navigate IVR menus when the "
+    "IVR asks for keypad input. Never tell the caller you cannot use the "
+    "keypad or cannot process keypad menu options. After pressing, wait for "
+    "the next IVR prompt before pressing again. Never repeat the same digit "
+    "for the same prompt. If the same prompt repeats or navigation stalls, "
+    'change strategy: press 0 once, say "representative", escalate or '
+    "transfer if available, or gracefully give up. Stay on the line through "
+    "any hold. Once you are speaking with a live representative, call "
+    "representative_reached."
 )
 
 
