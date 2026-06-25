@@ -864,8 +864,8 @@ async def test_run_bot_flag_off_queues_no_flow_frames():
 
 
 @pytest.mark.asyncio
-async def test_run_bot_flag_on_initializes_identity_gate_node():
-    """Flag on → the flow initializes at the identity-gate node (16b),
+async def test_run_bot_flag_on_inbound_initializes_identity_gate_node():
+    """Flag on + inbound → the flow initializes at the identity-gate node (16b),
     which advertises ONLY ``verify_identity`` and never auto-responds."""
     agent, mocks = _patch_run_bot_dependencies()
     transport = _make_transport_mock()
@@ -890,6 +890,62 @@ async def test_run_bot_flag_on_initializes_identity_gate_node():
     assert node["name"] == "identity_gate"
     assert [f.name for f in node["functions"]] == ["verify_identity"]
     assert node["respond_immediately"] is False
+
+
+@pytest.mark.asyncio
+async def test_run_bot_flag_on_outbound_initializes_step_chain_without_identity_gate():
+    agent, mocks = _patch_run_bot_dependencies()
+    transport = _make_transport_mock()
+    fm = _flow_manager_mock()
+    step_chain = {"name": NAVIGATE, "task_messages": [], "functions": []}
+    build_identity_gate = MagicMock()
+    patches = _start_run_bot_patches(agent, mocks, transport) + [
+        patch("app.bot.bot.build_flow_manager", MagicMock(return_value=fm)),
+        patch("app.bot.bot.build_step_chain", MagicMock(return_value=step_chain)),
+        patch("app.bot.bot.build_identity_gate_flow", build_identity_gate),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        await run_bot(
+            transport,
+            _runner_args(direction="outbound"),
+            _settings(flows_enabled=True, identity_verification_keys="patient_name"),
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    fm.initialize.assert_awaited_once_with(step_chain)
+    build_identity_gate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_bot_flag_on_browser_initializes_step_chain_without_identity_gate():
+    agent, mocks = _patch_run_bot_dependencies()
+    transport = _make_transport_mock()
+    fm = _flow_manager_mock()
+    step_chain = {"name": NAVIGATE, "task_messages": [], "functions": []}
+    build_identity_gate = MagicMock()
+    patches = _start_run_bot_patches(agent, mocks, transport) + [
+        patch("app.bot.bot.build_flow_manager", MagicMock(return_value=fm)),
+        patch("app.bot.bot.build_step_chain", MagicMock(return_value=step_chain)),
+        patch("app.bot.bot.build_identity_gate_flow", build_identity_gate),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        await run_bot(
+            transport,
+            _runner_args(direction="browser"),
+            _settings(flows_enabled=True, identity_verification_keys="patient_name"),
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    fm.initialize.assert_awaited_once_with(step_chain)
+    build_identity_gate.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1206,6 +1262,7 @@ async def _run_bot_capturing_tool_handlers(
     tools: list[ToolConfig],
     settings: Settings,
     executor: MagicMock,
+    direction: str = "inbound",
     capture: dict | None = None,
 ):
     """Run run_bot with the given tools + executor; return {name: handler}.
@@ -1244,7 +1301,7 @@ async def _run_bot_capturing_tool_handlers(
     for p in patches:
         p.start()
     try:
-        await run_bot(transport, _runner_args(), settings)
+        await run_bot(transport, _runner_args(direction=direction), settings)
     finally:
         for p in patches:
             p.stop()
@@ -1272,6 +1329,25 @@ async def test_gated_tool_blocked_when_flows_enabled_and_unverified():
     executor.execute.assert_not_awaited()
     payload = params.result_callback.await_args.args[0]
     assert "not verified" in payload["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_outbound_tool_allowed_immediately_when_flows_enabled():
+    """Flag on + outbound skips identity verification, so gated tools are
+    executable as soon as the step chain starts."""
+    executor = _executor_mock(ToolResult(status=ToolStatus.SUCCESS, run_llm=False))
+    handlers = await _run_bot_capturing_tool_handlers(
+        tools=[ToolConfig(type="transfer_call", description="")],
+        settings=_settings(flows_enabled=True, identity_verification_keys="patient_name"),
+        executor=executor,
+        direction="outbound",
+    )
+    params = _FakeParams({"target": "billing"})
+    await handlers["transfer_call"](params)
+
+    executor.execute.assert_awaited_once()
+    payload = params.result_callback.await_args.args[0]
+    assert "not verified" not in str(payload).lower()
 
 
 @pytest.mark.asyncio

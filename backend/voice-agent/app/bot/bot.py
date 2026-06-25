@@ -107,6 +107,7 @@ from app.flows import (
     build_flow_manager,
     build_identity_gate_flow,
     build_step_chain,
+    identity_gate_required_for_direction,
 )
 from app.hydration.hydrator import (
     MissingRequiredCaseDataError,
@@ -299,6 +300,7 @@ async def run_bot(
         raise ValueError("runner_args.body.agent_id is required")
 
     direction = body.get("direction", "inbound")
+    gate_required = identity_gate_required_for_direction(direction)
     target_number = body.get("target_number") or ""
     from_number = body.get("from_number") or ""
     case_data: dict[str, Any] = body.get("case_data") or {}
@@ -433,8 +435,12 @@ async def run_bot(
     # fires and the flag-off path is byte-identical to the pre-gate
     # pipeline. When Flows is on it starts False, and only the
     # ``verify_identity`` flow function (Layer B) flips it True after a
-    # deterministic code check against ``case_data``.
-    verification_state: dict[str, bool] = {"verified": not settings.flows_enabled}
+    # deterministic code check against ``case_data``. The gate is
+    # inbound-only; outbound/browser calls start at the post-gate step
+    # chain and therefore must have the code-level tool gate open.
+    verification_state: dict[str, bool] = {
+        "verified": not settings.flows_enabled or not gate_required
+    }
     call_intelligence: dict[str, bool] = {"transferred": False}
 
     # ── Knowledge prefetch (#56) ──────────────────────────────────────
@@ -698,14 +704,15 @@ async def run_bot(
     # pre-Flows pipeline. Node initialization (which WOULD mutate context
     # / trigger generation) happens only behind ``flows_enabled``.
     #
-    # Behind the flag we initialize the identity-gate flow (Layer B): the
-    # initial node advertises ONLY ``verify_identity`` (the LLM isn't even
-    # shown the real tools until it transitions), and on a successful,
-    # code-checked verification it transitions into the ordered,
+    # Behind the flag, inbound calls initialize the identity-gate flow
+    # (Layer B): the initial node advertises ONLY ``verify_identity`` (the
+    # LLM isn't even shown the real tools until it transitions), and on a
+    # successful, code-checked verification it transitions into the ordered,
     # un-skippable post-verification step chain (16c) — whose first step
     # re-advertises the call's real tools and loads the hydrated prompt.
-    # The identity node sets respond_immediately=False so it never races
-    # ``deliver_opener_if_needed``.
+    # Outbound/browser calls are initiated by the agent, so they initialize
+    # directly at that step-chain head. The identity node sets
+    # respond_immediately=False so it never races ``deliver_opener_if_needed``.
     #
     # ✅ Production-safe path completed by 16c (#43): the gate node now
     # carries a PHI-free ``role_message`` (PRE_VERIFICATION_ROLE_MESSAGE)
@@ -713,8 +720,8 @@ async def run_bot(
     # whole pre-verification phase, and the post-verification step chain
     # restores the hydrated prompt only after a successful code-checked
     # verification. So the model is never given any ``case_data`` value
-    # before the caller is verified. ``flows_enabled`` stays OFF until this
-    # is validated on staging. See Settings.flows_enabled.
+    # before the inbound caller is verified. ``flows_enabled`` stays OFF
+    # until this is validated on staging. See Settings.flows_enabled.
     flow_manager = build_flow_manager(
         task=task,
         llm=llm,
@@ -723,19 +730,6 @@ async def run_bot(
     )
 
     if settings.flows_enabled:
-        identity_keys = _resolve_identity_keys(agent, settings)
-        if not identity_keys:
-            # Loud, queryable signal: Flows is on but the gate has nothing
-            # to verify against, so it is fail-closed and blocks every
-            # gated tool. Operators MUST set identity_verification_keys.
-            logger.warning(
-                "flows_enabled_without_identity_keys",
-                call_id=call_id,
-                detail=(
-                    "identity_verification_keys is empty; identity gate is "
-                    "fail-closed and will block every gated tool"
-                ),
-            )
         # ── Verified IVR path (#17) ───────────────────────────────────
         # Best-effort: fetch the payer's verified claims IVR path and feed
         # it into the navigate step so the agent follows the map via
@@ -757,35 +751,59 @@ async def run_bot(
             has_ivr_path=bool(ivr_path),
             has_ivr_goal=bool(hydrated_ivr_goal.strip()),
         )
-        await flow_manager.initialize(
-            build_identity_gate_flow(
-                case_data=case_data,
-                identity_keys=identity_keys,
-                verification_state=verification_state,
-                # 16c (#43): the verified node is the head of the ordered,
-                # un-skippable post-verification step chain. Its first step
-                # loads the hydrated (PHI-bearing) prompt as role_message;
-                # the gate stays PHI-free via build_identity_gate_flow's
-                # safe_role_message default.
-                verified_node=build_step_chain(
-                    run_tool_core=run_tool_to_payload,
-                    registry=registry,
-                    hydrated_system=hydrated_system,
-                    ivr_path=ivr_path,
-                    ivr_goal=hydrated_ivr_goal,
-                    knowledge_warmer=knowledge_warmer,
-                    knowledge_context=knowledge_context,
-                    flow_definition=agent.flow_definition,
-                ),
+        step_chain_head = build_step_chain(
+            run_tool_core=run_tool_to_payload,
+            registry=registry,
+            hydrated_system=hydrated_system,
+            ivr_path=ivr_path,
+            ivr_goal=hydrated_ivr_goal,
+            knowledge_warmer=knowledge_warmer,
+            knowledge_context=knowledge_context,
+            flow_definition=agent.flow_definition,
+        )
+        if gate_required:
+            identity_keys = _resolve_identity_keys(agent, settings)
+            if not identity_keys:
+                # Loud, queryable signal: Flows is on but the gate has nothing
+                # to verify against, so it is fail-closed and blocks every
+                # gated tool. Operators MUST set identity_verification_keys.
+                logger.warning(
+                    "flows_enabled_without_identity_keys",
+                    call_id=call_id,
+                    detail=(
+                        "identity_verification_keys is empty; identity gate is "
+                        "fail-closed and will block every gated tool"
+                    ),
+                )
+            await flow_manager.initialize(
+                build_identity_gate_flow(
+                    case_data=case_data,
+                    identity_keys=identity_keys,
+                    verification_state=verification_state,
+                    # 16c (#43): the verified node is the head of the ordered,
+                    # un-skippable post-verification step chain. Its first step
+                    # loads the hydrated (PHI-bearing) prompt as role_message;
+                    # the gate stays PHI-free via build_identity_gate_flow's
+                    # safe_role_message default.
+                    verified_node=step_chain_head,
+                )
             )
-        )
-        logger.info(
-            "flows_identity_gate_initialized",
-            call_id=call_id,
-            node=IDENTITY_GATE_NODE,
-            identity_key_count=len(identity_keys),
-            has_flow_definition=bool(agent.flow_definition),
-        )
+            logger.info(
+                "flows_identity_gate_initialized",
+                call_id=call_id,
+                node=IDENTITY_GATE_NODE,
+                identity_key_count=len(identity_keys),
+                has_flow_definition=bool(agent.flow_definition),
+            )
+        else:
+            await flow_manager.initialize(step_chain_head)
+            logger.info(
+                "flows_step_chain_initialized",
+                call_id=call_id,
+                direction=direction,
+                node=step_chain_head["name"],
+                has_flow_definition=bool(agent.flow_definition),
+            )
 
     # ── Static-opener dispatch (idempotent) ───────────────────────────
     async def deliver_opener_if_needed() -> None:

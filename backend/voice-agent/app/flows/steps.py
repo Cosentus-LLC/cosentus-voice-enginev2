@@ -76,6 +76,12 @@ REQUIRED_REFERENCE_NODE_ID = REFERENCE_NUMBER
 REQUIRED_REFERENCE_FIELD = "call_reference"
 FLOW_NODE_TYPES = frozenset({"ask", "branch", "transfer", "end"})
 
+
+def identity_gate_required_for_direction(direction: str) -> bool:
+    """Return whether this call direction should start at the identity gate."""
+    return direction == "inbound"
+
+
 # The running-summary prompt used by RESET_WITH_SUMMARY on every step
 # after the first. Post-verification, so it may reference claim/case
 # details — the gate already barred all PHI before this point.
@@ -964,4 +970,5 @@ __all__ = [
     "WRAP",
     "build_navigate_task",
     "build_step_chain",
+    "identity_gate_required_for_direction",
 ]

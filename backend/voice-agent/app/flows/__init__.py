@@ -26,6 +26,7 @@ from app.flows.steps import (
     STEPS,
     SUMMARY_PROMPT,
     build_step_chain,
+    identity_gate_required_for_direction,
 )
 
 __all__ = [
@@ -40,5 +41,6 @@ __all__ = [
     "build_identity_gate_flow",
     "build_scaffold_flow",
     "build_step_chain",
+    "identity_gate_required_for_direction",
     "verify_against_case_data",
 ]
