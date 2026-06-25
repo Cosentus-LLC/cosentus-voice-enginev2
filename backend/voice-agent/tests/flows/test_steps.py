@@ -161,6 +161,7 @@ def _custom_flow_starting_at_navigate() -> dict:
             "id": NAVIGATE,
             "type": "ask",
             "label": "Navigate",
+            "ivr": True,
             "say": "Navigate the payer IVR.",
             "next": "intro",
         },
@@ -311,6 +312,38 @@ class TestIvrApplicability:
 
         assert node["name"] == "intro"
         assert NAVIGATE not in _message_blob(node)
+
+    def test_data_driven_no_ivr_skips_any_ivr_flagged_start_node(self):
+        # The skip is flag-driven: an arbitrarily-named ``ivr: true`` start
+        # node with a single outgoing target is dropped for no-IVR calls.
+        flow = {
+            "version": 1,
+            "start": "payer_menu_entry",
+            "nodes": [
+                {
+                    "id": "payer_menu_entry",
+                    "type": "ask",
+                    "ivr": True,
+                    "say": "Navigate to a claims representative.",
+                    "next": "intro",
+                },
+                {
+                    "id": "intro",
+                    "type": "ask",
+                    "say": "Ask the representative to confirm the denial.",
+                    "next": "done",
+                },
+                {"id": "done", "type": "end"},
+            ],
+        }
+        node = _chain(
+            flow_definition=flow,
+            include_ivr=False,
+            greeting_state={GREETING_STATE_KEY: False},
+        )
+
+        assert node["name"] == "intro"
+        assert "Navigate to a claims representative." not in _message_blob(node)
 
 
 # ── Greeting state ───────────────────────────────────────────────────────
@@ -563,14 +596,16 @@ class TestDataDrivenFlow:
         assert _advance_fn(node).name == "advance_intro"
 
     @pytest.mark.asyncio
-    async def test_custom_deadline_node_keeps_cached_knowledge_hint(self):
+    async def test_prefetch_flagged_node_keeps_cached_knowledge_hint(self):
+        # An arbitrarily-named node opts into knowledge prefetch via the flag.
         flow = {
             "version": 1,
-            "start": "deadline",
+            "start": "appeal_window",
             "nodes": [
                 {
-                    "id": "deadline",
+                    "id": "appeal_window",
                     "type": "ask",
+                    "prefetch": True,
                     "say": "Confirm the timely filing deadline.",
                     "next": REFERENCE_NUMBER,
                 },
@@ -601,6 +636,158 @@ class TestDataDrivenFlow:
         )
 
         assert "Known payer-level fact: Aetna timely filing is 120 days." in _navigate_task(chain)
+
+    @pytest.mark.asyncio
+    async def test_unflagged_deadline_named_node_gets_no_knowledge_hint(self):
+        # Behavior is flag-driven, not id-driven: a node named "deadline"
+        # without ``prefetch: true`` must NOT receive the cached fact.
+        flow = {
+            "version": 1,
+            "start": "deadline",
+            "nodes": [
+                {
+                    "id": "deadline",
+                    "type": "ask",
+                    "say": "Confirm the timely filing deadline.",
+                    "next": "done",
+                },
+                {"id": "done", "type": "end"},
+            ],
+        }
+        warmer = MagicMock()
+        warmer.live_read.return_value = CacheHit(
+            value="Aetna timely filing is 120 days.",
+            similarity=1.0,
+            query="timely filing limit for Aetna",
+        )
+
+        chain = build_step_chain(
+            run_tool_core=AsyncMock(return_value=({"status": "ok"}, False)),
+            registry=_registry([]),
+            hydrated_system="SYS",
+            knowledge_warmer=warmer,
+            knowledge_context=PrefetchContext(payer="Aetna"),
+            flow_definition=flow,
+        )
+
+        assert "Known payer-level fact" not in _navigate_task(chain)
+        warmer.live_read.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ivr_flagged_node_with_arbitrary_id_gets_path_injection(self):
+        # IVR navigation can be placed on any node via ``ivr: true``.
+        flow = {
+            "version": 1,
+            "start": "payer_menu_entry",
+            "nodes": [
+                {
+                    "id": "payer_menu_entry",
+                    "type": "ask",
+                    "ivr": True,
+                    "say": "Navigate to a claims representative.",
+                    "next": "done",
+                },
+                {"id": "done", "type": "end"},
+            ],
+        }
+
+        chain = build_step_chain(
+            run_tool_core=AsyncMock(return_value=({"status": "ok"}, False)),
+            registry=_registry([]),
+            hydrated_system="SYS",
+            ivr_path="1. Claims — press 1",
+            ivr_goal="Reach a rep",
+            flow_definition=flow,
+        )
+
+        assert chain["name"] == "payer_menu_entry"
+        task = _navigate_task(chain)
+        assert NAVIGATE_BASE_TASK in task
+        assert "1. Claims — press 1" in task
+        assert "Reach a rep" in task
+
+    @pytest.mark.asyncio
+    async def test_unflagged_navigate_named_node_gets_no_path_injection(self):
+        # A node named "navigate" without ``ivr: true`` uses its generic task
+        # and never receives the verified IVR path.
+        flow = {
+            "version": 1,
+            "start": NAVIGATE,
+            "nodes": [
+                {
+                    "id": NAVIGATE,
+                    "type": "ask",
+                    "say": "Talk through the menu.",
+                    "next": "done",
+                },
+                {"id": "done", "type": "end"},
+            ],
+        }
+
+        chain = build_step_chain(
+            run_tool_core=AsyncMock(return_value=({"status": "ok"}, False)),
+            registry=_registry([]),
+            hydrated_system="SYS",
+            ivr_path="1. Claims — press 1",
+            ivr_goal="Reach a rep",
+            flow_definition=flow,
+        )
+
+        task = _navigate_task(chain)
+        assert "Talk through the menu." in task
+        assert "1. Claims — press 1" not in task
+        assert NAVIGATE_BASE_TASK not in task
+
+    @pytest.mark.asyncio
+    async def test_claim_flow_flags_reproduce_default_ivr_and_prefetch_behavior(self):
+        # The claim flow as data reproduces today's behavior via the flags,
+        # regardless of node ids.
+        flow = {
+            "version": 1,
+            "start": "menu",
+            "nodes": [
+                {
+                    "id": "menu",
+                    "type": "ask",
+                    "ivr": True,
+                    "say": "Navigate the payer IVR.",
+                    "next": "appeal_window",
+                },
+                {
+                    "id": "appeal_window",
+                    "type": "ask",
+                    "prefetch": True,
+                    "say": "Confirm the timely filing deadline.",
+                    "next": "done",
+                },
+                {"id": "done", "type": "end"},
+            ],
+        }
+        warmer = MagicMock()
+        warmer.live_read.return_value = CacheHit(
+            value="Aetna timely filing is 120 days.",
+            similarity=1.0,
+            query="timely filing limit for Aetna",
+        )
+
+        chain = build_step_chain(
+            run_tool_core=AsyncMock(return_value=({"status": "ok"}, False)),
+            registry=_registry([]),
+            hydrated_system="SYS",
+            ivr_path="1. Claims — press 1",
+            ivr_goal="Reach a rep",
+            knowledge_warmer=warmer,
+            knowledge_context=PrefetchContext(payer="Aetna"),
+            flow_definition=flow,
+        )
+
+        # IVR node carries the verified path/goal.
+        assert chain["name"] == "menu"
+        assert "1. Claims — press 1" in _navigate_task(chain)
+        assert "Reach a rep" in _navigate_task(chain)
+        # Prefetch node carries the cached payer fact.
+        appeal = await _walk_to(chain, "appeal_window")
+        assert "Known payer-level fact: Aetna timely filing is 120 days." in _navigate_task(appeal)
 
 
 # ── Un-skippable reference number ─────────────────────────────────────────
