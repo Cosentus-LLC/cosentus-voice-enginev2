@@ -26,6 +26,7 @@ sequence.
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -36,6 +37,21 @@ from typing import Any
 # ``assistant`` distinctly; ``tool`` is new in v2 and gets its own
 # styling once the frontend is rebuilt.
 _VALID_SPEAKERS = frozenset({"user", "assistant", "tool"})
+_STREAM_JOIN_REPAIRS = (
+    ("calling", "on"),
+    ("get", "the"),
+    ("to", "check"),
+    ("bit", "more"),
+    ("the", "reason"),
+    ("do", "that"),
+    ("must", "be"),
+    ("everything", "I"),
+)
+_STREAM_JOIN_PATTERNS = tuple(
+    (re.compile(rf"\b{left}{right}\b", re.IGNORECASE), left, right)
+    for left, right in _STREAM_JOIN_REPAIRS
+)
+_WORD_TO_I_BOUNDARY = re.compile(r"(?<=[a-z])(?=I\b)")
 
 
 @dataclass(frozen=True)
@@ -116,7 +132,11 @@ class TranscriptAccumulator:
         results into the final string and only calling here when the
         turn is finalized.
         """
-        await self._append(speaker="user", content=content, timestamp=timestamp)
+        await self._append(
+            speaker="user",
+            content=_normalize_dialogue_spacing(content),
+            timestamp=timestamp,
+        )
 
     async def append_assistant_turn(
         self,
@@ -149,7 +169,7 @@ class TranscriptAccumulator:
         """
         await self._append(
             speaker="assistant",
-            content=content,
+            content=_normalize_dialogue_spacing(content),
             timestamp=timestamp,
             interrupted=interrupted,
         )
@@ -237,3 +257,25 @@ class TranscriptAccumulator:
     def turn_count(self) -> int:
         """Total finalized turns recorded so far."""
         return len(self._turns)
+
+
+def _normalize_dialogue_spacing(content: str) -> str:
+    """Repair conservative word joins caused by streamed delta boundaries."""
+    text = _WORD_TO_I_BOUNDARY.sub(" ", content)
+    for pattern, left, right in _STREAM_JOIN_PATTERNS:
+        text = pattern.sub(
+            lambda match, left_word=left, right_word=right: _replacement(
+                match.group(0),
+                left_word,
+                right_word,
+            ),
+            text,
+        )
+    return text
+
+
+def _replacement(original: str, left: str, right: str) -> str:
+    replacement = f"{left} {right}"
+    if original[:1].isupper():
+        replacement = replacement[:1].upper() + replacement[1:]
+    return replacement

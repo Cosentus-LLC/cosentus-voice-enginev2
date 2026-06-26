@@ -944,7 +944,12 @@ async def test_run_bot_flag_on_outbound_initializes_step_chain_without_identity_
     agent, mocks = _patch_run_bot_dependencies()
     transport = _make_transport_mock()
     fm = _flow_manager_mock()
-    step_chain = {"name": NAVIGATE, "task_messages": [], "functions": []}
+    step_chain = {
+        "name": NAVIGATE,
+        "task_messages": [],
+        "functions": [],
+        "respond_immediately": True,
+    }
     build_identity_gate = MagicMock()
     patches = _start_run_bot_patches(agent, mocks, transport) + [
         patch("app.bot.bot.build_flow_manager", MagicMock(return_value=fm)),
@@ -963,7 +968,9 @@ async def test_run_bot_flag_on_outbound_initializes_step_chain_without_identity_
         for p in patches:
             p.stop()
 
-    fm.initialize.assert_awaited_once_with(step_chain)
+    initialized = fm.initialize.await_args.args[0]
+    assert initialized == {**step_chain, "respond_immediately": False}
+    assert step_chain["respond_immediately"] is True
     build_identity_gate.assert_not_called()
 
 
@@ -972,7 +979,12 @@ async def test_run_bot_flag_on_browser_initializes_step_chain_without_identity_g
     agent, mocks = _patch_run_bot_dependencies()
     transport = _make_transport_mock()
     fm = _flow_manager_mock()
-    step_chain = {"name": NAVIGATE, "task_messages": [], "functions": []}
+    step_chain = {
+        "name": NAVIGATE,
+        "task_messages": [],
+        "functions": [],
+        "respond_immediately": True,
+    }
     build_identity_gate = MagicMock()
     patches = _start_run_bot_patches(agent, mocks, transport) + [
         patch("app.bot.bot.build_flow_manager", MagicMock(return_value=fm)),
@@ -991,8 +1003,52 @@ async def test_run_bot_flag_on_browser_initializes_step_chain_without_identity_g
         for p in patches:
             p.stop()
 
-    fm.initialize.assert_awaited_once_with(step_chain)
+    initialized = fm.initialize.await_args.args[0]
+    assert initialized == {**step_chain, "respond_immediately": False}
+    assert step_chain["respond_immediately"] is True
     build_identity_gate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_flows_direct_static_opener_has_single_initial_response_source():
+    agent, mocks = _patch_run_bot_dependencies(
+        agent=_agent(speak_first=True, first_message="Hello there."),
+    )
+    transport = _make_transport_mock()
+    fm = _flow_manager_mock()
+    step_chain = {
+        "name": NAVIGATE,
+        "task_messages": [],
+        "functions": [],
+        "respond_immediately": True,
+    }
+    patches = _start_run_bot_patches(agent, mocks, transport) + [
+        patch("app.bot.bot.build_flow_manager", MagicMock(return_value=fm)),
+        patch("app.bot.bot.build_step_chain", MagicMock(return_value=step_chain)),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        await run_bot(
+            transport,
+            _runner_args(direction="outbound"),
+            _settings(flows_enabled=True, identity_verification_keys="patient_name"),
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    initialized = fm.initialize.await_args.args[0]
+    assert initialized["respond_immediately"] is False
+    pt = mocks["pipeline_task"]
+    pt.queue_frames.assert_not_called()
+
+    handler = transport._handlers["on_first_participant_joined"]
+    await handler(transport, {"id": "p1"})
+
+    queued_frames = [frame for call in pt.queue_frames.await_args_list for frame in call.args[0]]
+    assert [type(frame) for frame in queued_frames] == [TTSSpeakFrame]
+    assert queued_frames[0].text == "Hello there."
 
 
 @pytest.mark.asyncio
@@ -1000,7 +1056,12 @@ async def test_run_bot_flag_on_outbound_payer_policy_initializes_step_chain_with
     agent, mocks = _patch_run_bot_dependencies(agent=_agent(call_kind="payer"))
     transport = _make_transport_mock()
     fm = _flow_manager_mock()
-    step_chain = {"name": NAVIGATE, "task_messages": [], "functions": []}
+    step_chain = {
+        "name": NAVIGATE,
+        "task_messages": [],
+        "functions": [],
+        "respond_immediately": True,
+    }
     build_identity_gate = MagicMock()
     build_step_chain = MagicMock(return_value=step_chain)
     load_ivr = AsyncMock(return_value="1. Claims - press 1")
@@ -1022,7 +1083,9 @@ async def test_run_bot_flag_on_outbound_payer_policy_initializes_step_chain_with
         for p in patches:
             p.stop()
 
-    fm.initialize.assert_awaited_once_with(step_chain)
+    initialized = fm.initialize.await_args.args[0]
+    assert initialized == {**step_chain, "respond_immediately": False}
+    assert step_chain["respond_immediately"] is True
     build_identity_gate.assert_not_called()
     load_ivr.assert_awaited_once()
     assert build_step_chain.call_args.kwargs["include_ivr"] is True
@@ -1569,6 +1632,29 @@ async def test_end_call_exempt_from_gate_when_unverified():
     )
     await handlers["end_call"](_FakeParams({"reason": "done"}))
     executor.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_end_call_result_callback_suppresses_followup_llm_when_call_ended():
+    executor = _executor_mock(
+        ToolResult(
+            status=ToolStatus.SUCCESS,
+            data={"call_ended": True, "reason": "done"},
+            run_llm=True,
+        )
+    )
+    handlers = await _run_bot_capturing_tool_handlers(
+        tools=[ToolConfig(type="end_call", description="")],
+        settings=_settings(),
+        executor=executor,
+    )
+    params = _FakeParams({"reason": "done"})
+
+    await handlers["end_call"](params)
+
+    params.result_callback.assert_awaited_once()
+    properties = params.result_callback.await_args.kwargs["properties"]
+    assert properties.run_llm is False
 
 
 @pytest.mark.asyncio
