@@ -92,7 +92,7 @@ async def amain() -> None:
         api_key=settings.daily_api_key,
         recording_bucket=settings.recording_bucket,
         recording_role_arn=settings.recording_role_arn,
-        recording_region=settings.aws_region,
+        recording_region=settings.recording_region,
     )
     manager = PipelineManager(settings, daily_client, protection)
     metrics = MetricsEmitter(manager, settings)

@@ -136,11 +136,9 @@ class DailyRoomClient:
             "bucket_name": self._recording_bucket,
             "bucket_region": self._recording_region,
             "assume_role_arn": self._recording_role_arn,
-            # ``allow_api_access`` lets the dashboard fetch the
-            # signed recording URL via Daily's recording API rather
-            # than requiring direct S3 list permissions on the
-            # consuming role.
-            "allow_api_access": True,
+            # Playback goes through the Cosentus API's S3 presign
+            # endpoint; Daily only needs write access to the bucket.
+            "allow_api_access": False,
         }
 
     async def create_inbound_room(self, *, ttl_secs: int = _DEFAULT_TTL_SECS) -> DailyRoom:

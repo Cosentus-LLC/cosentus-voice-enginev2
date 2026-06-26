@@ -37,14 +37,18 @@ def _settings(
     *,
     api_key_arn: str = "",
     daily_dialin_webhook_hmac: str = "",
+    daily_recording_webhook_hmac: str = "",
     environment: str = "test",
+    recording_bucket: str = "test-recordings",
 ) -> Settings:
     return Settings(
         voice_api_lambda_name="test-voice-api",
         api_key_secret_arn=api_key_arn,
         daily_dialin_webhook_hmac=daily_dialin_webhook_hmac,
+        daily_recording_webhook_hmac=daily_recording_webhook_hmac,
         environment=environment,
         max_concurrent_calls=6,
+        recording_bucket=recording_bucket,
     )
 
 
@@ -117,6 +121,45 @@ def _signed_dialin_headers(
         "Content-Type": "application/json",
         "X-Pinless-Timestamp": timestamp,
         "X-Pinless-Signature": signature,
+    }
+
+
+def _recording_body_bytes(
+    event: str = "recording.ready-to-download",
+    **payload_overrides: str | None,
+) -> bytes:
+    payload = {
+        "room_name": "room-123",
+        "s3_key": "cosentus/room-123/1716400000000.wav",
+        "recording_id": "rec-123",
+    }
+    for key, value in payload_overrides.items():
+        if value is None:
+            payload.pop(key, None)
+        else:
+            payload[key] = value
+    return json.dumps(
+        {"type": event, "payload": payload},
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _signed_recording_headers(
+    raw_body: bytes,
+    hmac_secret: str,
+    *,
+    timestamp: str | None = None,
+) -> dict[str, str]:
+    timestamp = timestamp or str(int(time.time()))
+    secret_bytes = base64.b64decode(hmac_secret)
+    signed_payload = timestamp.encode("utf-8") + b"." + raw_body
+    signature = base64.b64encode(hmac.new(secret_bytes, signed_payload, "sha256").digest()).decode(
+        "ascii"
+    )
+    return {
+        "Content-Type": "application/json",
+        "X-Webhook-Timestamp": timestamp,
+        "X-Webhook-Signature": signature,
     }
 
 
@@ -722,6 +765,311 @@ async def test_dialin_signature_uses_constant_time_compare(aiohttp_client):
 
     assert resp.status == 200
     compare_digest.assert_called_once_with(headers["X-Pinless-Signature"], expected_signature)
+
+
+# ── /daily-recording-webhook ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_recording_webhook_rejects_missing_signature_before_processing(aiohttp_client):
+    manager = _manager_mock()
+    settings = _settings(
+        daily_recording_webhook_hmac=_daily_hmac_secret(),
+        environment="production",
+    )
+    app = await _build_app_for_test(manager, settings=settings)
+    client = await aiohttp_client(app)
+    patch_recording = AsyncMock(return_value=True)
+
+    with patch("app.runner.server._patch_recording_path", patch_recording):
+        resp = await client.post(
+            "/daily-recording-webhook",
+            data=_recording_body_bytes(),
+            headers={"Content-Type": "application/json"},
+        )
+
+    assert resp.status == 403
+    patch_recording.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recording_webhook_rejects_bad_signature_before_processing(aiohttp_client):
+    manager = _manager_mock()
+    settings = _settings(
+        daily_recording_webhook_hmac=_daily_hmac_secret(),
+        environment="production",
+    )
+    app = await _build_app_for_test(manager, settings=settings)
+    client = await aiohttp_client(app)
+    patch_recording = AsyncMock(return_value=True)
+
+    with patch("app.runner.server._patch_recording_path", patch_recording):
+        resp = await client.post(
+            "/daily-recording-webhook",
+            data=_recording_body_bytes(),
+            headers={
+                "Content-Type": "application/json",
+                "X-Webhook-Timestamp": str(int(time.time())),
+                "X-Webhook-Signature": "bad-signature",
+            },
+        )
+
+    assert resp.status == 403
+    patch_recording.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recording_webhook_rejects_stale_signature_before_processing(aiohttp_client):
+    manager = _manager_mock()
+    hmac_secret = _daily_hmac_secret()
+    settings = _settings(
+        daily_recording_webhook_hmac=hmac_secret,
+        environment="production",
+    )
+    app = await _build_app_for_test(manager, settings=settings)
+    client = await aiohttp_client(app)
+    patch_recording = AsyncMock(return_value=True)
+    raw_body = _recording_body_bytes()
+
+    with patch("app.runner.server._patch_recording_path", patch_recording):
+        resp = await client.post(
+            "/daily-recording-webhook",
+            data=raw_body,
+            headers=_signed_recording_headers(raw_body, hmac_secret, timestamp="1"),
+        )
+
+    assert resp.status == 403
+    patch_recording.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recording_signature_uses_constant_time_compare(aiohttp_client):
+    manager = _manager_mock()
+    hmac_secret = _daily_hmac_secret()
+    settings = _settings(
+        daily_recording_webhook_hmac=hmac_secret,
+        environment="production",
+    )
+    app = await _build_app_for_test(manager, settings=settings)
+    client = await aiohttp_client(app)
+    patch_recording = AsyncMock(return_value=True)
+    raw_body = _recording_body_bytes()
+    headers = _signed_recording_headers(raw_body, hmac_secret)
+    expected_signature = headers["X-Webhook-Signature"]
+
+    with (
+        patch("app.runner.server.hmac.compare_digest", return_value=True) as compare_digest,
+        patch("app.runner.server._patch_recording_path", patch_recording),
+    ):
+        resp = await client.post(
+            "/daily-recording-webhook",
+            data=raw_body,
+            headers=headers,
+        )
+        await asyncio.sleep(0)
+
+    assert resp.status == 200
+    compare_digest.assert_called_once_with(headers["X-Webhook-Signature"], expected_signature)
+
+
+@pytest.mark.asyncio
+async def test_recording_webhook_rejects_invalid_json_after_valid_signature(aiohttp_client):
+    manager = _manager_mock()
+    hmac_secret = _daily_hmac_secret()
+    settings = _settings(
+        daily_recording_webhook_hmac=hmac_secret,
+        environment="production",
+    )
+    app = await _build_app_for_test(manager, settings=settings)
+    client = await aiohttp_client(app)
+    patch_recording = AsyncMock(return_value=True)
+    raw_body = b"{"
+
+    with patch("app.runner.server._patch_recording_path", patch_recording):
+        resp = await client.post(
+            "/daily-recording-webhook",
+            data=raw_body,
+            headers=_signed_recording_headers(raw_body, hmac_secret),
+        )
+
+    assert resp.status == 400
+    patch_recording.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recording_webhook_ready_event_fast_acks_and_patches_recording_path(aiohttp_client):
+    manager = _manager_mock()
+    hmac_secret = _daily_hmac_secret()
+    settings = _settings(
+        daily_recording_webhook_hmac=hmac_secret,
+        environment="production",
+        recording_bucket="medcloud-voice-us-prod-825",
+    )
+    app = await _build_app_for_test(manager, settings=settings)
+    client = await aiohttp_client(app)
+    raw_body = _recording_body_bytes()
+    patch_started = asyncio.Event()
+    patch_release = asyncio.Event()
+
+    async def slow_patch(**kwargs):
+        patch_started.set()
+        await patch_release.wait()
+        return True
+
+    with patch(
+        "app.runner.server._patch_recording_path", AsyncMock(side_effect=slow_patch)
+    ) as patched:
+        resp = await client.post(
+            "/daily-recording-webhook",
+            data=raw_body,
+            headers=_signed_recording_headers(raw_body, hmac_secret),
+        )
+        assert resp.status == 200
+        assert not patch_release.is_set()
+        await asyncio.wait_for(patch_started.wait(), timeout=1)
+        patch_release.set()
+        await asyncio.sleep(0)
+
+    patched.assert_awaited_once_with(
+        session_id="room-123",
+        recording_path="s3://medcloud-voice-us-prod-825/cosentus/room-123/1716400000000.wav",
+        recording_id="rec-123",
+        settings=settings,
+    )
+
+
+@pytest.mark.asyncio
+async def test_recording_webhook_ready_event_requires_room_key_and_recording_id(aiohttp_client):
+    manager = _manager_mock()
+    hmac_secret = _daily_hmac_secret()
+    settings = _settings(
+        daily_recording_webhook_hmac=hmac_secret,
+        environment="production",
+    )
+    app = await _build_app_for_test(manager, settings=settings)
+    client = await aiohttp_client(app)
+    patch_recording = AsyncMock(return_value=True)
+    raw_body = _recording_body_bytes(room_name=None)
+
+    with patch("app.runner.server._patch_recording_path", patch_recording):
+        resp = await client.post(
+            "/daily-recording-webhook",
+            data=raw_body,
+            headers=_signed_recording_headers(raw_body, hmac_secret),
+        )
+
+    assert resp.status == 400
+    patch_recording.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recording_webhook_error_event_logs_without_patch(aiohttp_client):
+    manager = _manager_mock()
+    hmac_secret = _daily_hmac_secret()
+    settings = _settings(
+        daily_recording_webhook_hmac=hmac_secret,
+        environment="production",
+    )
+    app = await _build_app_for_test(manager, settings=settings)
+    client = await aiohttp_client(app)
+    patch_recording = AsyncMock(return_value=True)
+    raw_body = _recording_body_bytes(
+        "recording.error",
+        error="Error fetching STS credentials",
+    )
+
+    with patch("app.runner.server._patch_recording_path", patch_recording):
+        resp = await client.post(
+            "/daily-recording-webhook",
+            data=raw_body,
+            headers=_signed_recording_headers(raw_body, hmac_secret),
+        )
+
+    assert resp.status == 200
+    patch_recording.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recording_webhook_duplicate_recording_id_noops_after_success(aiohttp_client):
+    manager = _manager_mock()
+    hmac_secret = _daily_hmac_secret()
+    settings = _settings(
+        daily_recording_webhook_hmac=hmac_secret,
+        environment="production",
+    )
+    app = await _build_app_for_test(manager, settings=settings)
+    client = await aiohttp_client(app)
+    patch_recording = AsyncMock(return_value=True)
+    raw_body = _recording_body_bytes()
+    headers = _signed_recording_headers(raw_body, hmac_secret)
+
+    with patch("app.runner.server._patch_recording_path", patch_recording):
+        resp1 = await client.post("/daily-recording-webhook", data=raw_body, headers=headers)
+        await asyncio.sleep(0)
+        resp2 = await client.post("/daily-recording-webhook", data=raw_body, headers=headers)
+        await asyncio.sleep(0)
+
+    assert resp1.status == 200
+    assert resp2.status == 200
+    patch_recording.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_patch_recording_path_invokes_lambda_recording_update_shape():
+    from app.runner.server import _patch_recording_path
+
+    lambda_client_mock = MagicMock()
+    lambda_client_mock.invoke = MagicMock(
+        return_value=_build_lambda_invoke_response(body={"ok": True})
+    )
+    settings = _settings()
+
+    with patch(
+        "app.config.agent_config._get_lambda_client",
+        return_value=lambda_client_mock,
+    ):
+        result = await _patch_recording_path(
+            session_id="room-123",
+            recording_path="s3://bucket/cosentus/room-123/1.wav",
+            recording_id="rec-123",
+            settings=settings,
+        )
+
+    assert result is True
+    invoke_kwargs = lambda_client_mock.invoke.call_args.kwargs
+    assert invoke_kwargs["FunctionName"] == "test-voice-api"
+    envelope = json.loads(invoke_kwargs["Payload"])
+    assert envelope["httpMethod"] == "POST"
+    assert envelope["path"] == "/api/calls/recording-update"
+    body = json.loads(envelope["body"])
+    assert body == {
+        "session_id": "room-123",
+        "recording_path": "s3://bucket/cosentus/room-123/1.wav",
+        "recording_id": "rec-123",
+    }
+
+
+@pytest.mark.asyncio
+async def test_patch_recording_path_returns_false_on_non_2xx():
+    from app.runner.server import _patch_recording_path
+
+    lambda_client_mock = MagicMock()
+    lambda_client_mock.invoke = MagicMock(
+        return_value=_build_lambda_invoke_response(status_code=404, body={"detail": "missing"})
+    )
+
+    with patch(
+        "app.config.agent_config._get_lambda_client",
+        return_value=lambda_client_mock,
+    ):
+        result = await _patch_recording_path(
+            session_id="room-missing",
+            recording_path="s3://bucket/key.wav",
+            recording_id="rec-missing",
+            settings=_settings(),
+        )
+
+    assert result is False
 
 
 # ── _lookup_inbound_agent: real lambda envelope shape ────────────────────

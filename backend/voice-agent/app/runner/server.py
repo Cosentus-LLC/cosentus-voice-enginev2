@@ -39,6 +39,7 @@ import hmac
 import json
 import secrets
 import time
+from collections.abc import Coroutine
 from typing import TYPE_CHECKING, Any
 
 import boto3
@@ -63,6 +64,14 @@ if TYPE_CHECKING:
 APP_KEY_MANAGER: web.AppKey[PipelineManager] = web.AppKey("manager", PipelineManager)
 APP_KEY_SETTINGS: web.AppKey[Settings] = web.AppKey("settings", Settings)
 APP_KEY_API_KEY: web.AppKey[str] = web.AppKey("api_key", str)
+APP_KEY_BACKGROUND_TASKS: web.AppKey[set[asyncio.Task[Any]]] = web.AppKey(
+    "background_tasks",
+    set,
+)
+APP_KEY_PROCESSED_RECORDING_IDS: web.AppKey[set[str]] = web.AppKey(
+    "processed_recording_ids",
+    set,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -90,6 +99,15 @@ _DAILY_DIALIN_SIGNATURE_HEADER = "X-Pinless-Signature"
 _DAILY_DIALIN_SIGNATURE_TOLERANCE_SECS = 300
 _LOCAL_DIALIN_SIGNATURE_BYPASS_ENVS = {"local", "dev", "development", "test"}
 
+# Daily recording webhooks sign ``timestamp + "." + raw_json_body`` with
+# a separate HMAC secret. Unlike the local dial-in route, recording
+# updates always fail closed when the secret is absent.
+_DAILY_RECORDING_TIMESTAMP_HEADER = "X-Webhook-Timestamp"
+_DAILY_RECORDING_SIGNATURE_HEADER = "X-Webhook-Signature"
+_DAILY_RECORDING_SIGNATURE_TOLERANCE_SECS = 300
+
+_PATH_RECORDING_UPDATE = "/api/calls/recording-update"
+
 
 # ── App factory ────────────────────────────────────────────────────────────
 
@@ -105,16 +123,27 @@ async def build_app(settings: Settings, manager: PipelineManager) -> web.Applica
     app[APP_KEY_MANAGER] = manager
     app[APP_KEY_SETTINGS] = settings
     app[APP_KEY_API_KEY] = await _load_api_key(settings)
+    app[APP_KEY_BACKGROUND_TASKS] = set()
+    app[APP_KEY_PROCESSED_RECORDING_IDS] = set()
+    app.on_cleanup.append(_cleanup_background_tasks)
 
     app.router.add_get("/health", handle_health)
     app.router.add_get("/ready", handle_ready)
     app.router.add_get("/status", handle_status)
     app.router.add_post("/start", handle_start)
     app.router.add_post("/daily-dialin-webhook", handle_dialin_webhook)
+    app.router.add_post("/daily-recording-webhook", handle_recording_webhook)
 
     logger.info(
         "app_built",
-        routes=["/health", "/ready", "/status", "/start", "/daily-dialin-webhook"],
+        routes=[
+            "/health",
+            "/ready",
+            "/status",
+            "/start",
+            "/daily-dialin-webhook",
+            "/daily-recording-webhook",
+        ],
         api_key_configured=bool(app[APP_KEY_API_KEY]),
     )
     return app
@@ -290,6 +319,74 @@ async def handle_dialin_webhook(request: web.Request) -> web.Response:
     )
 
 
+async def handle_recording_webhook(request: web.Request) -> web.Response:
+    """Daily recording webhook. Verifies HMAC before trusting payload fields.
+
+    ``recording.ready-to-download`` patches ``voice_calls.recording_path``
+    through the existing API Lambda endpoint keyed by Daily room name
+    (``CallRecord.session_id``). The Lambda call is scheduled in the
+    background so Daily receives a fast 200 and does not trip delivery
+    circuit-breakers on transient API latency.
+    """
+    settings: Settings = request.app[APP_KEY_SETTINGS]
+    raw_body = await request.read()
+
+    if not _verify_daily_recording_signature(request, raw_body, settings):
+        return web.json_response({"error": "forbidden"}, status=403)
+
+    try:
+        body = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return web.json_response({"error": "invalid_json"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response({"error": "invalid_json"}, status=400)
+
+    event_type = str(body.get("type") or body.get("event") or "")
+    payload_raw = body.get("payload")
+    payload = payload_raw if isinstance(payload_raw, dict) else body
+
+    if event_type == "recording.ready-to-download":
+        room_name = _non_empty_str(payload.get("room_name"))
+        s3_key = _non_empty_str(payload.get("s3_key"))
+        recording_id = _non_empty_str(payload.get("recording_id"))
+        if not room_name or not s3_key or not recording_id:
+            logger.warning(
+                "daily_recording_ready_missing_fields",
+                has_room_name=bool(room_name),
+                has_s3_key=bool(s3_key),
+                has_recording_id=bool(recording_id),
+            )
+            return web.json_response({"error": "missing_recording_fields"}, status=400)
+
+        _schedule_background_task(
+            request.app,
+            _process_recording_ready(
+                {
+                    "room_name": room_name,
+                    "s3_key": s3_key,
+                    "recording_id": recording_id,
+                },
+                settings,
+                request.app[APP_KEY_PROCESSED_RECORDING_IDS],
+            ),
+        )
+        return web.json_response({"status": "accepted"})
+
+    if event_type == "recording.error":
+        error = _non_empty_str(payload.get("error")) or _non_empty_str(payload.get("message")) or ""
+        logger.error(
+            "daily_recording_error",
+            room_name=_non_empty_str(payload.get("room_name")),
+            recording_id=_non_empty_str(payload.get("recording_id")),
+            error=error,
+            sts_credentials_error="Error fetching STS credentials" in error,
+        )
+        return web.json_response({"status": "accepted"})
+
+    logger.info("daily_recording_event_ignored", event_type=event_type)
+    return web.json_response({"status": "ignored"})
+
+
 # ── Auth helpers ──────────────────────────────────────────────────────────
 
 
@@ -398,6 +495,208 @@ def _daily_dialin_timestamp_within_tolerance(
 
     now_value = time.time() if now is None else now
     return abs(now_value - timestamp_value) <= _DAILY_DIALIN_SIGNATURE_TOLERANCE_SECS
+
+
+def _verify_daily_recording_signature(
+    request: web.Request,
+    raw_body: bytes,
+    settings: Settings,
+    *,
+    now: float | None = None,
+) -> bool:
+    """Verify Daily recording webhook HMAC before processing a payload."""
+    secret = settings.daily_recording_webhook_hmac
+    if not secret:
+        logger.error(
+            "daily_recording_signature_secret_missing",
+            environment=settings.environment,
+        )
+        return False
+
+    timestamp = request.headers.get(_DAILY_RECORDING_TIMESTAMP_HEADER, "")
+    provided_signature = request.headers.get(_DAILY_RECORDING_SIGNATURE_HEADER, "")
+    if not timestamp or not provided_signature:
+        logger.warning(
+            "daily_recording_signature_missing_headers",
+            has_timestamp=bool(timestamp),
+            has_signature=bool(provided_signature),
+        )
+        return False
+
+    if not _daily_recording_timestamp_within_tolerance(timestamp, now=now):
+        logger.warning("daily_recording_signature_timestamp_rejected")
+        return False
+
+    expected_signature = _compute_daily_recording_signature(secret, timestamp, raw_body)
+    if expected_signature is None:
+        logger.error("daily_recording_signature_secret_invalid")
+        return False
+
+    if not hmac.compare_digest(provided_signature, expected_signature):
+        logger.warning("daily_recording_signature_mismatch")
+        return False
+
+    return True
+
+
+def _compute_daily_recording_signature(
+    hmac_secret: str,
+    timestamp: str,
+    raw_body: bytes,
+) -> str | None:
+    """Return Daily's expected Base64 HMAC-SHA256 recording signature."""
+    try:
+        secret_bytes = base64.b64decode(hmac_secret, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+
+    signed_payload = timestamp.encode("utf-8") + b"." + raw_body
+    digest = hmac.new(secret_bytes, signed_payload, "sha256").digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
+def _daily_recording_timestamp_within_tolerance(
+    timestamp: str,
+    *,
+    now: float | None = None,
+) -> bool:
+    """Return whether a Daily recording timestamp is inside replay window."""
+    try:
+        timestamp_value = float(timestamp.strip())
+    except ValueError:
+        return False
+
+    if timestamp_value > 10_000_000_000:
+        timestamp_value = timestamp_value / 1000
+
+    now_value = time.time() if now is None else now
+    return abs(now_value - timestamp_value) <= _DAILY_RECORDING_SIGNATURE_TOLERANCE_SECS
+
+
+def _non_empty_str(value: Any) -> str | None:
+    """Return stripped string values; coerce missing/blank/non-string to None."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _schedule_background_task(
+    app: web.Application,
+    coro: Coroutine[Any, Any, Any],
+) -> None:
+    """Schedule a task and hold a strong reference until it completes."""
+    tasks = app[APP_KEY_BACKGROUND_TASKS]
+    task = asyncio.create_task(coro)
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+
+
+async def _cleanup_background_tasks(app: web.Application) -> None:
+    """Cancel unfinished background work during aiohttp cleanup."""
+    tasks = set(app[APP_KEY_BACKGROUND_TASKS])
+    if not tasks:
+        return
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    app[APP_KEY_BACKGROUND_TASKS].clear()
+
+
+async def _process_recording_ready(
+    payload: dict[str, str],
+    settings: Settings,
+    processed_ids: set[str],
+) -> None:
+    """Patch recording_path for a verified Daily ready-to-download event."""
+    recording_id = payload["recording_id"]
+    if recording_id in processed_ids:
+        logger.info("daily_recording_duplicate_ignored", recording_id=recording_id)
+        return
+
+    recording_path = f"s3://{settings.recording_bucket}/{payload['s3_key']}"
+    patched = await _patch_recording_path(
+        session_id=payload["room_name"],
+        recording_path=recording_path,
+        recording_id=recording_id,
+        settings=settings,
+    )
+    if patched:
+        processed_ids.add(recording_id)
+        logger.info(
+            "daily_recording_path_patched",
+            room_name=payload["room_name"],
+            recording_id=recording_id,
+            recording_path=recording_path,
+        )
+
+
+async def _patch_recording_path(
+    *,
+    session_id: str,
+    recording_path: str,
+    recording_id: str,
+    settings: Settings,
+) -> bool:
+    """Patch ``voice_calls.recording_path`` through the API Lambda."""
+    from app.config.agent_config import _get_lambda_client
+
+    envelope = {
+        "httpMethod": "POST",
+        "path": _PATH_RECORDING_UPDATE,
+        "headers": {"Content-Type": "application/json"},
+        "queryStringParameters": None,
+        "body": json.dumps(
+            {
+                "session_id": session_id,
+                "recording_path": recording_path,
+                "recording_id": recording_id,
+            }
+        ),
+    }
+
+    try:
+        client = _get_lambda_client(settings)
+        response = await asyncio.to_thread(
+            client.invoke,
+            FunctionName=settings.voice_api_lambda_name,
+            InvocationType="RequestResponse",
+            Payload=json.dumps(envelope).encode("utf-8"),
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort webhook side effect
+        logger.error(
+            "recording_update_invoke_failed",
+            session_id=session_id,
+            recording_id=recording_id,
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+        return False
+
+    try:
+        payload_bytes = response["Payload"].read()
+        payload = json.loads(payload_bytes)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "recording_update_bad_envelope",
+            session_id=session_id,
+            recording_id=recording_id,
+            error=str(exc),
+        )
+        return False
+
+    status_code = payload.get("statusCode", 0)
+    if 200 <= status_code < 300:
+        return True
+
+    logger.error(
+        "recording_update_failed",
+        session_id=session_id,
+        recording_id=recording_id,
+        status_code=status_code,
+        body_preview=str(payload.get("body", ""))[:500],
+    )
+    return False
 
 
 async def _load_api_key(settings: Settings) -> str:
