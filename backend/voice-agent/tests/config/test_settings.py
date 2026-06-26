@@ -23,6 +23,10 @@ _ALL_SETTINGS_ENV = (
     "SERVICE_PORT",
     "MAX_CONCURRENT_CALLS",
     "DAILY_DIALIN_WEBHOOK_HMAC",
+    "DAILY_RECORDING_WEBHOOK_HMAC",
+    "RECORDING_BUCKET",
+    "RECORDING_ROLE_ARN",
+    "RECORDING_REGION",
     "DISABLED_TOOLS",
     "KNOWLEDGE_PREFETCH_ENABLED",
     "KNOWLEDGE_CACHE_TTL_SECS",
@@ -101,8 +105,10 @@ class TestSettingsDefaults:
             "DAILY_API_KEY",
             "ASSEMBLYAI_API_KEY",
             "ELEVENLABS_API_KEY",
+            "DAILY_RECORDING_WEBHOOK_HMAC",
             "RECORDING_BUCKET",
             "RECORDING_ROLE_ARN",
+            "RECORDING_REGION",
         ):
             monkeypatch.delenv(env, raising=False)
         s = _settings()
@@ -120,8 +126,10 @@ class TestSettingsDefaults:
         # don't require Daily / S3 access just to construct Settings.
         assert s.daily_api_key == ""
         assert s.daily_dialin_webhook_hmac == ""
+        assert s.daily_recording_webhook_hmac == ""
         assert s.recording_bucket == ""
         assert s.recording_role_arn == ""
+        assert s.recording_region == "us-east-1"
         # Vendor API keys default to empty too — build_stt / build_tts
         # raise a clear ValueError if they're still empty at call time.
         assert s.assemblyai_api_key == ""
@@ -201,9 +209,17 @@ class TestSettingsCaseInsensitive:
         # Standard env-var convention.
         _set_required(monkeypatch)
         monkeypatch.setenv("DAILY_DIALIN_WEBHOOK_HMAC", "base64-secret")
+        monkeypatch.setenv("DAILY_RECORDING_WEBHOOK_HMAC", "recording-secret")
+        monkeypatch.setenv("RECORDING_BUCKET", "recording-bucket")
+        monkeypatch.setenv("RECORDING_ROLE_ARN", "arn:aws:iam::123:role/Daily")
+        monkeypatch.setenv("RECORDING_REGION", "us-west-2")
         s = _settings()
         assert s.voice_api_lambda_name == "medcloud-voice-api:test"
         assert s.daily_dialin_webhook_hmac == "base64-secret"
+        assert s.daily_recording_webhook_hmac == "recording-secret"
+        assert s.recording_bucket == "recording-bucket"
+        assert s.recording_role_arn == "arn:aws:iam::123:role/Daily"
+        assert s.recording_region == "us-west-2"
 
     def test_lowercase_env_vars_also_bind(self, monkeypatch: pytest.MonkeyPatch):
         # case_sensitive=False: lowercase resolves to the same field.

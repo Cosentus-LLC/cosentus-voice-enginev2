@@ -103,6 +103,12 @@ export interface VoiceEngineConfig {
   readonly voiceApiLambdaName: string;
   /** Daily.co S3 recordings bucket name (existing or to-be-created). */
   readonly recordingsBucketName: string;
+  /** IAM role Daily assumes to write recordings into the recordings bucket. */
+  readonly recordingRoleArn: string;
+  /** Region of the recordings bucket passed to Daily room config. */
+  readonly recordingRegion: string;
+  /** Existing Secrets Manager secret name for Daily recording webhook HMAC verification. */
+  readonly dailyRecordingWebhookHmacSecretName: string;
   /** True when CDK owns the bucket lifecycle; false when we import an existing bucket. */
   readonly recordingsBucketOwnedByCdk: boolean;
   /**
@@ -130,6 +136,9 @@ export interface VoiceEngineConfig {
 const PROJECT_NAME = 'cosentus-voice-engine';
 const DEFAULT_ACCOUNT = '825269749545';
 const DEFAULT_REGION = 'us-east-1';
+const DAILY_RECORDINGS_UPLOADER_ROLE_ARN =
+  'arn:aws:iam::825269749545:role/daily-recordings-uploader';
+const DAILY_RECORDING_WEBHOOK_HMAC_SECRET_NAME = 'voice-agent/daily-recording-webhook-hmac';
 
 // The modernized v2 behavior — ON in both staging and prod: Pipecat Flows,
 // the identity gate, payer-knowledge prefetch, and context summarization.
@@ -167,6 +176,9 @@ const ENV_DEFAULTS: Record<Environment, Partial<VoiceEngineConfig>> = {
     stopTimeoutSeconds: 120,
     serviceHostname: 'staging.cosentusaibackend.com',
     recordingsBucketName: 'cosentus-voice-recordings-staging',
+    recordingRoleArn: DAILY_RECORDINGS_UPLOADER_ROLE_ARN,
+    recordingRegion: DEFAULT_REGION,
+    dailyRecordingWebhookHmacSecretName: DAILY_RECORDING_WEBHOOK_HMAC_SECRET_NAME,
     recordingsBucketOwnedByCdk: true,
     recordingsKmsKeyArn: '',
     // Staging points at the stub Lambda (see VoiceApiStubStack) so
@@ -198,6 +210,9 @@ const ENV_DEFAULTS: Record<Environment, Partial<VoiceEngineConfig>> = {
     stopTimeoutSeconds: 120,
     serviceHostname: 'api.cosentusaibackend.com',
     recordingsBucketName: 'medcloud-voice-us-prod-825',
+    recordingRoleArn: DAILY_RECORDINGS_UPLOADER_ROLE_ARN,
+    recordingRegion: DEFAULT_REGION,
+    dailyRecordingWebhookHmacSecretName: DAILY_RECORDING_WEBHOOK_HMAC_SECRET_NAME,
     recordingsBucketOwnedByCdk: false,
     recordingsKmsKeyArn: '',
     voiceApiLambdaName: 'medcloud-voice-api:live',
@@ -350,6 +365,18 @@ export function loadConfig(app: App): VoiceEngineConfig {
   const recordingsBucketName =
     readSetting(app, 'recordingsBucketName', 'RECORDINGS_BUCKET_NAME') ??
     (defaults.recordingsBucketName as string);
+  const recordingRoleArn =
+    readSetting(app, 'recordingRoleArn', 'RECORDING_ROLE_ARN') ??
+    (defaults.recordingRoleArn as string);
+  const recordingRegion =
+    readSetting(app, 'recordingRegion', 'RECORDING_REGION') ??
+    (defaults.recordingRegion as string);
+  const dailyRecordingWebhookHmacSecretName =
+    readSetting(
+      app,
+      'dailyRecordingWebhookHmacSecretName',
+      'DAILY_RECORDING_WEBHOOK_HMAC_SECRET_NAME',
+    ) ?? (defaults.dailyRecordingWebhookHmacSecretName as string);
   const recordingsBucketOwnedByCdk =
     (readSetting(app, 'recordingsBucketOwnedByCdk', 'RECORDINGS_BUCKET_OWNED_BY_CDK') ??
       String(defaults.recordingsBucketOwnedByCdk)) === 'true';
@@ -381,6 +408,9 @@ export function loadConfig(app: App): VoiceEngineConfig {
     serviceHostname,
     certificateArn,
     recordingsBucketName,
+    recordingRoleArn,
+    recordingRegion,
+    dailyRecordingWebhookHmacSecretName,
     recordingsBucketOwnedByCdk,
     recordingsKmsKeyArn,
     voiceApiLambdaName,

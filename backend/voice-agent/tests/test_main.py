@@ -109,11 +109,13 @@ async def _run_amain_and_capture_handlers(graceful_drain_mock, *mocks):
     settings_mock.daily_api_key = "k"
     settings_mock.recording_bucket = "b"
     settings_mock.recording_role_arn = "arn"
+    settings_mock.recording_region = "us-east-2"
+    daily_client_ctor = MagicMock(return_value=daily_client_mock)
 
     with (
         patch("app.main.Settings", MagicMock(return_value=settings_mock)),
         patch("app.main.TaskProtection", MagicMock(return_value=protection_mock)),
-        patch("app.main.DailyRoomClient", MagicMock(return_value=daily_client_mock)),
+        patch("app.main.DailyRoomClient", daily_client_ctor),
         patch("app.main.PipelineManager", MagicMock(return_value=manager_mock)),
         patch("app.main.MetricsEmitter", MagicMock(return_value=metrics_mock)),
         patch("app.main.build_app", AsyncMock(return_value=MagicMock())),
@@ -151,6 +153,12 @@ async def _run_amain_and_capture_handlers(graceful_drain_mock, *mocks):
         finally:
             loop.add_signal_handler = original_asgh  # type: ignore[method-assign]
 
+    daily_client_ctor.assert_called_once_with(
+        api_key="k",
+        recording_bucket="b",
+        recording_role_arn="arn",
+        recording_region="us-east-2",
+    )
     return app_runner_mock
 
 
@@ -236,6 +244,7 @@ async def test_signal_handler_holds_shutdown_task_until_drain_finishes():
     settings_mock.daily_api_key = "k"
     settings_mock.recording_bucket = "b"
     settings_mock.recording_role_arn = "arn"
+    settings_mock.recording_region = "us-east-2"
 
     with (
         patch("app.main.Settings", MagicMock(return_value=settings_mock)),
@@ -315,6 +324,7 @@ async def test_both_sigterm_and_sigint_are_registered():
     settings_mock.daily_api_key = "k"
     settings_mock.recording_bucket = "b"
     settings_mock.recording_role_arn = "arn"
+    settings_mock.recording_region = "us-east-2"
 
     with (
         patch("app.main.Settings", MagicMock(return_value=settings_mock)),
@@ -398,6 +408,7 @@ async def test_repeated_signal_does_not_break_shutdown():
     settings_mock.daily_api_key = "k"
     settings_mock.recording_bucket = "b"
     settings_mock.recording_role_arn = "arn"
+    settings_mock.recording_region = "us-east-2"
 
     with (
         patch("app.main.Settings", MagicMock(return_value=settings_mock)),

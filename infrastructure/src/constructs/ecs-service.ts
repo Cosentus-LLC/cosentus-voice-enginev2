@@ -146,6 +146,7 @@ export class EcsServiceConstruct extends Construct {
       recordingsKmsKeyArn,
       voiceApiLambdaName,
     );
+    this.grantDailyRecordingUploaderRole(config, recordingsBucketArn);
 
     this.taskDefinition = new ecs.FargateTaskDefinition(this, 'TaskDefinition', {
       family: prefix,
@@ -178,6 +179,16 @@ export class EcsServiceConstruct extends Construct {
       'ElevenLabsSecretRef',
       secretArns.elevenLabs,
     );
+    const dailyRecordingWebhookHmacSecret = secretsmanager.Secret.fromSecretNameV2(
+      this,
+      'DailyRecordingWebhookHmacSecretRef',
+      config.dailyRecordingWebhookHmacSecretName,
+    );
+    dailyRecordingWebhookHmacSecret.grantRead(this.executionRole);
+    const recordingsBucketName = stack.splitArn(
+      recordingsBucketArn,
+      cdk.ArnFormat.NO_RESOURCE_NAME,
+    ).resource;
 
     this.taskDefinition.addContainer('Engine', {
       containerName: 'engine',
@@ -199,10 +210,12 @@ export class EcsServiceConstruct extends Construct {
         ENVIRONMENT: config.environment,
         AWS_REGION: config.region,
         MAX_CONCURRENT_CALLS: String(config.sessionCapacityPerTask),
-        RECORDINGS_BUCKET_NAME: stack.splitArn(
-          recordingsBucketArn,
-          cdk.ArnFormat.NO_RESOURCE_NAME,
-        ).resource,
+        RECORDING_BUCKET: recordingsBucketName,
+        RECORDING_ROLE_ARN: config.recordingRoleArn,
+        RECORDING_REGION: config.recordingRegion,
+        // Back-compat/diagnostic env var from prior infra. The engine reads
+        // RECORDING_BUCKET through Settings.
+        RECORDINGS_BUCKET_NAME: recordingsBucketName,
         // Required by Settings — engine refuses to boot without these.
         VOICE_API_LAMBDA_NAME: voiceApiLambdaName,
         API_KEY_SECRET_ARN: secretArns.apiKey,
@@ -220,6 +233,9 @@ export class EcsServiceConstruct extends Construct {
         // here. apiKeySecret remains referenced so the IAM execution-role
         // policy grants GetSecretValue on the ARN.
         DAILY_API_KEY: ecs.Secret.fromSecretsManager(dailySecret),
+        DAILY_RECORDING_WEBHOOK_HMAC: ecs.Secret.fromSecretsManager(
+          dailyRecordingWebhookHmacSecret,
+        ),
         ASSEMBLYAI_API_KEY: ecs.Secret.fromSecretsManager(aaiSecret),
         ELEVENLABS_API_KEY: ecs.Secret.fromSecretsManager(elevenSecret),
       },
@@ -407,5 +423,37 @@ export class EcsServiceConstruct extends Construct {
     );
 
     return role;
+  }
+
+  private grantDailyRecordingUploaderRole(
+    config: VoiceEngineConfig,
+    recordingsBucketArn: string,
+  ): void {
+    const role = iam.Role.fromRoleArn(
+      this,
+      'DailyRecordingsUploaderRole',
+      config.recordingRoleArn,
+      { mutable: true },
+    );
+    role.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        sid: 'DailyRecordingsBucketAccess',
+        actions: ['s3:ListBucket', 's3:ListBucketMultipartUploads', 's3:ListBucketVersions'],
+        resources: [recordingsBucketArn],
+      }),
+    );
+    role.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        sid: 'DailyRecordingsObjectAccess',
+        actions: [
+          's3:PutObject',
+          's3:GetObject',
+          's3:GetObjectVersion',
+          's3:AbortMultipartUpload',
+          's3:ListMultipartUploadParts',
+        ],
+        resources: [`${recordingsBucketArn}/cosentus/*`],
+      }),
+    );
   }
 }

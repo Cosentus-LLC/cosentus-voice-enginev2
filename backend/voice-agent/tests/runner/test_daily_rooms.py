@@ -127,6 +127,7 @@ async def test_create_inbound_room_request_shape():
     assert props["enable_recording"] == "cloud"
     assert props["recordings_bucket"]["bucket_name"] == "test-bucket"
     assert props["recordings_bucket"]["assume_role_arn"] == "arn:aws:iam::000:role/Daily"
+    assert props["recordings_bucket"]["allow_api_access"] is False
 
 
 @pytest.mark.asyncio
@@ -201,6 +202,8 @@ async def test_create_outbound_room_request_shape():
     assert props["enable_dialout"] is True
     assert props["dialout_config"]["allow_room_start"] is True
     assert "sip" not in props
+    assert props["enable_recording"] == "cloud"
+    assert props["recordings_bucket"]["allow_api_access"] is False
 
 
 # ── create_browser_room ──────────────────────────────────────────────────

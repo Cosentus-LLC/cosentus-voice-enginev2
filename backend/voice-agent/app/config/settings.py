@@ -121,6 +121,11 @@ class Settings(BaseSettings):
     permits local dev / unit-test construction; production must
     provide it or the webhook fails closed."""
 
+    daily_recording_webhook_hmac: str = ""
+    """Base64-encoded Daily recording webhook HMAC secret used to
+    verify requests to ``/daily-recording-webhook``. Production must
+    provide it or the webhook fails closed."""
+
     recording_bucket: str = ""
     """S3 bucket Daily uses for cloud recording uploads. Set on each
     room's ``recordings_bucket.bucket_name`` property at room
@@ -135,6 +140,12 @@ class Settings(BaseSettings):
     property at room creation time. The trust policy on the role
     grants Daily's signing principal sts:AssumeRole; the role's
     permission policy grants s3:PutObject on the bucket."""
+
+    recording_region: str = "us-east-1"
+    """AWS region of ``recording_bucket`` as passed to Daily's
+    ``recordings_bucket.bucket_region`` property. Kept separate from
+    ``aws_region`` so the engine can invoke regional AWS services from
+    one region while Daily writes recordings to the bucket's region."""
 
     # ── Observability: per-call tracing (#13) ───────────────────────────
     # Off by default. An operator opts in by setting the endpoint + keys
