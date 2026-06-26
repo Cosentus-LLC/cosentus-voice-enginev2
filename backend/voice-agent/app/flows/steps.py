@@ -74,6 +74,8 @@ WRAP = "wrap"
 
 FLOW_NODE_TYPES = frozenset({"ask", "branch", "transfer", "end"})
 GREETING_STATE_KEY = "greeted"
+_FLOW_DEFAULT_MAX_REPROMPTS = 3
+_FLOW_REPROMPT_STATE_KEY_PREFIX = "flow_reprompts:"
 GREETING_ALREADY_DONE_NOTE = (
     "Call state: the opener/greeting has already been delivered for this call. "
     "Do not repeat the opener, say hello again, or re-introduce yourself; continue "
@@ -118,7 +120,9 @@ NEUTRAL_ASSIST = "assist"
 NEUTRAL_CLOSE = "close"
 NEUTRAL_ASSIST_TASK = (
     "Assist the caller according to your instructions. When the conversation is "
-    "complete, end the call."
+    'complete, end the call. If the caller is silent, says only "sorry", or '
+    "asks you to repeat, repeat or rephrase the same current question; do not "
+    "switch topics."
 )
 NEUTRAL_CLOSE_TASK = "Politely close the call when finished."
 NEUTRAL_ADVANCE_NAME = "assist_complete"
@@ -665,6 +669,71 @@ def _required_capture_fields(node: _FlowNode) -> tuple[str, ...]:
     return node.capture if node.required else ()
 
 
+def _state_text_value(flow_manager: FlowManager, field: str) -> str:
+    value = flow_manager.state.get(field)
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _already_captured_fields(
+    flow_manager: FlowManager | None,
+    fields: tuple[str, ...],
+) -> dict[str, str]:
+    if flow_manager is None:
+        return {}
+    captured: dict[str, str] = {}
+    for field in fields:
+        value = _state_text_value(flow_manager, field)
+        if value:
+            captured[field] = value
+    return captured
+
+
+def _remaining_capture_fields(
+    node: _FlowNode,
+    flow_manager: FlowManager | None,
+) -> tuple[str, ...]:
+    already_captured = _already_captured_fields(flow_manager, node.capture)
+    return tuple(field for field in node.capture if field not in already_captured)
+
+
+def _reprompt_state_key(node_id: str) -> str:
+    return f"{_FLOW_REPROMPT_STATE_KEY_PREFIX}{node_id}"
+
+
+def _increment_reprompt_count(flow_manager: FlowManager, node: _FlowNode) -> int:
+    key = _reprompt_state_key(node.id)
+    try:
+        count = int(flow_manager.state.get(key, 0))
+    except (TypeError, ValueError):
+        count = 0
+    count += 1
+    flow_manager.state[key] = count
+    return count
+
+
+def _reset_reprompt_count(flow_manager: FlowManager, node: _FlowNode) -> None:
+    flow_manager.state.pop(_reprompt_state_key(node.id), None)
+
+
+def _escape_target_for(node: _FlowNode) -> str | None:
+    return node.fallback or node.next
+
+
+def _capture_properties_for_node(
+    node: _FlowNode,
+    flow_manager: FlowManager | None = None,
+) -> dict[str, Any]:
+    properties: dict[str, Any] = {}
+    for field in _remaining_capture_fields(node, flow_manager):
+        properties[field] = {
+            "type": "string",
+            "description": f"The {field.replace('_', ' ')} captured during this step.",
+        }
+    return properties
+
+
 def _record_captured_field(flow_manager: FlowManager, field: str, value: str) -> None:
     flow_manager.state[field] = value
     # Compatibility for existing claim-flow data that captures call_reference
@@ -673,7 +742,14 @@ def _record_captured_field(flow_manager: FlowManager, field: str, value: str) ->
         flow_manager.state[REFERENCE_NUMBER] = value
 
 
-def _task_for_flow_node(*, node: _FlowNode, ivr_path: str, ivr_goal: str, include_ivr: bool) -> str:
+def _task_for_flow_node(
+    *,
+    node: _FlowNode,
+    ivr_path: str,
+    ivr_goal: str,
+    include_ivr: bool,
+    flow_manager: FlowManager | None = None,
+) -> str:
     if node.ivr and include_ivr:
         parts = [build_navigate_task(ivr_path=ivr_path, ivr_goal=ivr_goal)]
     else:
@@ -683,7 +759,30 @@ def _task_for_flow_node(*, node: _FlowNode, ivr_path: str, ivr_goal: str, includ
 
     if node.capture:
         fields = ", ".join(field.replace("_", " ") for field in node.capture)
-        parts.append(f"Capture these field(s) during this step when available: {fields}.")
+        already_captured = _already_captured_fields(flow_manager, node.capture)
+        remaining = _remaining_capture_fields(node, flow_manager)
+        parts.append(
+            f"Collect ONLY these field(s) during this step: {fields}. "
+            "Do not ask the caller for any other information for this step."
+        )
+        if already_captured:
+            known = ", ".join(
+                f"{field.replace('_', ' ')}={value}" for field, value in already_captured.items()
+            )
+            parts.append(f"Already known - do NOT ask again: {known}.")
+            if remaining:
+                remaining_fields = ", ".join(field.replace("_", " ") for field in remaining)
+                parts.append(f"Only collect the still-missing field(s): {remaining_fields}.")
+            else:
+                parts.append(
+                    "All listed field(s) are already known. Do not ask for them again; "
+                    "advance when the step goal is otherwise complete."
+                )
+        parts.append(
+            'If the caller is silent, says only "sorry", or asks you to repeat, '
+            "repeat or rephrase the same question for the still-missing field(s). "
+            "Do not switch to a different question or request unlisted fields."
+        )
         if node.required:
             parts.append("All captured field(s) for this step are required before moving on.")
     if node.type == "branch":
@@ -708,22 +807,54 @@ def _task_for_flow_node(*, node: _FlowNode, ivr_path: str, ivr_goal: str, includ
 
 def _advance_function_for_flow_node(
     node: _FlowNode,
-    build_next: Callable[[str], NodeConfig | None],
+    build_next: Callable[[str, FlowManager | None], NodeConfig | None],
     *,
     greeting_state: GreetingState | None = None,
+    flow_manager: FlowManager | None = None,
 ) -> FlowsFunctionSchema:
     required_fields = _required_capture_fields(node)
     required_field_set = set(required_fields)
+    schema_required_fields = [
+        field for field in required_fields if field in _remaining_capture_fields(node, flow_manager)
+    ]
 
     async def handler(args: FlowArgs, flow_manager: FlowManager) -> ConsolidatedFunctionResult:
         captured: dict[str, str] = {}
         for field in node.capture:
             value = str(args.get(field) or "").strip()
+            if not value:
+                value = _state_text_value(flow_manager, field)
             if field in required_field_set and not value:
-                return {"status": "missing", "field": field}, None
+                attempt = _increment_reprompt_count(flow_manager, node)
+                result = {
+                    "status": "missing",
+                    "field": field,
+                    "attempt": attempt,
+                    "max_attempts": _FLOW_DEFAULT_MAX_REPROMPTS,
+                }
+                if attempt < _FLOW_DEFAULT_MAX_REPROMPTS:
+                    return result, None
+
+                target = _escape_target_for(node)
+                next_node = build_next(target, flow_manager) if target else None
+                if target and next_node is None:
+                    logger.warning(
+                        "flow_definition_escape_transition_missing",
+                        node_id=node.id,
+                        target=target,
+                    )
+                _reset_reprompt_count(flow_manager, node)
+                return {
+                    "status": "escaped",
+                    "field": field,
+                    "reason": "max_reprompts",
+                    "attempt": attempt,
+                    "max_attempts": _FLOW_DEFAULT_MAX_REPROMPTS,
+                }, next_node
             if value:
                 _record_captured_field(flow_manager, field, value)
                 captured[field] = value
+        _reset_reprompt_count(flow_manager, node)
 
         target = node.next
         if node.type == "branch":
@@ -738,7 +869,7 @@ def _advance_function_for_flow_node(
         if node.id == GREET:
             _mark_greeted(greeting_state, flow_manager)
 
-        next_node = build_next(target) if target else None
+        next_node = build_next(target, flow_manager) if target else None
         if target and next_node is None:
             logger.warning(
                 "flow_definition_transition_missing_default_flow",
@@ -747,12 +878,7 @@ def _advance_function_for_flow_node(
             )
         return {"status": "ok", **captured}, next_node
 
-    properties: dict[str, Any] = {}
-    for field in node.capture:
-        properties[field] = {
-            "type": "string",
-            "description": f"The {field.replace('_', ' ')} captured during this step.",
-        }
+    properties = _capture_properties_for_node(node, flow_manager)
     if node.type == "branch":
         options = sorted(
             {branch.to for branch in node.branches if branch.to}
@@ -768,7 +894,7 @@ def _advance_function_for_flow_node(
         name=_advance_name_for_flow_node(node),
         description=f"Advance from the {node.label or node.id} flow step.",
         properties=properties,
-        required=list(required_fields),
+        required=schema_required_fields,
         handler=handler,
     )
 
@@ -1051,7 +1177,12 @@ def _build_data_driven_step_chain(
             if start_node is not None and start_node.id == GREET and start_node.next:
                 start_node_id = start_node.next
 
-    def build_node(node_id: str, *, is_initial: bool = False) -> NodeConfig | None:
+    def build_node(
+        node_id: str,
+        flow_manager: FlowManager | None = None,
+        *,
+        is_initial: bool = False,
+    ) -> NodeConfig | None:
         step = nodes_by_id.get(node_id)
         if step is None:
             return None
@@ -1063,11 +1194,16 @@ def _build_data_driven_step_chain(
                     step,
                     build_node,
                     greeting_state=greeting_state,
+                    flow_manager=flow_manager,
                 )
             )
 
         task = _task_for_flow_node(
-            node=step, ivr_path=ivr_path, ivr_goal=ivr_goal, include_ivr=include_ivr
+            node=step,
+            ivr_path=ivr_path,
+            ivr_goal=ivr_goal,
+            include_ivr=include_ivr,
+            flow_manager=flow_manager,
         )
         task = _task_with_knowledge(
             prefetch=step.prefetch,
