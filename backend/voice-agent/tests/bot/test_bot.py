@@ -22,7 +22,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from app.bot.bot import (
+    _FLOW_MID_DIALOG_USER_IDLE_TIMEOUT_SECS,
     _FLOW_NO_INPUT_ATTEMPTS_STATE_KEY,
+    _FLOW_NO_INPUT_MESSAGES,
     _FLOW_USER_IDLE_TIMEOUT_SECS,
     _build_dialin_settings,
     _compose_system_prompt,
@@ -40,7 +42,7 @@ from app.flows.identity_gate import IDENTITY_VERIFICATION_ROLE_RULE
 from app.flows.steps import NAVIGATE, NEUTRAL_ASSIST, STEP_COMPLETION_ROLE_RULE
 from app.hydration.hydrator import MissingRequiredCaseDataError
 from app.tools.result import ToolResult, ToolStatus
-from pipecat.frames.frames import LLMRunFrame, TTSSpeakFrame
+from pipecat.frames.frames import LLMRunFrame, TTSSpeakFrame, UserIdleTimeoutUpdateFrame
 from pipecat.runner.types import DailyRunnerArguments, RunnerArguments
 
 # ── Fixtures ──────────────────────────────────────────────────────────────
@@ -2623,10 +2625,14 @@ async def _run_bot_capturing(settings, *, agent=None, flow_manager=None):
 
         def event_handler(self, event_name):
             def _decorator(fn):
-                self.handlers[event_name] = fn
+                self.handlers.setdefault(event_name, []).append(fn)
                 return fn
 
             return _decorator
+
+        async def emit(self, event_name, *args):
+            for handler in self.handlers[event_name]:
+                await handler(*args)
 
     user_aggregator = _AggregatorDouble()
     assistant_aggregator = _AggregatorDouble()
@@ -2708,20 +2714,24 @@ async def test_user_idle_timeout_enabled_when_flows_enabled():
 
 
 @pytest.mark.asyncio
-async def test_user_idle_handler_queues_llm_reprompt_when_flows_enabled():
+async def test_user_idle_handler_queues_short_presence_check_when_flows_enabled():
     fm = _flow_manager_mock()
     cap = await _run_bot_capturing(
         _settings(flows_enabled=True, identity_verification_keys="patient_name"),
         flow_manager=fm,
     )
-    handler = cap["user_aggregator"].handlers["on_user_turn_idle"]
+    cap["pipeline_task"].queue_frames.reset_mock()
 
-    await handler(cap["user_aggregator"])
+    await cap["user_aggregator"].emit("on_user_turn_idle", cap["user_aggregator"])
 
     cap["llm_context"].add_message.assert_called_once()
     message = cap["llm_context"].add_message.call_args.args[0]
     assert message["role"] == "user"
-    assert "did not respond" in message["content"]
+    assert "Sorry, are you still there?" in message["content"]
+    lowered = message["content"].lower()
+    assert "repeat the exact" not in lowered
+    assert "verbatim" not in lowered
+    assert "current question" not in lowered
     assert fm.state[_FLOW_NO_INPUT_ATTEMPTS_STATE_KEY] == 1
 
     queued = [
@@ -2733,6 +2743,86 @@ async def test_user_idle_handler_queues_llm_reprompt_when_flows_enabled():
 
 
 @pytest.mark.asyncio
+async def test_user_idle_handler_uses_distinct_ladder_and_stops_after_terminal_attempt():
+    fm = _flow_manager_mock()
+    cap = await _run_bot_capturing(
+        _settings(flows_enabled=True, identity_verification_keys="patient_name"),
+        flow_manager=fm,
+    )
+    cap["pipeline_task"].queue_frames.reset_mock()
+
+    for _ in range(4):
+        await cap["user_aggregator"].emit("on_user_turn_idle", cap["user_aggregator"])
+
+    added_messages = [
+        call.args[0]["content"] for call in cap["llm_context"].add_message.call_args_list
+    ]
+    assert len(added_messages) == 3
+    assert len(set(added_messages)) == 3
+    assert "having trouble hearing" in added_messages[2]
+    assert "Repeat the exact current question" not in "\n".join(added_messages)
+    assert fm.state[_FLOW_NO_INPUT_ATTEMPTS_STATE_KEY] == 4
+
+    queued = [
+        frame
+        for call in cap["pipeline_task"].queue_frames.await_args_list
+        for frame in call.args[0]
+    ]
+    assert sum(isinstance(frame, LLMRunFrame) for frame in queued) == 3
+
+
+@pytest.mark.asyncio
+async def test_user_turn_started_resets_no_input_attempts_for_barge_in():
+    fm = _flow_manager_mock()
+    fm.state[_FLOW_NO_INPUT_ATTEMPTS_STATE_KEY] = 2
+    cap = await _run_bot_capturing(
+        _settings(flows_enabled=True, identity_verification_keys="patient_name"),
+        flow_manager=fm,
+    )
+    cap["pipeline_task"].queue_frames.reset_mock()
+
+    await cap["user_aggregator"].emit(
+        "on_user_turn_started",
+        cap["user_aggregator"],
+        MagicMock(),
+    )
+
+    assert _FLOW_NO_INPUT_ATTEMPTS_STATE_KEY not in fm.state
+    cap["llm_context"].add_message.assert_not_called()
+    cap["pipeline_task"].queue_frames.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_user_turn_stopped_switches_to_mid_dialogue_idle_window():
+    fm = _flow_manager_mock()
+    fm.state[_FLOW_NO_INPUT_ATTEMPTS_STATE_KEY] = 1
+    cap = await _run_bot_capturing(
+        _settings(flows_enabled=True, identity_verification_keys="patient_name"),
+        flow_manager=fm,
+    )
+    cap["pipeline_task"].queue_frames.reset_mock()
+    message = MagicMock()
+    message.content = "I am here"
+
+    await cap["user_aggregator"].emit(
+        "on_user_turn_stopped",
+        cap["user_aggregator"],
+        MagicMock(),
+        message,
+    )
+
+    assert _FLOW_NO_INPUT_ATTEMPTS_STATE_KEY not in fm.state
+    queued = [
+        frame
+        for call in cap["pipeline_task"].queue_frames.await_args_list
+        for frame in call.args[0]
+    ]
+    idle_updates = [frame for frame in queued if isinstance(frame, UserIdleTimeoutUpdateFrame)]
+    assert len(idle_updates) == 1
+    assert idle_updates[0].timeout == _FLOW_MID_DIALOG_USER_IDLE_TIMEOUT_SECS
+
+
+@pytest.mark.asyncio
 async def test_user_idle_handler_ignores_call_ended():
     fm = _flow_manager_mock()
     fm.state["call_ended"] = True
@@ -2740,12 +2830,24 @@ async def test_user_idle_handler_ignores_call_ended():
         _settings(flows_enabled=True, identity_verification_keys="patient_name"),
         flow_manager=fm,
     )
-    handler = cap["user_aggregator"].handlers["on_user_turn_idle"]
 
-    await handler(cap["user_aggregator"])
+    await cap["user_aggregator"].emit("on_user_turn_idle", cap["user_aggregator"])
 
     cap["llm_context"].add_message.assert_not_called()
     cap["pipeline_task"].queue_frames.assert_not_called()
+
+
+def test_no_input_messages_never_request_verbatim_repeat():
+    banned = (
+        "repeat",
+        "re-say",
+        "resay",
+        "verbatim",
+        "exact current question",
+    )
+    for message in _FLOW_NO_INPUT_MESSAGES:
+        lowered = message.lower()
+        assert all(term not in lowered for term in banned)
 
 
 @pytest.mark.asyncio

@@ -71,6 +71,7 @@ from pipecat.frames.frames import (
     FunctionCallResultProperties,
     LLMRunFrame,
     TTSSpeakFrame,
+    UserIdleTimeoutUpdateFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -181,24 +182,39 @@ _MIN_WORDS_INTERRUPT_THRESHOLD = 3
 # walking-skeleton round 3 and v1.
 _DEFAULT_IDLE_TIMEOUT_SECS = 300
 _FLOW_USER_IDLE_TIMEOUT_SECS = 10.0
-_FLOW_MAX_NO_INPUT_REPROMPTS = 3
+_FLOW_MID_DIALOG_USER_IDLE_TIMEOUT_SECS = 7.0
+_FLOW_MAX_NO_INPUT_NUDGES = 2
+_FLOW_MAX_NO_INPUT_ATTEMPTS = 3
 _FLOW_NO_INPUT_ATTEMPTS_STATE_KEY = "flow_no_input_attempts"
 _FLOW_NO_INPUT_MESSAGES = (
     (
-        "The caller did not respond. Repeat the exact current question, asking "
-        "only for the still-missing information in the active flow step."
+        "The caller did not respond. Say exactly: 'Sorry, are you still "
+        "there?' Do not use any prior greeting, opener, or question."
     ),
     (
-        "The caller is still silent or unclear. Rephrase the same current "
-        "question, preserve all required parts, and do not switch to a new "
-        "question or ask for unlisted fields."
+        "The caller is still silent or unclear. Ask only for the still-missing "
+        "information in the active flow step using a brief new wording and one "
+        "short help cue. Do not deliver any prior greeting, opener, or full "
+        "prompt."
     ),
     (
-        "The caller still has not responded. Ask whether they can hear you, "
-        "then gracefully close or transfer according to the active flow step "
-        "and available tools if there is no response."
+        "The caller still has not responded. Briefly say you are having "
+        "trouble hearing them, then gracefully close, retry, or transfer "
+        "according to the active flow step and available tools. Do not deliver "
+        "any prior greeting, opener, or full prompt."
     ),
 )
+
+
+def _flow_no_input_message_for_attempt(attempt: int) -> str | None:
+    if attempt > _FLOW_MAX_NO_INPUT_ATTEMPTS:
+        return None
+    return _FLOW_NO_INPUT_MESSAGES[attempt - 1]
+
+
+def _reset_flow_no_input_attempts(flow_state: dict[str, Any]) -> None:
+    flow_state.pop(_FLOW_NO_INPUT_ATTEMPTS_STATE_KEY, None)
+
 
 # Tools the identity gate (16b, #42) leaves available BEFORE the caller
 # is verified. ``end_call`` is exempt so the bot can always terminate —
@@ -778,6 +794,24 @@ async def run_bot(
         transport=transport,
     )
 
+    @aggregator_pair.user().event_handler("on_user_turn_started")
+    async def on_user_turn_started(_aggregator, _strategy):
+        if not settings.flows_enabled:
+            return
+        _reset_flow_no_input_attempts(flow_manager.state)
+
+    @aggregator_pair.user().event_handler("on_user_turn_stopped")
+    async def on_user_turn_stopped(_aggregator, _strategy, message):
+        if not settings.flows_enabled:
+            return
+        if not (getattr(message, "content", "") or "").strip():
+            return
+
+        _reset_flow_no_input_attempts(flow_manager.state)
+        await task.queue_frames(
+            [UserIdleTimeoutUpdateFrame(_FLOW_MID_DIALOG_USER_IDLE_TIMEOUT_SECS)]
+        )
+
     @aggregator_pair.user().event_handler("on_user_turn_idle")
     async def on_user_turn_idle(_aggregator):
         if not settings.flows_enabled:
@@ -788,17 +822,28 @@ async def run_bot(
             attempt = int(flow_manager.state.get(_FLOW_NO_INPUT_ATTEMPTS_STATE_KEY, 0))
         except (TypeError, ValueError):
             attempt = 0
+        attempt = max(attempt, 0)
         attempt += 1
         flow_manager.state[_FLOW_NO_INPUT_ATTEMPTS_STATE_KEY] = attempt
 
-        message = _FLOW_NO_INPUT_MESSAGES[min(attempt, _FLOW_MAX_NO_INPUT_REPROMPTS) - 1]
+        message = _flow_no_input_message_for_attempt(attempt)
+        if message is None:
+            logger.info(
+                "flow_user_idle_reprompt_suppressed",
+                call_id=call_id,
+                attempt=attempt,
+                max_attempts=_FLOW_MAX_NO_INPUT_ATTEMPTS,
+            )
+            return
+
         context.add_message({"role": "user", "content": message})
         await task.queue_frames([LLMRunFrame()])
         logger.info(
             "flow_user_idle_reprompt_queued",
             call_id=call_id,
             attempt=attempt,
-            max_attempts=_FLOW_MAX_NO_INPUT_REPROMPTS,
+            max_attempts=_FLOW_MAX_NO_INPUT_ATTEMPTS,
+            terminal=attempt > _FLOW_MAX_NO_INPUT_NUDGES,
         )
 
     if settings.flows_enabled:
