@@ -34,6 +34,11 @@ def _runtime_config_json() -> dict[str, Any]:
         "first_message": "Hi, I'm calling about a claim status.",
         "flow_definition": None,
         "ivr_goal": "Reach a claims rep",
+        "base_instructions": {
+            "global": "Speak briefly and ask one question at a time.",
+            "payer": "Use keypad tools for IVR menus.",
+            "patient": "Verify identity before discussing PHI.",
+        },
         "identity_verification_keys": ["patient_name", "dob"],
         "llm": {
             "provider": "anthropic",  # extra in v2
@@ -124,6 +129,9 @@ class TestAgentConfigParse:
         assert cfg.first_message == "Hi, I'm calling about a claim status."
         assert cfg.flow_definition is None
         assert cfg.ivr_goal == "Reach a claims rep"
+        assert cfg.base_instructions.global_ == "Speak briefly and ask one question at a time."
+        assert cfg.base_instructions.payer == "Use keypad tools for IVR menus."
+        assert cfg.base_instructions.patient == "Verify identity before discussing PHI."
         assert cfg.identity_verification_keys == ["patient_name", "dob"]
 
         assert cfg.llm.model == "claude-sonnet-4-6"
@@ -217,6 +225,34 @@ class TestAgentConfigParse:
 
         assert cfg.call_kind == "patient"
         assert cfg.model_dump(by_alias=True)["call_kind"] == "patient"
+
+    def test_base_instructions_default_empty(self):
+        cfg = AgentConfig.model_validate({"name": "agent"})
+
+        assert cfg.base_instructions.global_ == ""
+        assert cfg.base_instructions.payer == ""
+        assert cfg.base_instructions.patient == ""
+
+    def test_base_instructions_parses_and_dumps(self):
+        cfg = AgentConfig.model_validate(
+            {
+                "name": "agent",
+                "base_instructions": {
+                    "global": "GLOBAL",
+                    "payer": "PAYER",
+                    "patient": "PATIENT",
+                },
+            }
+        )
+
+        assert cfg.base_instructions.global_ == "GLOBAL"
+        assert cfg.base_instructions.payer == "PAYER"
+        assert cfg.base_instructions.patient == "PATIENT"
+        assert cfg.model_dump(by_alias=True)["base_instructions"] == {
+            "global": "GLOBAL",
+            "payer": "PAYER",
+            "patient": "PATIENT",
+        }
 
     def test_meta_alias_underscore_meta_deserializes(self):
         # The lambda sends ``_meta`` (wire convention); the Python
@@ -329,6 +365,18 @@ class TestUnknownFieldLogging:
             {
                 "name": "agent",
                 "flow_definition": {"version": 1, "start": "reference_number", "nodes": []},
+            }
+        )
+
+        assert self._unknown_field_warnings(mock_logger) == []
+
+    def test_base_instructions_is_not_logged_as_unknown(self, mocker):
+        mock_logger = mocker.patch("app.config.agent_config.logger")
+
+        AgentConfig.model_validate(
+            {
+                "name": "agent",
+                "base_instructions": {"global": "GLOBAL", "payer": "PAYER"},
             }
         )
 

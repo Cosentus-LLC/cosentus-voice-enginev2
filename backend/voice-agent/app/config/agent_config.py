@@ -277,6 +277,20 @@ class AgentConfigMeta(_RuntimeConfigModel):
     updated_at_ms: int = Field(default=0, alias="version")
 
 
+class BaseInstructions(_RuntimeConfigModel):
+    """Shared prompt layers served dynamically by runtime-config.
+
+    The API owns editing/storage for these blocks. The engine only models the
+    wire contract and composes the relevant pieces at call start.
+    """
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    global_: str = Field(default="", alias="global")
+    payer: str = ""
+    patient: str = ""
+
+
 class AgentConfig(_RuntimeConfigModel):
     """Top-level per-agent runtime config.
 
@@ -304,6 +318,7 @@ class AgentConfig(_RuntimeConfigModel):
     first_message: str = ""
     flow_definition: dict[str, Any] | None = None
     ivr_goal: str = ""
+    base_instructions: BaseInstructions = Field(default_factory=BaseInstructions)
     identity_verification_keys: list[str] = Field(default_factory=list)
     call_kind: str | None = None
     """Per-agent call policy selector.

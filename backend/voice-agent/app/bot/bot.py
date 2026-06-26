@@ -390,7 +390,8 @@ async def run_bot(
     )
 
     # ── Layer 5: hydrate prompts ───────────────────────────────────────
-    hydrated_system = hydrate_prompt(agent.system_prompt, case_data)
+    effective_system_prompt = _compose_system_prompt(agent, call_policy)
+    hydrated_system = hydrate_prompt(effective_system_prompt, case_data)
     hydrated_first = hydrate_prompt(agent.first_message, case_data) if agent.first_message else ""
 
     # ── Layer 3: services (STT / TTS / LLM) ────────────────────────────
@@ -1259,6 +1260,28 @@ def _without_initial_flow_response(node: dict[str, Any]) -> dict[str, Any]:
     response source.
     """
     return {**node, "respond_immediately": False}
+
+
+def _compose_system_prompt(agent: AgentConfig, call_policy: _CallPolicy) -> str:
+    """Compose shared base prompt layers with the per-agent persona prompt.
+
+    Runtime-config may supply shared base instructions dynamically. Empty base
+    blocks are ignored; if every base block is empty, return ``agent.system_prompt``
+    exactly to preserve pre-migration behavior for un-migrated agents.
+    """
+    base = agent.base_instructions
+    global_base = base.global_.strip()
+    scope_base = ""
+    if call_policy.source == "call_kind" and call_policy.call_kind == "payer":
+        scope_base = base.payer.strip()
+    elif call_policy.source == "call_kind" and call_policy.call_kind == "patient":
+        scope_base = base.patient.strip()
+
+    if not global_base and not scope_base:
+        return agent.system_prompt
+
+    parts = [part for part in (global_base, scope_base, agent.system_prompt.strip()) if part]
+    return "\n\n".join(parts)
 
 
 def _resolve_call_policy(agent: AgentConfig, direction: str) -> _CallPolicy:

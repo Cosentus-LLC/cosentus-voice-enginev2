@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from app.bot.bot import (
     _build_dialin_settings,
+    _compose_system_prompt,
     _extract_session_id,
     _get_daily_api_key,
     _resolve_call_policy,
@@ -30,7 +31,7 @@ from app.bot.bot import (
     bot,
     run_bot,
 )
-from app.config.agent_config import AgentConfig, ToolConfig
+from app.config.agent_config import AgentConfig, BaseInstructions, ToolConfig
 from app.config.settings import Settings
 from app.flows import GREETING_STATE_KEY, PRE_VERIFICATION_ROLE_MESSAGE
 from app.flows.identity_gate import IDENTITY_VERIFICATION_ROLE_RULE
@@ -53,23 +54,26 @@ def _settings(**overrides) -> Settings:
 
 def _agent(
     *,
+    system_prompt: str = "You are a test agent.",
     speak_first: bool = True,
     first_message: str = "",
     tools: list | None = None,
     flow_definition: dict | None = None,
     identity_verification_keys: list[str] | None = None,
     call_kind: str | None = None,
+    base_instructions: BaseInstructions | None = None,
 ) -> AgentConfig:
     return AgentConfig(
         name="test-agent",
         display_name="Test Agent",
-        system_prompt="You are a test agent.",
+        system_prompt=system_prompt,
         first_message=first_message,
         speak_first=speak_first,
         tools=tools or [],
         flow_definition=flow_definition,
         identity_verification_keys=identity_verification_keys or [],
         call_kind=call_kind,
+        base_instructions=base_instructions or BaseInstructions(),
     )
 
 
@@ -129,6 +133,7 @@ def _patch_run_bot_dependencies(*, agent: AgentConfig | None = None):
     llm_mock = MagicMock()
     llm_mock.register_function = MagicMock()
     mocks["llm"] = llm_mock
+    mocks["build_llm"] = MagicMock(return_value=llm_mock)
 
     # Mock registry — returns names + tool defs.
     registry_mock = MagicMock()
@@ -150,7 +155,7 @@ def _start_run_bot_patches(agent: AgentConfig, mocks: dict, transport: MagicMock
         patch("app.bot.bot.load_agent_config", AsyncMock(return_value=agent)),
         patch("app.bot.bot.build_stt", MagicMock(return_value=MagicMock())),
         patch("app.bot.bot.build_tts", MagicMock(return_value=MagicMock())),
-        patch("app.bot.bot.build_llm", MagicMock(return_value=mocks["llm"])),
+        patch("app.bot.bot.build_llm", mocks["build_llm"]),
         patch(
             "app.bot.bot.build_registry_for_call",
             MagicMock(return_value=mocks["registry"]),
@@ -334,6 +339,71 @@ class TestCallPolicy:
         assert mock_logger.warning.call_args.args[0] == "call_policy_unknown_call_kind"
 
 
+class TestComposeSystemPrompt:
+    def test_payer_prompt_orders_global_then_payer_then_agent_prompt(self):
+        agent = _agent(
+            system_prompt="AGENT",
+            call_kind="payer",
+            base_instructions=BaseInstructions(
+                global_="GLOBAL",
+                payer="PAYER",
+                patient="PATIENT",
+            ),
+        )
+        policy = _resolve_call_policy(agent, "outbound")
+
+        assert _compose_system_prompt(agent, policy) == "GLOBAL\n\nPAYER\n\nAGENT"
+
+    def test_patient_prompt_orders_global_then_patient_then_agent_prompt(self):
+        agent = _agent(
+            system_prompt="AGENT",
+            call_kind="patient",
+            base_instructions=BaseInstructions(
+                global_="GLOBAL",
+                payer="PAYER",
+                patient="PATIENT",
+            ),
+        )
+        policy = _resolve_call_policy(agent, "outbound")
+
+        assert _compose_system_prompt(agent, policy) == "GLOBAL\n\nPATIENT\n\nAGENT"
+
+    def test_empty_or_missing_base_returns_agent_prompt_unchanged(self):
+        agent = _agent(system_prompt="  AGENT  ", call_kind="payer")
+        policy = _resolve_call_policy(agent, "outbound")
+
+        assert _compose_system_prompt(agent, policy) == "  AGENT  "
+
+    def test_missing_or_unknown_call_kind_does_not_apply_scope_base(self, mocker):
+        mocker.patch("app.bot.bot.logger")
+        missing = _agent(
+            system_prompt="AGENT",
+            base_instructions=BaseInstructions(
+                global_="GLOBAL",
+                payer="PAYER",
+                patient="PATIENT",
+            ),
+        )
+        unknown = _agent(
+            system_prompt="AGENT",
+            call_kind="facility",
+            base_instructions=BaseInstructions(
+                global_="GLOBAL",
+                payer="PAYER",
+                patient="PATIENT",
+            ),
+        )
+
+        assert (
+            _compose_system_prompt(missing, _resolve_call_policy(missing, "outbound"))
+            == "GLOBAL\n\nAGENT"
+        )
+        assert (
+            _compose_system_prompt(unknown, _resolve_call_policy(unknown, "outbound"))
+            == "GLOBAL\n\nAGENT"
+        )
+
+
 # ── run_bot guard rails ───────────────────────────────────────────────────
 
 
@@ -507,6 +577,41 @@ async def test_run_bot_dynamic_opener_seeds_user_kickoff():
     assert len(msgs) == 1
     assert msgs[0]["role"] == "user"
     assert msgs[0]["content"] == "Hi."
+
+
+@pytest.mark.asyncio
+async def test_run_bot_passes_composed_base_prompt_to_llm_system_instruction():
+    agent, mocks = _patch_run_bot_dependencies(
+        agent=_agent(
+            system_prompt="AGENT-PERSONA {{patient_name}}",
+            call_kind="payer",
+            base_instructions=BaseInstructions(
+                global_="GLOBAL-BASE {{payer_name}}",
+                payer="PAYER-BASE",
+                patient="PATIENT-BASE",
+            ),
+        ),
+    )
+    transport = _make_transport_mock()
+    patches = _start_run_bot_patches(agent, mocks, transport)
+    for p in patches:
+        p.start()
+    try:
+        await run_bot(
+            transport,
+            _runner_args(
+                direction="outbound",
+                case_data={"payer_name": "Aetna", "patient_name": "Ada"},
+            ),
+            _settings(),
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    system_instruction = mocks["build_llm"].call_args.kwargs["system_instruction"]
+    assert system_instruction == "GLOBAL-BASE Aetna\n\nPAYER-BASE\n\nAGENT-PERSONA Ada"
+    assert "PATIENT-BASE" not in system_instruction
 
 
 @pytest.mark.asyncio
@@ -1490,6 +1595,63 @@ async def test_flag_on_gate_is_phi_free_and_verified_node_is_step_chain(monkeypa
     assert STEP_COMPLETION_ROLE_RULE in verified["role_message"]
     # And the two are distinct — PHI is not present pre-verification.
     assert verified["role_message"] != gate_node["role_message"]
+
+
+@pytest.mark.asyncio
+async def test_flag_on_gate_keeps_safe_prompt_while_verified_node_gets_composed_prompt():
+    agent, mocks = _patch_run_bot_dependencies(
+        agent=_agent(
+            system_prompt="AGENT-PERSONA {{patient_name}}",
+            call_kind="patient",
+            base_instructions=BaseInstructions(
+                global_="GLOBAL-BASE",
+                payer="PAYER-BASE",
+                patient="PATIENT-BASE",
+            ),
+        )
+    )
+    transport = _make_transport_mock()
+    fm = _flow_manager_mock()
+    capture: dict = {}
+    real_build = __import__(
+        "app.bot.bot", fromlist=["build_identity_gate_flow"]
+    ).build_identity_gate_flow
+
+    def _spy(**kwargs):
+        capture.update(kwargs)
+        return real_build(**kwargs)
+
+    patches = _start_run_bot_patches(agent, mocks, transport) + [
+        patch("app.bot.bot.build_flow_manager", MagicMock(return_value=fm)),
+        patch("app.bot.bot.build_identity_gate_flow", _spy),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        await run_bot(
+            transport,
+            _runner_args(
+                direction="outbound",
+                case_data={"patient_name": "Ada"},
+            ),
+            _settings(flows_enabled=True, identity_verification_keys="patient_name"),
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    gate_node = fm.initialize.await_args.args[0]
+    assert PRE_VERIFICATION_ROLE_MESSAGE in gate_node["role_message"]
+    assert "GLOBAL-BASE" not in gate_node["role_message"]
+    assert "PATIENT-BASE" not in gate_node["role_message"]
+    assert "AGENT-PERSONA Ada" not in gate_node["role_message"]
+
+    verified = capture["verified_node"]
+    assert "GLOBAL-BASE" in verified["role_message"]
+    assert "PATIENT-BASE" in verified["role_message"]
+    assert "PAYER-BASE" not in verified["role_message"]
+    assert "AGENT-PERSONA Ada" in verified["role_message"]
+    assert STEP_COMPLETION_ROLE_RULE in verified["role_message"]
 
 
 # ── Identity gate — code-enforced tool gate (16b, #42) ───────────────────
