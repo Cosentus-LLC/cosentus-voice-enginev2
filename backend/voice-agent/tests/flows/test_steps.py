@@ -251,6 +251,24 @@ def _required_balance_flow() -> dict:
     }
 
 
+def _required_balance_after_intro_flow() -> dict:
+    flow = _required_balance_flow()
+    return {
+        "version": 1,
+        "start": "intro",
+        "nodes": [
+            {
+                "id": "intro",
+                "type": "ask",
+                "label": "Intro",
+                "say": "Introduce the balance collection step.",
+                "next": "collect_balance_details",
+            },
+            *flow["nodes"],
+        ],
+    }
+
+
 async def _walk_to(node, target_name):
     """Advance from ``node`` to ``target_name`` supplying no extra args.
 
@@ -662,14 +680,24 @@ class TestDataDrivenFlow:
             _fm(),
         )
         assert next_node is None
-        assert result == {"status": "missing", "field": "due_date"}
+        assert result == {
+            "status": "missing",
+            "field": "due_date",
+            "attempt": 1,
+            "max_attempts": 3,
+        }
 
         result, next_node = await _advance_fn(node).handler(
             {"due_date": "2026-07-01"},
             _fm(),
         )
         assert next_node is None
-        assert result == {"status": "missing", "field": "balance_amount"}
+        assert result == {
+            "status": "missing",
+            "field": "balance_amount",
+            "attempt": 1,
+            "max_attempts": 3,
+        }
 
     @pytest.mark.asyncio
     async def test_required_capture_records_all_present_fields_and_advances(self):
@@ -697,6 +725,108 @@ class TestDataDrivenFlow:
         assert advance.required == ["balance_amount", "due_date"]
         assert "balance_amount" in advance.properties
         assert "due_date" in advance.properties
+
+    def test_task_for_capture_node_lists_only_allowed_fields(self):
+        node = _chain(flow_definition=_required_balance_flow())
+        blob = _message_blob(node)
+
+        assert "Collect ONLY these field(s)" in blob
+        assert "balance amount" in blob
+        assert "due date" in blob
+        assert "denial date" not in blob
+        assert "Do not ask the caller for any other information" in blob
+
+    @pytest.mark.asyncio
+    async def test_task_for_capture_node_skips_already_captured_fields(self):
+        node = _chain(flow_definition=_required_balance_after_intro_flow())
+        fm = _fm()
+        fm.state["balance_amount"] = "100.00"
+
+        _result, next_node = await _advance_fn(node).handler({}, fm)
+        blob = _message_blob(next_node)
+
+        assert "Already known - do NOT ask again: balance amount=100.00" in blob
+        assert "Only collect the still-missing field(s): due date" in blob
+        assert "balance_amount" not in _advance_fn(next_node).properties
+        assert "due_date" in _advance_fn(next_node).properties
+        assert _advance_fn(next_node).required == ["due_date"]
+
+    @pytest.mark.asyncio
+    async def test_required_capture_uses_already_captured_state_and_advances(self):
+        node = _chain(flow_definition=_required_balance_flow())
+        fm = _fm()
+        fm.state["balance_amount"] = "100.00"
+
+        result, next_node = await _advance_fn(node).handler({"due_date": "2026-07-01"}, fm)
+
+        assert next_node["name"] == "done"
+        assert result == {
+            "status": "ok",
+            "balance_amount": "100.00",
+            "due_date": "2026-07-01",
+        }
+        assert fm.state["balance_amount"] == "100.00"
+        assert fm.state["due_date"] == "2026-07-01"
+
+    @pytest.mark.asyncio
+    async def test_required_capture_schema_omits_already_captured_fields_on_rebuilt_node(self):
+        node = _chain(flow_definition=_required_balance_after_intro_flow())
+        fm = _fm()
+        fm.state["balance_amount"] = "100.00"
+
+        _result, next_node = await _advance_fn(node).handler({}, fm)
+        properties = _advance_fn(next_node).properties
+
+        assert "balance_amount" not in properties
+        assert "due_date" in properties
+
+    @pytest.mark.asyncio
+    async def test_required_capture_escapes_after_max_reprompts(self):
+        node = _chain(flow_definition=_required_balance_flow())
+        fm = _fm()
+
+        for _ in range(2):
+            result, next_node = await _advance_fn(node).handler(
+                {"balance_amount": "100.00", "due_date": " "},
+                fm,
+            )
+            assert result["status"] == "missing"
+            assert next_node is None
+
+        result, next_node = await _advance_fn(node).handler(
+            {"balance_amount": "100.00", "due_date": " "},
+            fm,
+        )
+
+        assert result == {
+            "status": "escaped",
+            "field": "due_date",
+            "reason": "max_reprompts",
+            "attempt": 3,
+            "max_attempts": 3,
+        }
+        assert next_node["name"] == "done"
+
+    @pytest.mark.asyncio
+    async def test_reprompt_count_resets_after_successful_capture(self):
+        node = _chain(flow_definition=_required_balance_flow())
+        fm = _fm()
+
+        result, next_node = await _advance_fn(node).handler(
+            {"balance_amount": "100.00", "due_date": " "},
+            fm,
+        )
+        assert result["status"] == "missing"
+        assert next_node is None
+
+        result, next_node = await _advance_fn(node).handler(
+            {"balance_amount": "100.00", "due_date": "2026-07-01"},
+            fm,
+        )
+
+        assert result["status"] == "ok"
+        assert next_node["name"] == "done"
+        assert "flow_reprompts:collect_balance_details" not in fm.state
 
     @pytest.mark.asyncio
     async def test_custom_branch_uses_selected_branch_target(self):

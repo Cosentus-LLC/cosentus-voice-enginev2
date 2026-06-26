@@ -180,6 +180,25 @@ _MIN_WORDS_INTERRUPT_THRESHOLD = 3
 # this many seconds of no audio in either direction. 300s matches
 # walking-skeleton round 3 and v1.
 _DEFAULT_IDLE_TIMEOUT_SECS = 300
+_FLOW_USER_IDLE_TIMEOUT_SECS = 10.0
+_FLOW_MAX_NO_INPUT_REPROMPTS = 3
+_FLOW_NO_INPUT_ATTEMPTS_STATE_KEY = "flow_no_input_attempts"
+_FLOW_NO_INPUT_MESSAGES = (
+    (
+        "The caller did not respond. Repeat the exact current question, asking "
+        "only for the still-missing information in the active flow step."
+    ),
+    (
+        "The caller is still silent or unclear. Rephrase the same current "
+        "question, preserve all required parts, and do not switch to a new "
+        "question or ask for unlisted fields."
+    ),
+    (
+        "The caller still has not responded. Ask whether they can hear you, "
+        "then gracefully close or transfer according to the active flow step "
+        "and available tools if there is no response."
+    ),
+)
 
 # Tools the identity gate (16b, #42) leaves available BEFORE the caller
 # is verified. ``end_call`` is exempt so the bot can always terminate —
@@ -525,6 +544,7 @@ async def run_bot(
         context,
         user_params=LLMUserAggregatorParams(
             vad_analyzer=vad_analyzer,
+            user_idle_timeout=(_FLOW_USER_IDLE_TIMEOUT_SECS if settings.flows_enabled else 0),
             user_turn_strategies=UserTurnStrategies(
                 start=[
                     MinWordsUserTurnStartStrategy(
@@ -757,6 +777,29 @@ async def run_bot(
         context_aggregator=aggregator_pair,
         transport=transport,
     )
+
+    @aggregator_pair.user().event_handler("on_user_turn_idle")
+    async def on_user_turn_idle(_aggregator):
+        if not settings.flows_enabled:
+            return
+        if flow_manager.state.get("call_ended") is True:
+            return
+        try:
+            attempt = int(flow_manager.state.get(_FLOW_NO_INPUT_ATTEMPTS_STATE_KEY, 0))
+        except (TypeError, ValueError):
+            attempt = 0
+        attempt += 1
+        flow_manager.state[_FLOW_NO_INPUT_ATTEMPTS_STATE_KEY] = attempt
+
+        message = _FLOW_NO_INPUT_MESSAGES[min(attempt, _FLOW_MAX_NO_INPUT_REPROMPTS) - 1]
+        context.add_message({"role": "user", "content": message})
+        await task.queue_frames([LLMRunFrame()])
+        logger.info(
+            "flow_user_idle_reprompt_queued",
+            call_id=call_id,
+            attempt=attempt,
+            max_attempts=_FLOW_MAX_NO_INPUT_REPROMPTS,
+        )
 
     if settings.flows_enabled:
         # ── Verified IVR path (#17) ───────────────────────────────────

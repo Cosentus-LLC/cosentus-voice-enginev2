@@ -22,6 +22,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from app.bot.bot import (
+    _FLOW_NO_INPUT_ATTEMPTS_STATE_KEY,
+    _FLOW_USER_IDLE_TIMEOUT_SECS,
     _build_dialin_settings,
     _compose_system_prompt,
     _extract_session_id,
@@ -197,6 +199,7 @@ def _record_llm_context(mocks):
         mocks["initial_messages"] = list(messages)
         ctx = MagicMock()
         ctx.messages = list(messages)
+        mocks["llm_context"] = ctx
         return ctx
 
     return _factory
@@ -953,6 +956,7 @@ def _flow_manager_mock() -> MagicMock:
     fm = MagicMock()
     fm.initialize = AsyncMock()
     fm.current_node = None
+    fm.state = {}
     return fm
 
 
@@ -2605,7 +2609,7 @@ class TestBuildAssistantParams:
         assert sc.llm is None
 
 
-async def _run_bot_capturing(settings, *, agent=None):
+async def _run_bot_capturing(settings, *, agent=None, flow_manager=None):
     """Run ``run_bot`` under the standard mocks, overriding Pipeline and
     LLMContextAggregatorPair with capturing mocks. Returns the captured
     ``LLMContextAggregatorPair`` mock, the Pipeline positional args, the
@@ -2613,9 +2617,24 @@ async def _run_bot_capturing(settings, *, agent=None):
     agent, mocks = _patch_run_bot_dependencies(agent=agent)
     transport = _make_transport_mock()
 
-    agg_pair_mock = MagicMock(
-        return_value=MagicMock(user=lambda: MagicMock(), assistant=lambda: MagicMock())
+    class _AggregatorDouble:
+        def __init__(self):
+            self.handlers = {}
+
+        def event_handler(self, event_name):
+            def _decorator(fn):
+                self.handlers[event_name] = fn
+                return fn
+
+            return _decorator
+
+    user_aggregator = _AggregatorDouble()
+    assistant_aggregator = _AggregatorDouble()
+    aggregator_pair = MagicMock(
+        user=lambda: user_aggregator,
+        assistant=lambda: assistant_aggregator,
     )
+    agg_pair_mock = MagicMock(return_value=aggregator_pair)
     pipeline_capture: dict = {}
 
     def _record_pipeline(processors, *a, **kw):
@@ -2625,6 +2644,10 @@ async def _run_bot_capturing(settings, *, agent=None):
     tts_sentinel = MagicMock(name="tts")
 
     patches = _start_run_bot_patches(agent, mocks, transport)
+    if flow_manager is not None:
+        patches.append(
+            patch("app.bot.bot.build_flow_manager", MagicMock(return_value=flow_manager))
+        )
     overrides = [
         patch("app.bot.bot.build_tts", MagicMock(return_value=tts_sentinel)),
         patch("app.bot.bot.Pipeline", MagicMock(side_effect=_record_pipeline)),
@@ -2640,10 +2663,15 @@ async def _run_bot_capturing(settings, *, agent=None):
 
     return {
         "agg_pair": agg_pair_mock,
+        "user_aggregator": user_aggregator,
+        "assistant_aggregator": assistant_aggregator,
         "pipeline_processors": pipeline_capture.get("processors"),
         "tts": tts_sentinel,
         "llm": mocks["llm"],
+        "llm_context": mocks["llm_context"],
         "pipeline_task_kwargs": mocks["pipeline_task_kwargs"],
+        "pipeline_task": mocks["pipeline_task"],
+        "flow_manager": flow_manager,
     }
 
 
@@ -2655,6 +2683,69 @@ async def test_aggregator_pair_gets_no_assistant_params_when_disabled():
     kwargs = cap["agg_pair"].call_args.kwargs
     assert kwargs["assistant_params"] is None
     assert kwargs["user_params"] is not None
+
+
+@pytest.mark.asyncio
+async def test_user_idle_timeout_disabled_when_flows_disabled():
+    cap = await _run_bot_capturing(_settings())
+
+    user_params = cap["agg_pair"].call_args.kwargs["user_params"]
+
+    assert user_params.user_idle_timeout == 0
+
+
+@pytest.mark.asyncio
+async def test_user_idle_timeout_enabled_when_flows_enabled():
+    fm = _flow_manager_mock()
+    cap = await _run_bot_capturing(
+        _settings(flows_enabled=True, identity_verification_keys="patient_name"),
+        flow_manager=fm,
+    )
+
+    user_params = cap["agg_pair"].call_args.kwargs["user_params"]
+
+    assert user_params.user_idle_timeout == _FLOW_USER_IDLE_TIMEOUT_SECS
+
+
+@pytest.mark.asyncio
+async def test_user_idle_handler_queues_llm_reprompt_when_flows_enabled():
+    fm = _flow_manager_mock()
+    cap = await _run_bot_capturing(
+        _settings(flows_enabled=True, identity_verification_keys="patient_name"),
+        flow_manager=fm,
+    )
+    handler = cap["user_aggregator"].handlers["on_user_turn_idle"]
+
+    await handler(cap["user_aggregator"])
+
+    cap["llm_context"].add_message.assert_called_once()
+    message = cap["llm_context"].add_message.call_args.args[0]
+    assert message["role"] == "user"
+    assert "did not respond" in message["content"]
+    assert fm.state[_FLOW_NO_INPUT_ATTEMPTS_STATE_KEY] == 1
+
+    queued = [
+        frame
+        for call in cap["pipeline_task"].queue_frames.await_args_list
+        for frame in call.args[0]
+    ]
+    assert any(isinstance(frame, LLMRunFrame) for frame in queued)
+
+
+@pytest.mark.asyncio
+async def test_user_idle_handler_ignores_call_ended():
+    fm = _flow_manager_mock()
+    fm.state["call_ended"] = True
+    cap = await _run_bot_capturing(
+        _settings(flows_enabled=True, identity_verification_keys="patient_name"),
+        flow_manager=fm,
+    )
+    handler = cap["user_aggregator"].handlers["on_user_turn_idle"]
+
+    await handler(cap["user_aggregator"])
+
+    cap["llm_context"].add_message.assert_not_called()
+    cap["pipeline_task"].queue_frames.assert_not_called()
 
 
 @pytest.mark.asyncio
