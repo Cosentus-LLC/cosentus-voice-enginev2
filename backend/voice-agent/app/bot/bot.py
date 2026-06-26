@@ -664,7 +664,10 @@ async def run_bot(
             payload = result.data or {"status": "ok"}
         else:
             payload = {"error": result.error or "tool failed"}
-        return payload, result.run_llm
+        run_llm = result.run_llm
+        if payload.get("call_ended") is True:
+            run_llm = False
+        return payload, run_llm
 
     def make_tool_handler(tool_name: str):
         async def tool_handler(params: FunctionCallParams) -> None:
@@ -826,7 +829,7 @@ async def run_bot(
                 has_flow_definition=bool(agent.flow_definition),
             )
         else:
-            await flow_manager.initialize(step_chain_head)
+            await flow_manager.initialize(_without_initial_flow_response(step_chain_head))
             logger.info(
                 "flows_step_chain_initialized",
                 call_id=call_id,
@@ -1245,6 +1248,17 @@ def _direction_fallback_policy(direction: str) -> _CallPolicy:
         include_ivr=True,
         source="direction_fallback",
     )
+
+
+def _without_initial_flow_response(node: dict[str, Any]) -> dict[str, Any]:
+    """Return a first-node copy that cannot race the explicit opener.
+
+    Direct, non-gated flows are initialized before the caller has spoken and
+    before ``deliver_opener_if_needed`` runs. Their head node must not queue
+    its own LLMRunFrame; the documented opener modes remain the only initial
+    response source.
+    """
+    return {**node, "respond_immediately": False}
 
 
 def _resolve_call_policy(agent: AgentConfig, direction: str) -> _CallPolicy:

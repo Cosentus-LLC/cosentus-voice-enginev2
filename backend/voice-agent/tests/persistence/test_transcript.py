@@ -59,6 +59,30 @@ async def test_assistant_turn_basic_fields():
 
 
 @pytest.mark.asyncio
+async def test_assistant_turn_repairs_known_stream_delta_word_joins():
+    accum = TranscriptAccumulator()
+    await accum.append_assistant_turn(
+        "Hi, I'm callingon behalf of Cosentus tocheck getthe claim. "
+        "I need a bitmore detail about thereason and dothat today; everythingI need mustbe clear."
+    )
+
+    assert (
+        accum.to_list()[0]["content"]
+        == "Hi, I'm calling on behalf of Cosentus to check get the claim. "
+        "I need a bit more detail about the reason and do that today; "
+        "everything I need must be clear."
+    )
+
+
+@pytest.mark.asyncio
+async def test_user_turn_repairs_word_to_i_boundary():
+    accum = TranscriptAccumulator()
+    await accum.append_user_turn("Yes, thatis everythingI have.")
+
+    assert accum.to_list()[0]["content"] == "Yes, thatis everything I have."
+
+
+@pytest.mark.asyncio
 async def test_explicit_timestamp_preserved():
     """When the producer passes ``timestamp``, the accumulator preserves it."""
     accum = TranscriptAccumulator()
@@ -80,6 +104,18 @@ async def test_tool_turn_success_format():
         status="success",
     )
     assert accum.to_list()[0]["content"] == "transfer_call(target='billing') → success"
+
+
+@pytest.mark.asyncio
+async def test_tool_turn_does_not_apply_dialogue_spacing_repairs():
+    accum = TranscriptAccumulator()
+    await accum.append_tool_turn(
+        tool_name="audit",
+        arguments={"value": "callingon"},
+        status="success",
+    )
+
+    assert accum.to_list()[0]["content"] == "audit(value='callingon') → success"
 
 
 @pytest.mark.asyncio

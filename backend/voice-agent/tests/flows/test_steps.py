@@ -1128,6 +1128,24 @@ class TestStepTools:
         assert payload == {"ok": True}
         assert next_node is None  # tools don't transition the flow
 
+    @pytest.mark.asyncio
+    async def test_terminal_step_tool_marks_call_ended_without_transition(self):
+        core = AsyncMock(return_value=({"call_ended": True, "reason": "done"}, False))
+        chain = build_step_chain(
+            run_tool_core=core,
+            registry=_registry(["end_call"]),
+            hydrated_system="X",
+        )
+        fm = _fm()
+        tool_fn = next(f for f in chain["functions"] if f.name == "end_call")
+
+        payload, next_node = await tool_fn.handler({"reason": "done"}, fm)
+
+        core.assert_awaited_once_with("end_call", {"reason": "done"})
+        assert payload == {"call_ended": True, "reason": "done"}
+        assert fm.state["call_ended"] is True
+        assert next_node is None
+
     def test_tools_advertised_at_every_step(self):
         chain = _chain(tool_names=["end_call", "transfer_call"])
         # navigate: 2 tools + 1 advance.

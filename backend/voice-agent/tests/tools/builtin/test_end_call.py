@@ -66,16 +66,12 @@ class TestEndCallExecutor:
         assert isinstance(frame, EndTaskFrame)
         assert "Customer satisfied" in str(frame.reason or "")
 
-    async def test_run_llm_default_true(self):
-        """v2 fix: previously ``run_llm=False``. With ``EndTaskFrame``
-        upstream the pipeline drains gracefully; letting the LLM
-        re-fire is fine and lets Claude record the end-call decision
-        in conversation history before shutdown.
-        """
+    async def test_run_llm_false_on_success(self):
+        """Once ``EndTaskFrame`` is queued, the call is terminal."""
         ctx, _ = _ctx()
         result = await end_call_executor({}, ctx)
         assert result.status is ToolStatus.SUCCESS
-        assert result.run_llm is True
+        assert result.run_llm is False
 
     async def test_default_reason_when_not_provided(self):
         ctx, _ = _ctx()

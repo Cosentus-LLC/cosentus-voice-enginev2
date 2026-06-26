@@ -426,8 +426,10 @@ def _tool_functions(registry: Any, run_tool_core: RunToolCore) -> list[FlowsFunc
         schema = spec.to_function_schema()
 
         def make_flow_tool_handler(tool_name: str):
-            async def flow_tool_handler(args: FlowArgs, _flow_manager: FlowManager):
+            async def flow_tool_handler(args: FlowArgs, flow_manager: FlowManager):
                 payload, _run_llm = await run_tool_core(tool_name, dict(args))
+                if isinstance(payload, dict) and payload.get("call_ended") is True:
+                    flow_manager.state["call_ended"] = True
                 return payload, None
 
             return flow_tool_handler

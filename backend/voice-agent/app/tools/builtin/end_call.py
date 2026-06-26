@@ -21,15 +21,11 @@ This is the same architectural realignment that closed Phase 2
 for hangup paths in ``app/bot/bot.py`` (where ``queue_frames(
 [EndFrame()])`` was replaced by ``task.cancel(reason=...)``).
 
-``cancel_on_interruption`` and ``run_llm`` use Pipecat's documented
-defaults (``True``, ``True``). Earlier v2 revisions set them to
-``False`` to support a homegrown "narrate before tool, no follow-
-up" pattern that turned out to be incompatible with the
-function-call lifecycle (the assistant text was discarded by the
-aggregator's interruption handler before being committed to
-context). The ``run_llm=True`` default lets Claude record the
-end-call decision in conversation history before the pipeline
-drains.
+``cancel_on_interruption`` uses Pipecat's documented default
+(``True``), but the result explicitly sets ``run_llm=False``. Once
+``EndTaskFrame`` is queued, the call is terminal; a follow-up LLM
+run can leak step machinery or summaries after the goodbye while
+the pipeline is draining.
 
 The ``reason`` argument is audit-log only — the call ends
 regardless of value. We accept it to keep the LLM's tool-use
@@ -94,7 +90,7 @@ async def end_call_executor(
         call_id=context.call_id,
     )
 
-    return success_result(data={"reason": reason, "call_ended": True})
+    return success_result(data={"reason": reason, "call_ended": True}, run_llm=False)
 
 
 END_CALL = ToolDefinition(
