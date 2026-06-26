@@ -32,10 +32,14 @@ from app.flows.steps import (
     GREETING_STATE_KEY,
     NAVIGATE,
     NAVIGATE_BASE_TASK,
+    NEUTRAL_ADVANCE_NAME,
+    NEUTRAL_ASSIST,
+    NEUTRAL_CLOSE,
     REFERENCE_NUMBER,
     STEP_COMPLETION_ROLE_RULE,
     STEPS,
     WRAP,
+    _build_default_step_chain,
     build_navigate_task,
     build_step_chain,
     identity_gate_required_for_direction,
@@ -83,6 +87,7 @@ def _chain(
     flow_definition: dict | None = None,
     greeting_state: dict[str, bool] | None = None,
     include_ivr: bool = True,
+    agent_id: str = "",
 ):
     return build_step_chain(
         run_tool_core=AsyncMock(return_value=({"status": "ok"}, False)),
@@ -91,6 +96,38 @@ def _chain(
         flow_definition=flow_definition,
         greeting_state=greeting_state,
         include_ivr=include_ivr,
+        agent_id=agent_id,
+    )
+
+
+def _default_chain(
+    tool_names: list[str] | None = None,
+    hydrated_system: str = "HYDRATED-SYSTEM-PROMPT",
+    greeting_state: dict[str, bool] | None = None,
+    include_ivr: bool = True,
+    ivr_path: str = "",
+    ivr_goal: str = "",
+    knowledge_warmer=None,
+    knowledge_context=None,
+):
+    """Build the claim 8-step chain directly.
+
+    Since #21, ``build_step_chain`` no longer routes a missing/invalid
+    ``flow_definition`` to the claim chain — it falls back to the neutral
+    chain. ``_build_default_step_chain`` is retained as the claim-flow
+    seed-shape reference, so the claim-chain ordering/greeting/IVR/prefetch
+    tests target it directly here.
+    """
+    return _build_default_step_chain(
+        run_tool_core=AsyncMock(return_value=({"status": "ok"}, False)),
+        registry=_registry(tool_names or []),
+        hydrated_system=hydrated_system,
+        greeting_state=greeting_state,
+        include_ivr=include_ivr,
+        ivr_path=ivr_path,
+        ivr_goal=ivr_goal,
+        knowledge_warmer=knowledge_warmer,
+        knowledge_context=knowledge_context,
     )
 
 
@@ -242,7 +279,7 @@ class TestDirectionAwareStart:
 class TestOrdering:
     @pytest.mark.asyncio
     async def test_chain_is_linear_and_in_step_order(self):
-        node = _chain()
+        node = _default_chain()
         fm = _fm()
         names: list[str] = []
         while True:
@@ -261,7 +298,7 @@ class TestOrdering:
         assert names[-1] == WRAP
 
     def test_first_node_is_navigate(self):
-        assert _chain()["name"] == NAVIGATE
+        assert _default_chain()["name"] == NAVIGATE
 
     def test_terminal_step_has_no_advance(self):
         # wrap advertises tools (if any) but no advance function.
@@ -272,7 +309,7 @@ class TestOrdering:
 
 class TestIvrApplicability:
     def test_default_no_ivr_chain_starts_at_greet(self):
-        node = _chain(include_ivr=False, greeting_state={GREETING_STATE_KEY: False})
+        node = _default_chain(include_ivr=False, greeting_state={GREETING_STATE_KEY: False})
 
         assert node["name"] == GREET
         assert node["role_message"].endswith(STEP_COMPLETION_ROLE_RULE)
@@ -280,7 +317,7 @@ class TestIvrApplicability:
 
     @pytest.mark.asyncio
     async def test_default_no_ivr_chain_omits_navigate_in_walk(self):
-        node = _chain(include_ivr=False, greeting_state={GREETING_STATE_KEY: False})
+        node = _default_chain(include_ivr=False, greeting_state={GREETING_STATE_KEY: False})
         fm = _fm()
         names: list[str] = []
 
@@ -296,7 +333,7 @@ class TestIvrApplicability:
         assert names == [step.name for step in STEPS[1:]]
 
     def test_default_no_ivr_chain_respects_existing_greeting_state(self):
-        node = _chain(include_ivr=False, greeting_state={GREETING_STATE_KEY: True})
+        node = _default_chain(include_ivr=False, greeting_state={GREETING_STATE_KEY: True})
 
         assert node["name"] == CONFIRM_DENIAL
         task_blob = _message_blob(node)
@@ -353,7 +390,7 @@ class TestGreetingState:
     @pytest.mark.asyncio
     async def test_speak_first_state_skips_greet_step_after_navigate(self):
         greeting_state = {GREETING_STATE_KEY: True}
-        node = _chain(greeting_state=greeting_state)
+        node = _default_chain(greeting_state=greeting_state)
 
         _result, next_node = await _advance_fn(node).handler({}, _fm())
 
@@ -366,7 +403,7 @@ class TestGreetingState:
     async def test_user_first_state_enters_greet_once_then_marks_greeted(self):
         greeting_state = {GREETING_STATE_KEY: False}
         fm = _fm()
-        node = _chain(greeting_state=greeting_state)
+        node = _default_chain(greeting_state=greeting_state)
 
         _result, greet_node = await _advance_fn(node).handler({}, fm)
 
@@ -383,7 +420,7 @@ class TestGreetingState:
     @pytest.mark.asyncio
     async def test_no_regreeting_note_carries_across_later_default_steps(self):
         greeting_state = {GREETING_STATE_KEY: True}
-        node = _chain(greeting_state=greeting_state)
+        node = _default_chain(greeting_state=greeting_state)
         fm = _fm()
         visited: list[str] = []
 
@@ -411,7 +448,7 @@ class TestGreetingState:
 
     @pytest.mark.asyncio
     async def test_default_chain_without_greeting_state_preserves_existing_order(self):
-        _result, next_node = await _advance_fn(_chain()).handler({}, _fm())
+        _result, next_node = await _advance_fn(_default_chain()).handler({}, _fm())
 
         assert next_node["name"] == GREET
 
@@ -448,20 +485,42 @@ class TestDataDrivenFlow:
         assert node["functions"] == []
 
     @pytest.mark.asyncio
-    async def test_no_flow_definition_uses_default_step_order(self):
-        node = _chain(flow_definition=None)
+    async def test_no_flow_definition_uses_neutral_fallback(self, mocker):
+        # #21: a missing flow_definition runs the NEUTRAL chain (assist →
+        # close) driven by the agent's own persona — never the claim 8-step.
+        mock_logger = mocker.patch("app.flows.steps.logger")
+        node = _chain(flow_definition=None, agent_id="agent-xyz")
         fm = _fm()
         names: list[str] = []
         while True:
             names.append(node["name"])
             if not node["functions"]:
                 break
-            args = {"reference_number": "REF-1"} if node["name"] == REFERENCE_NUMBER else {}
-            _result, node = await _advance_fn(node).handler(args, fm)
+            _result, node = await _advance_fn(node).handler({}, fm)
+            assert node is not None
 
-        assert names == [s.name for s in STEPS]
+        assert names == [NEUTRAL_ASSIST, NEUTRAL_CLOSE]
+        # No claim step leaks into the neutral fallback.
+        claim_names = {s.name for s in STEPS}
+        assert not (set(names) & claim_names)
+        assert NAVIGATE not in names
+        assert REFERENCE_NUMBER not in names
+        mock_logger.warning.assert_any_call(
+            "flow_definition_missing_neutral_fallback",
+            agent_id="agent-xyz",
+            reason="missing",
+        )
 
-    def test_malformed_flow_definition_falls_back_to_default_and_logs_warning(self, mocker):
+    def test_neutral_fallback_head_resets_and_loads_agent_persona(self):
+        node = _chain(flow_definition=None, hydrated_system="AGENT-OWN-PERSONA")
+
+        assert node["name"] == NEUTRAL_ASSIST
+        assert node["context_strategy"].strategy == ContextStrategy.RESET
+        assert "AGENT-OWN-PERSONA" in node["role_message"]
+        assert node["role_message"].endswith(STEP_COMPLETION_ROLE_RULE)
+        assert _advance_fn(node).name == NEUTRAL_ADVANCE_NAME
+
+    def test_malformed_flow_definition_uses_neutral_fallback_and_logs_warning(self, mocker):
         mock_logger = mocker.patch("app.flows.steps.logger")
         flow = {
             "version": 1,
@@ -469,15 +528,99 @@ class TestDataDrivenFlow:
             "nodes": [{"id": "intro", "type": "ask"}],
         }
 
-        chain = _chain(flow_definition=flow)
+        chain = _chain(flow_definition=flow, agent_id="agent-xyz")
 
-        assert chain["name"] == NAVIGATE
-        mock_logger.warning.assert_called_with(
+        # Neutral fallback — NOT the claim chain.
+        assert chain["name"] == NEUTRAL_ASSIST
+        # The invalid-flow detail log still fires (why it was rejected) ...
+        mock_logger.warning.assert_any_call(
             "flow_definition_invalid_default_flow",
             reason="validation_error",
             error_count=ANY,
             errors=ANY,
         )
+        # ... alongside the action-taken log (neutral fallback + agent_id).
+        mock_logger.warning.assert_any_call(
+            "flow_definition_missing_neutral_fallback",
+            agent_id="agent-xyz",
+            reason="invalid",
+        )
+
+    @pytest.mark.asyncio
+    async def test_neutral_close_node_is_terminal_and_bounds_context(self):
+        node = _chain(flow_definition=None)
+
+        _result, close = await _advance_fn(node).handler({}, _fm())
+
+        assert close["name"] == NEUTRAL_CLOSE
+        # Terminal: no advance (and no tools were registered) → empty functions.
+        assert close["functions"] == []
+        assert close["context_strategy"].strategy == ContextStrategy.RESET_WITH_SUMMARY
+
+    def test_neutral_nodes_advertise_call_tools(self):
+        # end_call (and every other registered tool) is advertised on the
+        # neutral chain, so the agent can still end/transfer the call.
+        node = _chain(tool_names=["end_call", "transfer_call"], flow_definition=None)
+
+        assert "end_call" in {fn.name for fn in node["functions"]}
+        assert NEUTRAL_ADVANCE_NAME in {fn.name for fn in node["functions"]}
+
+    def test_no_ivr_ambiguous_ivr_start_uses_neutral_fallback(self, mocker):
+        # An ``ivr: true`` start node with >1 outgoing target on a no-IVR call
+        # cannot be unambiguously skipped — #21 routes it to the NEUTRAL chain
+        # (previously: the claim 8-step).
+        mock_logger = mocker.patch("app.flows.steps.logger")
+        flow = {
+            "version": 1,
+            "start": "ivr_menu",
+            "nodes": [
+                {
+                    "id": "ivr_menu",
+                    "type": "branch",
+                    "ivr": True,
+                    "branches": [{"when": "claims line", "to": "intro"}],
+                    "fallback": "other",
+                },
+                {"id": "intro", "type": "ask", "say": "Confirm denial.", "next": "done"},
+                {"id": "other", "type": "ask", "say": "Confirm eligibility.", "next": "done"},
+                {"id": "done", "type": "end"},
+            ],
+        }
+
+        node = _chain(
+            flow_definition=flow,
+            include_ivr=False,
+            greeting_state={GREETING_STATE_KEY: False},
+        )
+
+        assert node["name"] == NEUTRAL_ASSIST
+        assert NAVIGATE not in node["name"]
+        mock_logger.warning.assert_any_call(
+            "flow_definition_no_ivr_start_ambiguous_neutral_fallback",
+            node_id="ivr_menu",
+            target_count=2,
+        )
+
+    @pytest.mark.asyncio
+    async def test_seeded_claim_flow_definition_runs_full_order_unaffected(self):
+        # A seeded Claims-style flow_definition still drives its full order;
+        # #21 only changes the missing/invalid path, never a valid flow.
+        node = _chain(flow_definition=_custom_flow_starting_at_navigate())
+        fm = _fm()
+        names: list[str] = []
+        while True:
+            names.append(node["name"])
+            if not node["functions"]:
+                break
+            args = {CALL_REFERENCE_FIELD: "REF-1"} if node["name"] == REFERENCE_NUMBER else {}
+            if node["name"] == "route_submission":
+                args = {"branch_to": "fax_path"}
+            _result, node = await _advance_fn(node).handler(args, fm)
+            assert node is not None
+
+        assert names[0] == NAVIGATE
+        assert names[-1] == "done"
+        assert NEUTRAL_ASSIST not in names
 
     @pytest.mark.asyncio
     async def test_required_call_reference_blocks_blank_capture(self):
@@ -796,7 +939,7 @@ class TestDataDrivenFlow:
 class TestReferenceNumberRequired:
     @pytest.mark.asyncio
     async def test_blank_reference_number_blocks_advance(self):
-        node = await _walk_to(_chain(), REFERENCE_NUMBER)
+        node = await _walk_to(_default_chain(), REFERENCE_NUMBER)
         result, next_node = await _advance_fn(node).handler({"reference_number": "   "}, _fm())
         assert next_node is None  # stays on the node — un-skippable
         assert result["status"] == "missing"
@@ -804,14 +947,14 @@ class TestReferenceNumberRequired:
 
     @pytest.mark.asyncio
     async def test_missing_reference_number_blocks_advance(self):
-        node = await _walk_to(_chain(), REFERENCE_NUMBER)
+        node = await _walk_to(_default_chain(), REFERENCE_NUMBER)
         result, next_node = await _advance_fn(node).handler({}, _fm())
         assert next_node is None
         assert result["status"] == "missing"
 
     @pytest.mark.asyncio
     async def test_present_reference_number_advances_to_wrap_and_records_state(self):
-        node = await _walk_to(_chain(), REFERENCE_NUMBER)
+        node = await _walk_to(_default_chain(), REFERENCE_NUMBER)
         fm = _fm()
         result, next_node = await _advance_fn(node).handler({"reference_number": "REF-9"}, fm)
         assert next_node is not None
@@ -823,7 +966,7 @@ class TestReferenceNumberRequired:
     async def test_cannot_reach_wrap_without_a_reference_number(self):
         # Walk supplying NO args anywhere: the call must stall at
         # reference_number and never reach wrap.
-        node = _chain()
+        node = _default_chain()
         fm = _fm()
         visited: list[str] = []
         for _ in range(len(STEPS) + 2):
@@ -840,7 +983,7 @@ class TestReferenceNumberRequired:
 
     @pytest.mark.asyncio
     async def test_reference_number_advance_requires_the_field(self):
-        node = await _walk_to(_chain(), REFERENCE_NUMBER)
+        node = await _walk_to(_default_chain(), REFERENCE_NUMBER)
         advance = _advance_fn(node)
         assert advance.required == ["reference_number"]
         assert "reference_number" in advance.properties
@@ -910,7 +1053,7 @@ class TestInternalDirectiveLeakage:
             "Conversation summary so far",
             "Here's a summary of the conversation",
         }
-        node = _chain()
+        node = _default_chain()
         fm = _fm()
 
         while True:
@@ -924,7 +1067,7 @@ class TestInternalDirectiveLeakage:
             _result, node = await _advance_fn(node).handler(args, fm)
 
     def test_step_role_message_preserves_prompt_and_uses_generic_rule(self):
-        chain = _chain(hydrated_system="HYDRATED")
+        chain = _default_chain(hydrated_system="HYDRATED")
         role_message = chain["role_message"]
 
         assert "HYDRATED" in role_message
@@ -1007,8 +1150,8 @@ class TestNavigateTask:
         assert build_navigate_task() == NAVIGATE_BASE_TASK
         assert build_navigate_task("", "") == NAVIGATE_BASE_TASK
         assert build_navigate_task("   ", "   ") == NAVIGATE_BASE_TASK
-        # And the chain's first node reflects that verbatim.
-        assert _navigate_task(_chain()) == NAVIGATE_BASE_TASK
+        # And the claim chain's first node reflects that verbatim.
+        assert _navigate_task(_default_chain()) == NAVIGATE_BASE_TASK
 
     def test_includes_verified_path_when_present(self):
         path = "1. Provider services — press 3\n2. Claims — press 1"
@@ -1045,14 +1188,8 @@ class TestNavigateTask:
         assert "1. press 3" in task
 
     @pytest.mark.asyncio
-    async def test_build_step_chain_threads_path_into_navigate_node_only(self):
-        chain = build_step_chain(
-            run_tool_core=AsyncMock(return_value=({"status": "ok"}, False)),
-            registry=_registry([]),
-            hydrated_system="SYS",
-            ivr_path="1. Claims — press 1",
-            ivr_goal="Reach a rep",
-        )
+    async def test_default_chain_threads_path_into_navigate_node_only(self):
+        chain = _default_chain(ivr_path="1. Claims — press 1", ivr_goal="Reach a rep")
         assert chain["name"] == NAVIGATE
         nav_task = _navigate_task(chain)
         assert "1. Claims — press 1" in nav_task
@@ -1063,12 +1200,7 @@ class TestNavigateTask:
 
     @pytest.mark.asyncio
     async def test_verified_path_mentions_wait_instructions_when_present(self):
-        chain = build_step_chain(
-            run_tool_core=AsyncMock(return_value=({"status": "ok"}, False)),
-            registry=_registry([]),
-            hydrated_system="SYS",
-            ivr_path="1. Claims — press 1; wait 2.0s for the next IVR prompt",
-        )
+        chain = _default_chain(ivr_path="1. Claims — press 1; wait 2.0s for the next IVR prompt")
 
         assert "wait 2.0s for the next IVR prompt" in _navigate_task(chain)
         assert "honor any wait instructions" in _navigate_task(chain)
@@ -1079,7 +1211,7 @@ class TestNavigateTask:
 class TestKnowledgeTaskHints:
     @pytest.mark.asyncio
     async def test_build_step_chain_without_knowledge_keeps_deadline_task_verbatim(self):
-        chain = _chain()
+        chain = _default_chain()
         deadline = await _walk_to(chain, DEADLINE)
 
         expected = next(step.task for step in STEPS if step.name == DEADLINE)
@@ -1093,10 +1225,7 @@ class TestKnowledgeTaskHints:
             similarity=1.0,
             query="timely filing limit for Aetna",
         )
-        chain = build_step_chain(
-            run_tool_core=AsyncMock(return_value=({"status": "ok"}, False)),
-            registry=_registry([]),
-            hydrated_system="SYS",
+        chain = _default_chain(
             knowledge_warmer=warmer,
             knowledge_context=PrefetchContext(payer="Aetna"),
         )
@@ -1111,10 +1240,7 @@ class TestKnowledgeTaskHints:
     async def test_deadline_step_miss_leaves_task_unchanged_and_continues(self):
         warmer = MagicMock()
         warmer.live_read.return_value = None
-        chain = build_step_chain(
-            run_tool_core=AsyncMock(return_value=({"status": "ok"}, False)),
-            registry=_registry([]),
-            hydrated_system="SYS",
+        chain = _default_chain(
             knowledge_warmer=warmer,
             knowledge_context=PrefetchContext(payer="Aetna"),
         )
@@ -1127,10 +1253,7 @@ class TestKnowledgeTaskHints:
     @pytest.mark.asyncio
     async def test_knowledge_live_read_not_called_when_no_payer_context(self):
         warmer = MagicMock()
-        chain = build_step_chain(
-            run_tool_core=AsyncMock(return_value=({"status": "ok"}, False)),
-            registry=_registry([]),
-            hydrated_system="SYS",
+        chain = _default_chain(
             knowledge_warmer=warmer,
             knowledge_context=PrefetchContext(payer=None),
         )
