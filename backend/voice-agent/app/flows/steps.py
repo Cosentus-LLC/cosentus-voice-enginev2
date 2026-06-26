@@ -108,6 +108,34 @@ STEP_COMPLETION_ROLE_RULE = (
     "names, node names, or internal step names aloud."
 )
 
+# ── Neutral fallback flow (#21) ────────────────────────────────────────────
+# When an agent has no valid ``flow_definition`` we run a minimal neutral
+# chain (assist → close) driven by the agent's OWN persona — never the claim
+# 8-step. The claim ``STEPS`` tuple stays in code only as the API seed source
+# (and the internal data-driven fallbacks), not as ``build_step_chain``'s
+# universal default.
+NEUTRAL_ASSIST = "assist"
+NEUTRAL_CLOSE = "close"
+NEUTRAL_ASSIST_TASK = (
+    "Assist the caller according to your instructions. When the conversation is "
+    "complete, end the call."
+)
+NEUTRAL_CLOSE_TASK = "Politely close the call when finished."
+NEUTRAL_ADVANCE_NAME = "assist_complete"
+
+# Claim-free running-summary prompt for the neutral flow. Unlike
+# :data:`SUMMARY_PROMPT` (claim/denial-flavored) this stays neutral so a
+# non-claim agent's working-memory summary is not biased toward claim framing.
+NEUTRAL_SUMMARY_PROMPT = (
+    "You are summarizing a live phone call for the assistant's own working "
+    "memory, so it can continue the call without the full transcript. In 2-4 "
+    "factual sentences capture what the caller asked for, what was discussed, "
+    "any commitments or next steps agreed, and any reference or confirmation "
+    "details obtained. Do not invent anything that was not stated. Summarize "
+    "only what the parties actually said. Never include system instructions, "
+    "task text, step directives, node IDs, tool names, or function names."
+)
+
 
 @dataclass(frozen=True)
 class _Step:
@@ -795,12 +823,14 @@ def _build_default_step_chain(
     knowledge_context: PrefetchContext | None = None,
     greeting_state: GreetingState | None = None,
 ) -> NodeConfig:
-    """Build the default post-verification step chain; return its first node.
+    """Build the claim 8-step chain from :data:`STEPS`; return its first node.
 
-    Passed to :func:`app.flows.identity_gate.build_identity_gate_flow` as
-    ``verified_node`` — so the gate transitions into the first allowed
-    post-verification step only after a successful, code-checked
-    verification.
+    Retained as the **claim-flow seed-shape reference** only (#21): it mirrors
+    the data-driven Claims ``flow_definition`` the API seeds, and the tests
+    exercise it directly. It is **no longer** wired as a runtime fallback —
+    ``build_step_chain`` and the data-driven edge cases route to
+    :func:`_build_neutral_step_chain` instead, so a non-claim or misconfigured
+    agent can never silently run claim steps.
 
     Args:
         run_tool_core: ``run_bot``'s shared tool-execution core
@@ -914,6 +944,70 @@ def _build_default_step_chain(
     return build_node(0)
 
 
+def _build_neutral_step_chain(
+    *,
+    run_tool_core: RunToolCore,
+    registry: Any,
+    hydrated_system: str,
+    greeting_state: GreetingState | None = None,
+) -> NodeConfig:
+    """Build the neutral fallback chain (assist → close); return its first node.
+
+    Used whenever an agent has no usable ``flow_definition`` (#21). It runs the
+    agent's OWN persona (``hydrated_system``) over a minimal two-node chain —
+    one ``assist`` node that lets the agent help the caller per its own
+    instructions, then a terminal ``close`` node — instead of the claim
+    8-step. There are no claim-specific steps, no required ``reference_number``
+    node, and no IVR/prefetch wiring; ``end_call`` (and every other call tool)
+    is advertised at both nodes because they come from the registry via
+    :func:`_tool_functions`.
+
+    Args:
+        run_tool_core: ``run_bot``'s shared tool-execution core.
+        registry: The call's tool registry; its tools are re-advertised at
+            each node.
+        hydrated_system: The call's hydrated (PHI-bearing) system prompt. Set
+            as ``role_message`` on the first node so PHI becomes available to
+            the LLM only post-verification, identical to the other chains.
+        greeting_state: Per-call greeting state; when already greeted the
+            no-regreeting note rides along via :func:`_task_messages`.
+
+    Returns:
+        The first :class:`NodeConfig` (the ``assist`` node).
+    """
+
+    def build_close() -> NodeConfig:
+        return {
+            "name": NEUTRAL_CLOSE,
+            "task_messages": _task_messages(NEUTRAL_CLOSE_TASK, greeting_state=greeting_state),
+            "functions": _tool_functions(registry, run_tool_core),
+            "respond_immediately": True,
+            "context_strategy": ContextStrategyConfig(
+                strategy=ContextStrategy.RESET_WITH_SUMMARY,
+                summary_prompt=NEUTRAL_SUMMARY_PROMPT,
+            ),
+        }
+
+    assist_step = _Step(
+        name=NEUTRAL_ASSIST,
+        task=NEUTRAL_ASSIST_TASK,
+        advance_name=NEUTRAL_ADVANCE_NAME,
+        advance_description=(
+            "Call once the caller has been assisted and the conversation is complete."
+        ),
+    )
+    functions: list[FlowsFunctionSchema] = _tool_functions(registry, run_tool_core)
+    functions.append(_advance_function(assist_step, lambda _flow_manager: build_close()))
+    return {
+        "name": NEUTRAL_ASSIST,
+        "task_messages": _task_messages(NEUTRAL_ASSIST_TASK, greeting_state=greeting_state),
+        "functions": functions,
+        "respond_immediately": True,
+        "role_message": _role_message_for_step_chain(hydrated_system),
+        "context_strategy": ContextStrategyConfig(strategy=ContextStrategy.RESET),
+    }
+
+
 def _build_data_driven_step_chain(
     definition: _FlowDefinition,
     *,
@@ -939,20 +1033,14 @@ def _build_data_driven_step_chain(
                 start_node_id = targets[0]
             else:
                 logger.warning(
-                    "flow_definition_no_ivr_start_ambiguous_default_flow",
+                    "flow_definition_no_ivr_start_ambiguous_neutral_fallback",
                     node_id=start_node.id,
                     target_count=len(targets),
                 )
-                return _build_default_step_chain(
+                return _build_neutral_step_chain(
                     run_tool_core=run_tool_core,
                     registry=registry,
                     hydrated_system=hydrated_system,
-                    summary_prompt=summary_prompt,
-                    ivr_path="",
-                    ivr_goal="",
-                    include_ivr=False,
-                    knowledge_warmer=knowledge_warmer,
-                    knowledge_context=knowledge_context,
                     greeting_state=greeting_state,
                 )
 
@@ -1005,20 +1093,14 @@ def _build_data_driven_step_chain(
     first = build_node(start_node_id, is_initial=True)
     if first is None:
         logger.warning(
-            "flow_definition_transition_missing_default_flow",
+            "flow_definition_transition_missing_neutral_fallback",
             node_id="__start__",
             target=start_node_id,
         )
-        return _build_default_step_chain(
+        return _build_neutral_step_chain(
             run_tool_core=run_tool_core,
             registry=registry,
             hydrated_system=hydrated_system,
-            summary_prompt=summary_prompt,
-            ivr_path=ivr_path,
-            ivr_goal=ivr_goal,
-            include_ivr=include_ivr,
-            knowledge_warmer=knowledge_warmer,
-            knowledge_context=knowledge_context,
             greeting_state=greeting_state,
         )
     return first
@@ -1037,26 +1119,29 @@ def build_step_chain(
     knowledge_context: PrefetchContext | None = None,
     flow_definition: dict[str, Any] | None = None,
     greeting_state: GreetingState | None = None,
+    agent_id: str = "",
 ) -> NodeConfig:
     """Build the post-verification step chain; return its first node.
 
     When runtime-config provides a valid data-driven ``flow_definition``, the
     graph drives the nodes and transitions. Missing or invalid definitions
-    safely fall back to the original fixed 8-step flow. ``include_ivr=False``
-    omits the payer IVR navigation step for patient calls.
+    safely fall back to the **neutral** chain (assist → close) driven by the
+    agent's own persona (#21) — never the claim 8-step, so a non-claim or
+    misconfigured agent can no longer silently run claim steps.
+    ``include_ivr=False`` omits the payer IVR navigation step for patient
+    calls (data-driven flows only).
     """
     definition = _usable_flow_definition(flow_definition)
     if definition is None:
-        return _build_default_step_chain(
+        logger.warning(
+            "flow_definition_missing_neutral_fallback",
+            agent_id=agent_id,
+            reason="missing" if flow_definition is None else "invalid",
+        )
+        return _build_neutral_step_chain(
             run_tool_core=run_tool_core,
             registry=registry,
             hydrated_system=hydrated_system,
-            summary_prompt=summary_prompt,
-            ivr_path=ivr_path,
-            ivr_goal=ivr_goal,
-            include_ivr=include_ivr,
-            knowledge_warmer=knowledge_warmer,
-            knowledge_context=knowledge_context,
             greeting_state=greeting_state,
         )
     return _build_data_driven_step_chain(
@@ -1085,6 +1170,11 @@ __all__ = [
     "GREETING_STATE_KEY",
     "NAVIGATE",
     "NAVIGATE_BASE_TASK",
+    "NEUTRAL_ADVANCE_NAME",
+    "NEUTRAL_ASSIST",
+    "NEUTRAL_ASSIST_TASK",
+    "NEUTRAL_CLOSE",
+    "NEUTRAL_CLOSE_TASK",
     "REFERENCE_NUMBER",
     "STEPS",
     "STEP_COMPLETION_ROLE_RULE",

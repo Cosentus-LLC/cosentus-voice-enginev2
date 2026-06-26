@@ -34,7 +34,7 @@ from app.config.agent_config import AgentConfig, ToolConfig
 from app.config.settings import Settings
 from app.flows import GREETING_STATE_KEY, PRE_VERIFICATION_ROLE_MESSAGE
 from app.flows.identity_gate import IDENTITY_VERIFICATION_ROLE_RULE
-from app.flows.steps import NAVIGATE, STEP_COMPLETION_ROLE_RULE
+from app.flows.steps import NAVIGATE, NEUTRAL_ASSIST, STEP_COMPLETION_ROLE_RULE
 from app.hydration.hydrator import MissingRequiredCaseDataError
 from app.tools.result import ToolResult, ToolStatus
 from pipecat.frames.frames import LLMRunFrame, TTSSpeakFrame
@@ -1312,6 +1312,7 @@ async def test_run_bot_passes_agent_flow_definition_to_step_chain():
 
     step_chain.assert_called_once()
     assert step_chain.call_args.kwargs["flow_definition"] == flow_definition
+    assert step_chain.call_args.kwargs["agent_id"] == "test-agent-id"
 
 
 @pytest.mark.asyncio
@@ -1419,8 +1420,9 @@ async def test_flag_on_gate_is_phi_free_and_verified_node_is_step_chain(monkeypa
     assert IDENTITY_VERIFICATION_ROLE_RULE in gate_node["role_message"]
 
     # Verified node = the step-chain head; it restores the hydrated prompt.
+    # The test agent has no flow_definition, so this is the #21 neutral head.
     verified = capture["verified_node"]
-    assert verified["name"] == NAVIGATE
+    assert verified["name"] == NEUTRAL_ASSIST
     assert "You are a test agent." in verified["role_message"]  # hydrated system prompt
     assert STEP_COMPLETION_ROLE_RULE in verified["role_message"]
     # And the two are distinct — PHI is not present pre-verification.
