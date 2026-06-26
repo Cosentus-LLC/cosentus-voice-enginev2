@@ -789,6 +789,7 @@ async def run_bot(
             knowledge_context=knowledge_context,
             flow_definition=agent.flow_definition,
             greeting_state=greeting_state,
+            agent_id=agent_id,
         )
         if gate_required:
             identity_keys = _resolve_identity_keys(agent, settings)
