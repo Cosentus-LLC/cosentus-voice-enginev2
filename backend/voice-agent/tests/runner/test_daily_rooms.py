@@ -165,6 +165,40 @@ async def test_create_inbound_room_without_recording_config_omits_recording_bloc
     assert "recordings_bucket" not in props
 
 
+@pytest.mark.asyncio
+async def test_create_inbound_room_recording_disabled_omits_recording_block():
+    captured = {}
+
+    class _MockResponse:
+        status = 200
+
+        async def text(self):
+            return json.dumps({"url": "https://x.daily.co/r1", "name": "r1"})
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    def _post(url, json=None, **kwargs):
+        captured["json"] = json
+        return _MockResponse()
+
+    session = MagicMock()
+    session.post = MagicMock(side_effect=_post)
+    session.closed = False
+    session.close = AsyncMock()
+
+    c = _client()
+    with patch.object(c, "_ensure_session", AsyncMock(return_value=session)):
+        await c.create_inbound_room(recording_enabled=False)
+
+    props = captured["json"]["properties"]
+    assert "enable_recording" not in props
+    assert "recordings_bucket" not in props
+
+
 # ── create_outbound_room ──────────────────────────────────────────────────
 
 
@@ -204,6 +238,41 @@ async def test_create_outbound_room_request_shape():
     assert "sip" not in props
     assert props["enable_recording"] == "cloud"
     assert props["recordings_bucket"]["allow_api_access"] is False
+
+
+@pytest.mark.asyncio
+async def test_create_outbound_room_recording_disabled_omits_recording_block():
+    captured = {}
+
+    class _MockResponse:
+        status = 200
+
+        async def text(self):
+            return json.dumps({"url": "https://x.daily.co/r2", "name": "r2"})
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    def _post(url, json=None, **kwargs):
+        captured["json"] = json
+        return _MockResponse()
+
+    session = MagicMock()
+    session.post = MagicMock(side_effect=_post)
+    session.closed = False
+    session.close = AsyncMock()
+
+    c = _client()
+    with patch.object(c, "_ensure_session", AsyncMock(return_value=session)):
+        await c.create_outbound_room(recording_enabled=False)
+
+    props = captured["json"]["properties"]
+    assert props["enable_dialout"] is True
+    assert "enable_recording" not in props
+    assert "recordings_bucket" not in props
 
 
 # ── create_browser_room ──────────────────────────────────────────────────
@@ -284,6 +353,41 @@ async def test_mint_token_request_shape_owner():
     props = captured["json"]["properties"]
     assert props["room_name"] == "room-abc"
     assert props["is_owner"] is True
+    assert "start_cloud_recording" not in props
+
+
+@pytest.mark.asyncio
+async def test_mint_token_start_recording_owner_sets_start_cloud_recording():
+    captured = {}
+
+    class _MockResponse:
+        status = 200
+
+        async def text(self):
+            return json.dumps({"token": "jwt.token.here"})
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    def _post(url, json=None, **kwargs):
+        captured["json"] = json
+        return _MockResponse()
+
+    session = MagicMock()
+    session.post = MagicMock(side_effect=_post)
+    session.closed = False
+    session.close = AsyncMock()
+
+    c = _client()
+    with patch.object(c, "_ensure_session", AsyncMock(return_value=session)):
+        await c.mint_token("room-abc", start_recording=True)
+
+    props = captured["json"]["properties"]
+    assert props["is_owner"] is True
+    assert props["start_cloud_recording"] is True
 
 
 @pytest.mark.asyncio
@@ -317,6 +421,41 @@ async def test_mint_token_supports_non_owner():
 
     assert token == "viewer.jwt"
     assert captured["json"]["properties"]["is_owner"] is False
+    assert "start_cloud_recording" not in captured["json"]["properties"]
+
+
+@pytest.mark.asyncio
+async def test_mint_token_start_recording_non_owner_omits_start_cloud_recording():
+    captured = {}
+
+    class _MockResponse:
+        status = 200
+
+        async def text(self):
+            return json.dumps({"token": "viewer.jwt"})
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    def _post(url, json=None, **kwargs):
+        captured["json"] = json
+        return _MockResponse()
+
+    session = MagicMock()
+    session.post = MagicMock(side_effect=_post)
+    session.closed = False
+    session.close = AsyncMock()
+
+    c = _client()
+    with patch.object(c, "_ensure_session", AsyncMock(return_value=session)):
+        await c.mint_token("room-x", is_owner=False, start_recording=True)
+
+    props = captured["json"]["properties"]
+    assert props["is_owner"] is False
+    assert "start_cloud_recording" not in props
 
 
 # ── Error paths ───────────────────────────────────────────────────────────

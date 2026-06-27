@@ -72,7 +72,7 @@ def _runtime_config_json() -> dict[str, Any]:
                 "settings": {"destination": "+15555550100"},
             },
         ],
-        "recording": {"enabled": True, "channels": 2},  # whole object extra
+        "recording": {"enabled": True, "channels": 2},
         "post_call_analyses": {
             "model": "claude-haiku-4-5-20251001",
             "fields": [
@@ -150,6 +150,9 @@ class TestAgentConfigParse:
         assert cfg.tools[1].type == "transfer_call"
         assert cfg.tools[1].settings == {"destination": "+15555550100"}
 
+        assert cfg.recording.enabled is True
+        assert cfg.recording.channels == 2
+
         assert cfg.post_call_analyses is not None
         assert cfg.post_call_analyses.model == "claude-haiku-4-5-20251001"
         assert len(cfg.post_call_analyses.fields) == 1
@@ -226,6 +229,23 @@ class TestAgentConfigParse:
         assert cfg.call_kind == "patient"
         assert cfg.model_dump(by_alias=True)["call_kind"] == "patient"
 
+    def test_recording_config_parses_enabled_and_channels(self):
+        cfg = AgentConfig.model_validate(
+            {
+                "name": "agent",
+                "recording": {"enabled": True, "channels": 1},
+            }
+        )
+
+        assert cfg.recording.enabled is True
+        assert cfg.recording.channels == 1
+
+    def test_recording_config_defaults_disabled_when_missing(self):
+        cfg = AgentConfig.model_validate({"name": "agent"})
+
+        assert cfg.recording.enabled is False
+        assert cfg.recording.channels == 2
+
     def test_base_instructions_default_empty(self):
         cfg = AgentConfig.model_validate({"name": "agent"})
 
@@ -292,7 +312,8 @@ class TestAgentConfigParse:
         assert "language" in body["stt"]
         assert "recording" in body
 
-        # All silently dropped — no exceptions.
+        # Known extras are silently dropped — no exceptions. Recording
+        # is modeled now, so it is retained.
         cfg = AgentConfig.model_validate(body)
 
         # And dumping the model produces only modeled fields.
@@ -305,7 +326,7 @@ class TestAgentConfigParse:
         assert "speed" not in dumped["tts"]["settings"]
         assert "provider" not in dumped["stt"]
         assert "language" not in dumped["stt"]
-        assert "recording" not in dumped
+        assert dumped["recording"] == {"enabled": True, "channels": 2}
 
 
 class TestUnknownFieldLogging:
@@ -350,8 +371,8 @@ class TestUnknownFieldLogging:
 
     def test_known_extra_fields_not_logged(self, mocker):
         # The realistic fixture carries every Entry-1 extra
-        # (llm.provider, tts.settings.style, recording, ...). None of
-        # them should produce a drift warning — they're allowlisted.
+        # (llm.provider, tts.settings.style, ...). Recording is now
+        # modeled. None should produce a drift warning.
         mock_logger = mocker.patch("app.config.agent_config.logger")
 
         AgentConfig.model_validate(_runtime_config_json())

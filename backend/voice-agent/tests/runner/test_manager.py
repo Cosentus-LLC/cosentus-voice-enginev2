@@ -13,9 +13,10 @@ milliseconds. Verifies:
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
+from app.config.agent_config import AgentConfig, RecordingConfig
 from app.config.settings import Settings
 from app.runner.daily_rooms import DailyRoom
 from app.runner.manager import (
@@ -36,6 +37,21 @@ def _settings(*, max_concurrent: int = 6) -> Settings:
     )
 
 
+def _agent(*, recording_enabled: bool = False) -> AgentConfig:
+    return AgentConfig(
+        name="test-agent",
+        recording=RecordingConfig(enabled=recording_enabled),
+    )
+
+
+@pytest.fixture(autouse=True)
+def agent_config_loader(mocker):
+    return mocker.patch(
+        "app.runner.manager.load_agent_config",
+        AsyncMock(return_value=_agent()),
+    )
+
+
 def _daily_mock(
     *,
     inbound_room: DailyRoom | None = None,
@@ -53,6 +69,7 @@ def _daily_mock(
     daily.create_outbound_room = AsyncMock(return_value=outbound_room)
     daily.create_browser_room = AsyncMock(return_value=browser_room)
     daily.mint_token = AsyncMock(return_value="bot.token.jwt")
+    daily.recording_configured = True
     # Default: every from_number resolves to a stub UUID so existing
     # outbound tests don't hit the unresolved-fallback path. Tests
     # that exercise the fallback override this explicitly.
@@ -200,6 +217,24 @@ async def test_reservation_released_when_post_reservation_step_raises():
 
 
 @pytest.mark.asyncio
+async def test_agent_config_load_failure_releases_reserved_slot(agent_config_loader):
+    agent_config_loader.side_effect = RuntimeError("config unavailable")
+    daily = _daily_mock()
+    m = PipelineManager(_settings(max_concurrent=6), daily, _protection_mock())
+
+    with pytest.raises(RuntimeError, match="config unavailable"):
+        await m.start_outbound(
+            agent_id="a",
+            target_number="+1",
+            from_number="+15559999999",
+        )
+
+    assert m.active_session_count == 0
+    daily.create_outbound_room.assert_not_awaited()
+    daily.mint_token.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_release_slot_is_no_op_for_real_task_entry():
     """``_release_slot`` must NOT remove a slot that's been replaced
     by a real task — that would orphan the running coroutine. Only
@@ -236,8 +271,8 @@ async def test_start_outbound_creates_room_and_spawns():
         assert isinstance(result, CallSpawnResult)
         assert result.room_name == "out"
         assert result.room_url == "https://x.daily.co/out"
-        daily.create_outbound_room.assert_awaited_once()
-        daily.mint_token.assert_awaited_once_with("out")
+        daily.create_outbound_room.assert_awaited_once_with(recording_enabled=False)
+        daily.mint_token.assert_awaited_once_with("out", start_recording=False)
 
         # Wait inside the patch context so the spawned task sees the
         # patched bot. The patch unwinds when this with-block exits.
@@ -340,6 +375,67 @@ async def test_start_outbound_falls_back_to_e164_on_unresolved_caller_id():
     assert body["dialout_settings"]["callerId"] == "+19998887777"
 
 
+@pytest.mark.asyncio
+async def test_start_outbound_starts_recording_when_agent_enabled_and_recording_configured(
+    agent_config_loader,
+):
+    agent_config_loader.return_value = _agent(recording_enabled=True)
+    daily = _daily_mock()
+    m = PipelineManager(_settings(), daily, _protection_mock())
+
+    with patch("app.runner.manager.bot", AsyncMock()):
+        await m.start_outbound(
+            agent_id="agent-1",
+            target_number="+19494360836",
+            from_number="+12098075018",
+        )
+        await asyncio.sleep(0.05)
+
+    daily.create_outbound_room.assert_awaited_once_with(recording_enabled=True)
+    daily.mint_token.assert_awaited_once_with("out", start_recording=True)
+
+
+@pytest.mark.asyncio
+async def test_start_outbound_does_not_record_when_agent_recording_disabled(
+    agent_config_loader,
+):
+    agent_config_loader.return_value = _agent(recording_enabled=False)
+    daily = _daily_mock()
+    m = PipelineManager(_settings(), daily, _protection_mock())
+
+    with patch("app.runner.manager.bot", AsyncMock()):
+        await m.start_outbound(
+            agent_id="agent-1",
+            target_number="+19494360836",
+            from_number="+12098075018",
+        )
+        await asyncio.sleep(0.05)
+
+    daily.create_outbound_room.assert_awaited_once_with(recording_enabled=False)
+    daily.mint_token.assert_awaited_once_with("out", start_recording=False)
+
+
+@pytest.mark.asyncio
+async def test_start_outbound_does_not_record_when_recording_not_configured(
+    agent_config_loader,
+):
+    agent_config_loader.return_value = _agent(recording_enabled=True)
+    daily = _daily_mock()
+    daily.recording_configured = False
+    m = PipelineManager(_settings(), daily, _protection_mock())
+
+    with patch("app.runner.manager.bot", AsyncMock()):
+        await m.start_outbound(
+            agent_id="agent-1",
+            target_number="+19494360836",
+            from_number="+12098075018",
+        )
+        await asyncio.sleep(0.05)
+
+    daily.create_outbound_room.assert_awaited_once_with(recording_enabled=False)
+    daily.mint_token.assert_awaited_once_with("out", start_recording=False)
+
+
 # ── start_browser ────────────────────────────────────────────────────────
 
 
@@ -358,6 +454,28 @@ async def test_start_browser_returns_viewer_token():
     assert result.viewer_token == "viewer.jwt"
     daily.create_browser_room.assert_awaited_once()
     assert daily.mint_token.call_count == 2
+    assert daily.mint_token.await_args_list == [
+        call("br", is_owner=True),
+        call("br", is_owner=False, exp_secs=900),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_start_browser_does_not_start_recording(agent_config_loader):
+    daily = _daily_mock()
+    daily.mint_token = AsyncMock(side_effect=["bot.jwt", "viewer.jwt"])
+    m = PipelineManager(_settings(), daily, _protection_mock())
+
+    with patch("app.runner.manager.bot", AsyncMock()):
+        await m.start_browser(agent_id="agent-1")
+        await asyncio.sleep(0.05)
+
+    agent_config_loader.assert_not_awaited()
+    daily.create_browser_room.assert_awaited_once_with()
+    assert daily.mint_token.await_args_list == [
+        call("br", is_owner=True),
+        call("br", is_owner=False, exp_secs=900),
+    ]
 
 
 @pytest.mark.asyncio
@@ -400,11 +518,33 @@ async def test_start_inbound_creates_sip_room_and_spawns():
         )
         await asyncio.sleep(0.05)
 
-    daily.create_inbound_room.assert_awaited_once()
+    daily.create_inbound_room.assert_awaited_once_with(recording_enabled=False)
     body = captured[0]
     assert body["direction"] == "inbound"
     assert body["dialin_settings"]["call_id"] == "ext-call-id"
     assert body["dialin_settings"]["call_domain"] == "cosentus.daily.co"
+
+
+@pytest.mark.asyncio
+async def test_start_inbound_starts_recording_when_agent_enabled_and_configured(
+    agent_config_loader,
+):
+    agent_config_loader.return_value = _agent(recording_enabled=True)
+    daily = _daily_mock()
+    m = PipelineManager(_settings(), daily, _protection_mock())
+
+    with patch("app.runner.manager.bot", AsyncMock()):
+        await m.start_inbound(
+            agent_id="agent-1",
+            from_number="+19494360836",
+            to_number="+12098075018",
+            call_id_external="ext-call-id",
+            call_domain="cosentus.daily.co",
+        )
+        await asyncio.sleep(0.05)
+
+    daily.create_inbound_room.assert_awaited_once_with(recording_enabled=True)
+    daily.mint_token.assert_awaited_once_with("in", start_recording=True)
 
 
 # ── Dict-boundary protection lifecycle ───────────────────────────────────

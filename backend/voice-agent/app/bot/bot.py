@@ -139,6 +139,8 @@ from app.tools.result import ToolResult, ToolStatus
 
 logger = structlog.get_logger(__name__)
 
+_PRELOADED_AGENT_CONFIG_KEY = "_agent_config"
+
 
 # ── Locked-in pipeline knobs (matches walking-skeleton round 3) ───────────
 #
@@ -411,7 +413,11 @@ async def run_bot(
     root_ctx = context_of(call_otel_span)
 
     # ── Layer 1: load agent ────────────────────────────────────────────
-    agent = await load_agent_config(agent_id, settings=settings)
+    preloaded_agent = body.get(_PRELOADED_AGENT_CONFIG_KEY)
+    if isinstance(preloaded_agent, AgentConfig):
+        agent = preloaded_agent
+    else:
+        agent = await load_agent_config(agent_id, settings=settings)
     call_policy = _resolve_call_policy(agent, direction)
     gate_required = call_policy.identity_gate_required
     logger.info(

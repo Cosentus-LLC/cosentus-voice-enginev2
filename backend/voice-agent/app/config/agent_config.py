@@ -62,8 +62,9 @@ class AgentConfigLoadError(Exception):
 #
 # These mirror the JSON shape the cosentus-voice-api Lambda's
 # ``buildRuntimeConfig`` returns. ``extra='ignore'`` on every model
-# is deliberate: the lambda sends fields v2 chose not to model (per-
-# agent provider/recording fields the v1 engine ignored anyway). See
+# is deliberate: the lambda sends fields v2 chose not to model
+# (per-agent provider fields and older tuning knobs the v1 engine
+# ignored anyway). See
 # docs/v2-tech-debt-log.md entry 1 for the full list and the exit
 # condition that lets us tighten this back to ``extra='forbid'``.
 #
@@ -291,6 +292,15 @@ class BaseInstructions(_RuntimeConfigModel):
     patient: str = ""
 
 
+class RecordingConfig(_RuntimeConfigModel):
+    """Per-agent call recording policy from runtime-config."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = False
+    channels: int = 2
+
+
 class AgentConfig(_RuntimeConfigModel):
     """Top-level per-agent runtime config.
 
@@ -300,16 +310,13 @@ class AgentConfig(_RuntimeConfigModel):
 
     ``extra='ignore'`` lets v2 silently drop fields the lambda sends
     but v2 doesn't model — without this we would hard-fail every
-    call on the v1-era fields the lambda still emits. The whole
-    ``recording`` object is the one such top-level field today, so
-    it's allowlisted in ``_known_extra_fields``; any other unmodeled
+    call on the v1-era fields the lambda still emits. Any unmodeled
     top-level key is logged by the ``_RuntimeConfigModel`` guard.
     ``populate_by_name=True`` lets the ``meta`` field accept either
     the wire alias ``_meta`` or the Python attribute name.
     """
 
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
-    _known_extra_fields = frozenset({"recording"})
 
     name: str
     display_name: str = ""
@@ -354,6 +361,7 @@ class AgentConfig(_RuntimeConfigModel):
     tts: TTSConfig = Field(default_factory=TTSConfig)
     stt: STTConfig = Field(default_factory=STTConfig)
     tools: list[ToolConfig] = Field(default_factory=list)
+    recording: RecordingConfig = Field(default_factory=RecordingConfig)
     post_call_analyses: PostCallConfig | None = None
     meta: AgentConfigMeta = Field(default_factory=AgentConfigMeta, alias="_meta")
 

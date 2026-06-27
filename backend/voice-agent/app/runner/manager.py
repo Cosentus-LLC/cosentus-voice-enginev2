@@ -40,7 +40,8 @@ from typing import Any
 import structlog
 from pipecat.runner.types import DailyRunnerArguments
 
-from app.bot import bot
+from app.bot.bot import _PRELOADED_AGENT_CONFIG_KEY, bot
+from app.config.agent_config import AgentConfig, load_agent_config
 from app.config.settings import Settings
 from app.runner.daily_rooms import DailyRoomClient
 from app.runner.protection import TaskProtection
@@ -200,8 +201,13 @@ class PipelineManager:
         call_id = str(uuid.uuid4())
         was_empty = self._reserve_slot(call_id)
         try:
-            room = await self._daily.create_outbound_room()
-            token = await self._daily.mint_token(room.name)
+            agent = await self._load_agent_for_call(agent_id)
+            start_recording = self._should_start_recording(agent)
+            room = await self._daily.create_outbound_room(recording_enabled=start_recording)
+            token = await self._daily.mint_token(
+                room.name,
+                start_recording=start_recording,
+            )
 
             caller_id_uuid = await self._daily.get_phone_number_uuid(from_number)
             caller_id_for_dailout: str = caller_id_uuid or from_number
@@ -230,6 +236,7 @@ class PipelineManager:
                     "case_data": case_data or {},
                     "batch_id": batch_id,
                     "batch_row_index": batch_row_index,
+                    _PRELOADED_AGENT_CONFIG_KEY: agent,
                     # Daily SDK key naming: camelCase. Layer 8's
                     # ``on_joined`` handler passes this verbatim to
                     # ``transport.start_dialout``. ``callerId`` MUST
@@ -339,8 +346,13 @@ class PipelineManager:
         call_id = str(uuid.uuid4())
         was_empty = self._reserve_slot(call_id)
         try:
-            room = await self._daily.create_inbound_room()
-            token = await self._daily.mint_token(room.name)
+            agent = await self._load_agent_for_call(agent_id)
+            start_recording = self._should_start_recording(agent)
+            room = await self._daily.create_inbound_room(recording_enabled=start_recording)
+            token = await self._daily.mint_token(
+                room.name,
+                start_recording=start_recording,
+            )
 
             runner_args = DailyRunnerArguments(
                 room_url=room.url,
@@ -351,6 +363,7 @@ class PipelineManager:
                     "target_number": to_number,
                     "from_number": from_number,
                     "case_data": {},
+                    _PRELOADED_AGENT_CONFIG_KEY: agent,
                     "dialin_settings": {
                         "call_id": call_id_external,
                         "call_domain": call_domain,
@@ -371,6 +384,14 @@ class PipelineManager:
         )
 
     # ── Internals ────────────────────────────────────────────────
+
+    async def _load_agent_for_call(self, agent_id: str) -> AgentConfig:
+        """Load the agent runtime config once before PSTN room setup."""
+        return await load_agent_config(agent_id, settings=self._settings)
+
+    def _should_start_recording(self, agent: AgentConfig) -> bool:
+        """Return whether this PSTN call should start Daily cloud recording."""
+        return bool(agent.recording.enabled and self._daily.recording_configured)
 
     def _reject_if_unavailable(self) -> None:
         """Synchronous gate. Reads only — does not reserve a slot.
