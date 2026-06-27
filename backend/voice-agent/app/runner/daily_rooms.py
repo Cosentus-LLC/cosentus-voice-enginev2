@@ -14,9 +14,10 @@ v2 supports:
 Plus :meth:`DailyRoomClient.mint_token` for both bot and (browser-
 only) viewer tokens.
 
-Recording is room-level config: ``enable_recording: "cloud"`` plus
-``recordings_bucket`` (bucket name + region + assume-role ARN) make
-Daily upload directly to the customer's S3 on call end. SSE-KMS
+Recording has two Daily-side requirements: room-level config
+(``enable_recording: "cloud"`` plus ``recordings_bucket``) permits
+cloud recording, and the bot's owner meeting token can set
+``start_cloud_recording`` to start it when the bot joins. SSE-KMS
 encryption is enforced at the bucket level via default encryption;
 Layer 9 doesn't pass SSE headers.
 
@@ -141,7 +142,17 @@ class DailyRoomClient:
             "allow_api_access": False,
         }
 
-    async def create_inbound_room(self, *, ttl_secs: int = _DEFAULT_TTL_SECS) -> DailyRoom:
+    @property
+    def recording_configured(self) -> bool:
+        """Whether this client has the bucket + role Daily needs for S3 recording."""
+        return self._recording_config() is not None
+
+    async def create_inbound_room(
+        self,
+        *,
+        ttl_secs: int = _DEFAULT_TTL_SECS,
+        recording_enabled: bool = True,
+    ) -> DailyRoom:
         """Create a SIP-dial-in-enabled room for an inbound PSTN call.
 
         Daily's SIP gateway bridges the caller into the room when
@@ -161,13 +172,18 @@ class DailyRoomClient:
             "start_audio_off": False,
             "start_video_off": True,
         }
-        rec = self._recording_config()
+        rec = self._recording_config() if recording_enabled else None
         if rec is not None:
             properties["enable_recording"] = "cloud"
             properties["recordings_bucket"] = rec
         return await self._create_room(properties)
 
-    async def create_outbound_room(self, *, ttl_secs: int = _DEFAULT_TTL_SECS) -> DailyRoom:
+    async def create_outbound_room(
+        self,
+        *,
+        ttl_secs: int = _DEFAULT_TTL_SECS,
+        recording_enabled: bool = True,
+    ) -> DailyRoom:
         """Create a dialout-enabled room for an outbound PSTN call.
 
         ``allow_room_start: True`` is critical — without it, Daily
@@ -183,7 +199,7 @@ class DailyRoomClient:
             "start_audio_off": False,
             "start_video_off": True,
         }
-        rec = self._recording_config()
+        rec = self._recording_config() if recording_enabled else None
         if rec is not None:
             properties["enable_recording"] = "cloud"
             properties["recordings_bucket"] = rec
@@ -246,6 +262,7 @@ class DailyRoomClient:
         *,
         is_owner: bool = True,
         exp_secs: int = _DEFAULT_TTL_SECS,
+        start_recording: bool = False,
     ) -> str:
         """POST /meeting-tokens for the given room.
 
@@ -255,14 +272,19 @@ class DailyRoomClient:
                 control). Browser viewer tokens pass ``False``.
             exp_secs: Token TTL in seconds. Match or exceed the
                 room TTL so the token doesn't expire mid-call.
+            start_recording: For owner bot tokens only, ask Daily to
+                start cloud recording when the bot joins the room.
         """
         session = await self._ensure_session()
+        properties = {
+            "room_name": room_name,
+            "is_owner": is_owner,
+            "exp": int(time.time()) + exp_secs,
+        }
+        if start_recording and is_owner:
+            properties["start_cloud_recording"] = True
         payload = {
-            "properties": {
-                "room_name": room_name,
-                "is_owner": is_owner,
-                "exp": int(time.time()) + exp_secs,
-            },
+            "properties": properties,
         }
         try:
             async with session.post(f"{self._api_url}/meeting-tokens", json=payload) as resp:

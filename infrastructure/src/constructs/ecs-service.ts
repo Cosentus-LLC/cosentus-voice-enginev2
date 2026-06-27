@@ -452,7 +452,7 @@ export class EcsServiceConstruct extends Construct {
           's3:AbortMultipartUpload',
           's3:ListMultipartUploadParts',
         ],
-        resources: [`${recordingsBucketArn}/cosentus/*`],
+        resources: [`${recordingsBucketArn}/voice-recordings/*`],
       }),
     );
   }

@@ -26,6 +26,7 @@ from app.bot.bot import (
     _FLOW_NO_INPUT_ATTEMPTS_STATE_KEY,
     _FLOW_NO_INPUT_MESSAGES,
     _FLOW_USER_IDLE_TIMEOUT_SECS,
+    _PRELOADED_AGENT_CONFIG_KEY,
     _build_dialin_settings,
     _compose_system_prompt,
     _extract_session_id,
@@ -535,6 +536,29 @@ async def test_run_bot_does_not_block_outbound_when_no_required_keys():
 
     assert mocks.get("finalize_kwargs") is not None
     assert mocks["finalize_kwargs"]["end_status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_run_bot_uses_preloaded_agent_config_without_lambda_load():
+    agent = _agent(system_prompt="PRELOADED AGENT PROMPT")
+    agent_from_patch, mocks = _patch_run_bot_dependencies(agent=_agent(system_prompt="PATCHED"))
+    transport = _make_transport_mock()
+    patches = _start_run_bot_patches(agent_from_patch, mocks, transport)
+    started_patches = [p.start() for p in patches]
+    load_agent_config_mock = started_patches[0]
+    try:
+        await run_bot(
+            transport,
+            _runner_args(**{_PRELOADED_AGENT_CONFIG_KEY: agent}),
+            _settings(),
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    load_agent_config_mock.assert_not_awaited()
+    system_instruction = mocks["build_llm"].call_args.kwargs["system_instruction"]
+    assert system_instruction == "PRELOADED AGENT PROMPT"
 
 
 # ── run_bot full happy paths ─────────────────────────────────────────────

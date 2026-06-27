@@ -15,8 +15,6 @@ that v2's `AgentConfig` does not model:
 - `tts.provider`, `tts.settings.similarity_boost`,
   `tts.settings.style`, `tts.settings.speed`
 - `stt.provider`, `stt.language`
-- `recording.enabled`, `recording.channels` (the entire
-  `recording` object)
 
 v2 silently drops them via `extra='ignore'` on the Pydantic models.
 
@@ -24,10 +22,10 @@ v2 silently drops them via `extra='ignore'` on the Pydantic models.
 choices that were per-agent on paper but platform-wide in practice.
 v1's contract-trace audit (handoff #6) confirmed the engine ignored
 these fields at runtime anyway — env vars and Daily defaults won.
-v2 names that truth in the type system: per-agent provider/recording
-fields are not modeled because they are not honored. Changing the
-lambda's response contract to drop the fields is a separate repo's
-work and out of scope for v2's greenfield rebuild.
+v2 names that truth in the type system: per-agent provider fields are
+not modeled because they are not honored. Changing the lambda's
+response contract to drop the fields is a separate repo's work and out
+of scope for v2's greenfield rebuild.
 
 **Cost.** Minor. The lambda continues to ship bytes we throw away;
 a future contract change in either direction (lambda removes the
@@ -1080,4 +1078,3 @@ are the guardrails.
 (regenerated), ``Dockerfile`` (frozen install), ``app/services
 /factory.py::build_tts`` (the voice_settings construction that
 1.2.x rejects). Engine commit pending.
-
